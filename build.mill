@@ -1,0 +1,106 @@
+//| mill-version: 1.1.5
+//| mill-jvm-version: temurin:25
+//| mill-jvm-opts: ["-XX:NonProfiledCodeHeapSize=250m", "-XX:ReservedCodeCacheSize=500m"]
+
+package build
+
+import mill.*
+import scalalib.*
+
+object settings:
+  val scalaVersion = "3.8.3"
+  val soundnessVersion = "0.59.0"
+
+  val scalaOptions = Seq(
+    "-experimental",
+    "-new-syntax",
+    "-feature",
+    "-preview",
+    "-deprecation",
+    "-Wunused:imports",
+    "-Wimplausible-patterns",
+    "-Xmax-inlines", "32",
+    "-Yno-flexible-types",
+    "-Yexplicit-nulls",
+    "-Ycheck-all-patmat",
+    "-language:experimental.modularity",
+    "-language:experimental.dependent",
+    "-language:experimental.relaxedLambdaSyntax",
+    "-language:experimental.genericNumberLiterals",
+    "-language:experimental.into",
+    "-language:experimental.erasedDefinitions",
+    "-language:implicitConversions",
+    "-language:experimental.saferExceptions",
+    "-language:experimental.strictEqualityPatternMatching",
+    "-language:experimental.subCases",
+    "-language:experimental.multiSpreads"
+  )
+
+  // Flame's sources are written for the proscenium predef (the soundness house
+  // predef), so the standalone build replicates `-Yno-predef -Yimports:…`.
+  val predef = Seq("-Yno-predef", "-Yimports:java.lang,scala,proscenium")
+
+  // Depend on flame's exact published Soundness components (mirroring its in-tree
+  // moduleDeps) rather than the `soundness-all` umbrella: the umbrella pulls in
+  // every module, so `import soundness.*` would import clashing top-level names
+  // (e.g. a linear-algebra `Vector` shadowing `scala.Vector`).
+  val coreDeps = Seq(
+    mvn"dev.soundness:proscenium-core:0.59.0",
+    mvn"dev.soundness:beneficence-core:0.59.0",
+    mvn"dev.soundness:anthology-scala:0.59.0",
+    mvn"dev.soundness:inimitable-core:0.59.0",
+    mvn"dev.soundness:coaxial-core:0.59.0",
+    mvn"dev.soundness:eucalyptus-core:0.59.0",
+    mvn"dev.soundness:stratiform-core:0.59.0",
+    mvn"dev.soundness:stratiform-binary:0.59.0",
+    mvn"dev.soundness:harlequin-core:0.59.0")
+
+  val clientDeps = Seq(
+    mvn"dev.soundness:ethereal-core:0.59.0",
+    mvn"dev.soundness:exoskeleton-completions:0.59.0",
+    mvn"dev.soundness:profanity-core:0.59.0",
+    mvn"dev.soundness:urticose-core:0.59.0",
+    mvn"dev.soundness:escapade-core:0.59.0",
+    mvn"dev.soundness:iridescence-core:0.59.0",
+    mvn"dev.soundness:harlequin-ansi:0.59.0",
+    mvn"dev.soundness:escritoire-core:0.59.0",
+    mvn"dev.soundness:ultimatum-core:0.59.0",
+    // Burdock packaging: `Embed` (the compile-time macro) lives in burdock-core;
+    // burdock-boot supplies the `burdock.Bootstrap` class the repackager force-includes.
+    mvn"dev.soundness:burdock-core:0.59.0",
+    mvn"dev.soundness:burdock-boot:0.59.0")
+
+  val testDeps = Seq(
+    mvn"dev.soundness:probably-cli:0.59.0",
+    mvn"dev.soundness:spectacular-core:0.59.0")
+
+trait Project extends Module:
+  def moduleDir = super.moduleDir / os.up / "src"
+
+trait Component(dependencies: ScalaModule*) extends ScalaModule:
+  override def scalaVersion = settings.scalaVersion
+  override def scalacOptions = settings.scalaOptions ++ settings.predef
+  def moduleId: String = moduleDir.last
+  def moduleDeps: Seq[ScalaModule] = dependencies
+  def sources = Task.Sources(moduleDir)
+
+object flame extends Project:
+  // The REPL engine. Depends on the Scala 3 compiler (it compiles user input) in
+  // addition to its published Soundness components.
+  object core extends Component():
+    def mvnDeps =
+      settings.coreDeps :+ mvn"org.scala-lang:scala3-compiler_3:${settings.scalaVersion}"
+
+  // The interactive client (`flame.repl`). Built as a plain assembly; the native,
+  // self-fetching launcher is produced afterwards by the Burdock repackager — see
+  // the `repackage` target in the Makefile.
+  object client extends Component(core):
+    def mvnDeps = settings.clientDeps
+    def finalMainClass = "flame.repl"
+    // A clean zip (no executable shell preamble) so the Burdock repackager can
+    // read and rewrite the assembled JAR.
+    def prependShellScript = ""
+
+  object test extends Component(core):
+    def mvnDeps = settings.testDeps
+    def finalMainClass = "flame.Tests"
