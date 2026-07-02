@@ -23,7 +23,7 @@ make test                    # compile and run the test suite
 ## Dependencies
 
 Flame depends on the exact set of published Soundness components it needs (e.g.
-`dev.soundness:coaxial-core`, `harlequin-core`, `ethereal-core`, …) at version `0.59.0`,
+`dev.soundness:coaxial-core`, `harlequin-core`, `ethereal-core`, …) at version `0.61.0`,
 rather than the `soundness-all` umbrella — the umbrella pulls in every module, which
 introduces top-level name clashes (e.g. a linear-algebra `Vector` shadowing `scala.Vector`)
 under flame's `import soundness.*`.
