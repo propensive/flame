@@ -39,13 +39,13 @@ import _root_.java.nio.file as jnf
 
 import soundness.*
 
-import classloaders.threadContext
-import probates.await
-import logging.silent
+import classloaders.threadContextClassloader
+import probates.awaitProbate
+import logging.silentLogging
 import strategies.throwUnsafely
-import systems.java
-import temporaryDirectories.system
-import threading.platform
+import systems.javaSystem
+import temporaryDirectories.systemTemporaryDirectory
+import threading.platformThreading
 
 // Sends `request` to `output` as a length-prefixed BinTEL frame — the on-wire protocol
 // the server speaks (a 4-byte big-endian length, then that many BinTEL body bytes).
@@ -99,8 +99,224 @@ object Tests extends Suite(m"Flame Tests"):
           repl.interpret(t"val x = 40")
           repl.interpret(t"println(x + 2)")
       . assert:
-          case Repl.Outcome.Ran(_, _, _) => true
+          case Repl.Outcome.Ran(_, _, _, _, _) => true
           case _                         => false
+
+      test(m"an import persists to a later line"):
+        supervise:
+          val repl = Repl()
+          repl.interpret(t"import scala.collection.mutable.ListBuffer")
+          repl.interpret(t"ListBuffer(1, 2, 3)")
+      . assert:
+          case Repl.Outcome.Ran(_, _, _, _, _) => true
+          case _                         => false
+
+      test(m"/unimport removes an import so it is no longer in scope"):
+        supervise:
+          val repl = Repl()
+          repl.interpret(t"import scala.collection.mutable.ListBuffer")
+          val before = repl.interpret(t"ListBuffer(1, 2, 3)")
+          repl.interpret(t"/unimport scala.collection.mutable.ListBuffer")
+          (before, repl.interpret(t"ListBuffer(1, 2, 3)"))
+      . assert:
+          case (Repl.Outcome.Ran(_, _, _, _, _), Repl.Outcome.Rejected(_)) => true
+          case _                                                     => false
+
+      test(m"/unimport with no argument lists the removable imports"):
+        supervise:
+          val repl = Repl()
+          repl.interpret(t"import scala.collection.mutable.ListBuffer")
+          repl.interpret(t"/unimport")
+      . assert:
+          case Repl.Outcome.Ran(_, _, output, _, _) => output.contains(t"scala.collection.mutable.ListBuffer")
+          case _                              => false
+
+      test(m"/unimport reports when no import matches the given tokens"):
+        supervise:
+          Repl().interpret(t"/unimport nonsense.does.not.exist")
+      . assert:
+          case Repl.Outcome.Ran(_, _, output, _, _) => output.contains(t"no matching import")
+          case _                              => false
+
+      test(m"a given declared on one line is in scope on a later line"):
+        supervise:
+          val repl = Repl()
+          repl.interpret(t"given Int = 42")
+          repl.interpret(t"summon[Int]")
+      . assert:
+          case Repl.Outcome.Ran(_, value, _, _, _) => value == t"42"
+          case _                             => false
+
+      test(m"a persisted given resolves a later `using` parameter"):
+        supervise:
+          val repl = Repl()
+          repl.interpret(t"given Int = 7")
+          repl.interpret(t"def double(using n: Int) = n*2")
+          repl.interpret(t"double")
+      . assert:
+          case Repl.Outcome.Ran(_, value, _, _, _) => value == t"14"
+          case _                             => false
+
+      test(m"/set experimental enables experimental definitions"):
+        supervise:
+          val repl = Repl()
+          repl.interpret(t"@scala.annotation.experimental def ex = 1")
+          val before = repl.interpret(t"ex")
+          repl.interpret(t"/set experimental")
+          (before, repl.interpret(t"ex"))
+      . assert:
+          case (Repl.Outcome.Rejected(_), Repl.Outcome.Ran(_, _, _, _, _)) => true
+          case _                                                     => false
+
+      test(m"completions are offered for a member prefix"):
+        supervise:
+          val code = t"List(1, 2, 3).ma"
+          Repl().completionsAt(code, code.length).map(_.name)
+      . assert(_.contains(t"map"))
+
+      test(m"completions see the session's imports for a first-token prefix"):
+        supervise:
+          val repl = Repl()
+          repl.interpret(t"import scala.collection.mutable.ListBuffer")
+          repl.completionsAt(t"ListB", 5).map(_.name)
+      . assert(_.contains(t"ListBuffer"))
+
+      test(m"completions work in import position"):
+        supervise:
+          val code = t"import sca"
+          Repl().completionsAt(code, code.length).map(_.name)
+      . assert(_.contains(t"scala"))
+
+      test(m"slash-command lines complete against the engine's commands"):
+        supervise:
+          val code = t"/set ex"
+          Repl().completionsAt(code, code.length).map(_.name)
+      . assert(_.contains(t"/set experimental"))
+
+      test(m"a new definition invalidates the cached member completions"):
+        supervise:
+          val repl = Repl()
+          repl.completionsAt(t"z9.le", 5)        // z9 undefined: caches an empty member list
+          repl.interpret(t"val z9 = \"hi\"")      // defining z9 must drop the stale cache
+          repl.completionsAt(t"z9.le", 5).map(_.name)
+      . assert(_.contains(t"length"))
+
+      // Keyword completion is position-classified (`Repl.keywordCompletions`, no compiler).
+      test(m"`val`/`var` are keyword completions at a statement start"):
+        Repl.keywordCompletions(t"va", 2).map(_.name)
+      . assert(_ == List(t"val", t"var"))
+
+      test(m"`import` is a keyword completion at the start of a line"):
+        Repl.keywordCompletions(t"imp", 3).map(_.name)
+      . assert(_.contains(t"import"))
+
+      test(m"no keywords are offered after a member-selection dot"):
+        Repl.keywordCompletions(t"List(1).ma", 10)
+      . assert(_ == Nil)
+
+      test(m"no keyword (in particular `match`) is offered after a value with no space"):
+        Repl.keywordCompletions(t"List(1)ma", 9)
+      . assert(_ == Nil)
+
+      test(m"a value followed by a space is an infix receiver"):
+        Repl.infixBase(t"List(1) ma", 10)._1
+      . assert(_ == t"List(1).")
+
+      test(m"a value with no trailing space is not an infix receiver"):
+        Repl.infixBase(t"List(1)ma", 9)._1
+      . assert(_ == Unset)
+
+      test(m"a name after `val` is not an infix receiver"):
+        Repl.infixBase(t"val x ", 6)._1
+      . assert(_ == Unset)
+
+      test(m"a soft modifier offers a curated follow-set, not the whole definition list"):
+        Repl.keywordCompletions(t"transparent ", 12).map(_.name)
+      . assert(_ == List(t"inline", t"trait"))
+
+      test(m"`inline` offers def/given/val"):
+        Repl.keywordCompletions(t"inline ", 7).map(_.name)
+      . assert(_ == List(t"def", t"given", t"val"))
+
+      test(m"`with` is not offered after a type ascription `:`"):
+        Repl.keywordCompletions(t"val x: w", 8)
+      . assert(_ == Nil)
+
+      test(m"`with` is offered in a template header after `extends`"):
+        Repl.keywordCompletions(t"class A extends w", 17).map(_.name)
+      . assert(_ == List(t"with"))
+
+      test(m"definition keywords are not offered in expression position"):
+        Repl.keywordCompletions(t"1 + va", 6)
+      . assert(_ == Nil)
+
+      test(m"`new` is offered in expression position"):
+        Repl.keywordCompletions(t"1 + n", 5).map(_.name)
+      . assert(_.contains(t"new"))
+
+      test(m"`using` is offered inside a parameter list"):
+        Repl.keywordCompletions(t"def f(u", 7).map(_.name)
+      . assert(_ == List(t"using"))
+
+      test(m"a method-call argument is not a parameter position"):
+        Repl.keywordCompletions(t"foo(v", 5)
+      . assert(_ == Nil)
+
+      test(m"the Scala 2 `implicit` keyword is not offered"):
+        Repl.keywordCompletions(t"impl", 4)
+      . assert(_ == Nil)
+
+      test(m"the dropped do-while `do` keyword is not offered"):
+        Repl.keywordCompletions(t"1 + d", 5)
+      . assert(_ == Nil)
+
+      // `incomplete` decides whether Enter continues onto a new line or submits. The
+      // verdict is reliable for well-formed input (the cases below); malformed, non-prefix
+      // input may go either way (Shift+Enter always submits).
+      test(m"a trailing operator is an incomplete continuation"):
+        Repl.incomplete(t"1 +")
+      . assert(_ == true)
+
+      test(m"an unclosed brace is an incomplete continuation"):
+        Repl.incomplete(t"List(1).map { x =>")
+      . assert(_ == true)
+
+      test(m"a binding with no right-hand side is an incomplete continuation"):
+        Repl.incomplete(t"val x =")
+      . assert(_ == true)
+
+      test(m"a complete expression is ready to submit"):
+        Repl.incomplete(t"List(1).map(_ + 1)")
+      . assert(_ == false)
+
+      test(m"a complete definition is ready to submit"):
+        Repl.incomplete(t"val x = 40")
+      . assert(_ == false)
+
+      test(m"blank input is not a continuation"):
+        Repl.incomplete(t"   ")
+      . assert(_ == false)
+
+      test(m"an expression result carries its value and type"):
+        supervise:
+          Repl().react(0, t"1 + 1")
+      . assert:
+          case Repl.Reply.Ran(_, value, _, tpe, _, _, _) => value == t"2" && tpe.present
+          case _                                       => false
+
+      test(m"a Unit result shows neither a value nor a type"):
+        supervise:
+          Repl().react(0, t"println(\"hi\")")
+      . assert:
+          case Repl.Reply.Ran(_, value, _, tpe, _, _, _) => value.absent && tpe.absent
+          case _                                       => false
+
+      test(m"an import produces no result value"):
+        supervise:
+          Repl().react(0, t"import scala.collection.mutable.*")
+      . assert:
+          case Repl.Reply.Ran(_, value, _, tpe, _, _, _) => value.absent && tpe.absent
+          case _                                       => false
 
       test(m"a type error is reported as Rejected with notices"):
         supervise:
@@ -131,7 +347,7 @@ object Tests extends Suite(m"Flame Tests"):
 
           repl.interpret(t"println(total)")     // "hello".length + 5
       . assert:
-          case Repl.Outcome.Ran(_, _, _) => true
+          case Repl.Outcome.Ran(_, _, _, _, _) => true
           case _                         => false
 
       test(m"a lifted import is in scope for REPL lines"):
@@ -142,7 +358,7 @@ object Tests extends Suite(m"Flame Tests"):
 
           repl.interpret(t"println(ListBuffer(1, 2, 3).sum)")
       . assert:
-          case Repl.Outcome.Ran(_, _, _) => true
+          case Repl.Outcome.Ran(_, _, _, _, _) => true
           case _                         => false
 
       test(m"a captured value persists across several lines"):
@@ -155,7 +371,7 @@ object Tests extends Suite(m"Flame Tests"):
           repl.interpret(t"val doubled = seed*2")
           repl.interpret(t"println(doubled + seed)")
       . assert:
-          case Repl.Outcome.Ran(_, _, _) => true
+          case Repl.Outcome.Ran(_, _, _, _, _) => true
           case _                         => false
 
     suite(m"REPL result rendering"):
@@ -165,30 +381,40 @@ object Tests extends Suite(m"Flame Tests"):
         supervise:
           Repl().interpret(t"21 * 2")
       . assert:
-          case Repl.Outcome.Ran(_, value, _) => value.let(_ == t"42").or(false)
+          case Repl.Outcome.Ran(_, value, _, _, _) => value.let(_ == t"42").or(false)
           case _                             => false
 
       test(m"a definition renders no value"):
         supervise:
           Repl().interpret(t"val x = 5")
       . assert:
-          case Repl.Outcome.Ran(_, value, _) => value.absent
+          case Repl.Outcome.Ran(_, value, _, _, _) => value.absent
           case _                             => false
 
-      test(m"a rendered result is bound to res0 for later lines"):
+      test(m"a result is bound to a type-derived name, usable on a later line"):
         supervise:
           val repl = Repl()
-          repl.interpret(t"40 + 2")
-          repl.interpret(t"res0 + 1")
+          val first = repl.interpret(t"List(1, 2, 3)")
+          (first, repl.interpret(t"list.size"))
       . assert:
-          case Repl.Outcome.Ran(_, value, _) => value.let(_ == t"43").or(false)
-          case _                             => false
+          case (Repl.Outcome.Ran(_, _, _, name, _), Repl.Outcome.Ran(_, value, _, _, _)) =>
+            name == t"list" && value.let(_ == t"3").or(false)
+          case _ => false
+
+      test(m"a repeated result type gets a numbered name to avoid a collision"):
+        supervise:
+          val repl = Repl()
+          repl.interpret(t"List(1)")
+          repl.interpret(t"List(2)")
+      . assert:
+          case Repl.Outcome.Ran(_, _, _, name, _) => name == t"list2"
+          case _                                  => false
 
       test(m"stdout printed while a line runs is captured"):
         supervise:
           Repl().interpret(t"println(7)")
       . assert:
-          case Repl.Outcome.Ran(_, _, output) => output.contains(t"7")
+          case Repl.Outcome.Ran(_, _, output, _, _) => output.contains(t"7")
           case _                              => false
 
       test(m"multi-line code keeps its newlines when tokenized"):
@@ -209,7 +435,7 @@ object Tests extends Suite(m"Flame Tests"):
             socket.close()
             service.stop()
       . assert:
-          case Repl.Reply.Ran(_, value, _, tpe, _, _) =>
+          case Repl.Reply.Ran(_, value, _, tpe, _, _, _) =>
             value.let(_ == t"2").or(false) && tpe.let(_.contains(t"Int")).or(false)
 
           case _ =>
@@ -252,7 +478,7 @@ object Tests extends Suite(m"Flame Tests"):
             channel.close()
             service.stop()
       . assert:
-          case Repl.Reply.Ran(_, value, _, _, _, _) => value.let(_ == t"42").or(false)
+          case Repl.Reply.Ran(_, value, _, _, _, _, _) => value.let(_ == t"42").or(false)
           case _                                    => false
 
       test(m"a completion request returns matching completions"):
@@ -281,7 +507,7 @@ object Tests extends Suite(m"Flame Tests"):
 
           repl.interpret(t"shifted(5)")
       . assert:
-          case Repl.Outcome.Ran(_, value, _) => value.let(_ == t"105").or(false)
+          case Repl.Outcome.Ran(_, value, _, _, _) => value.let(_ == t"105").or(false)
           case _                             => false
 
       test(m"a lifted def captures an enclosing method parameter"):
@@ -293,7 +519,7 @@ object Tests extends Suite(m"Flame Tests"):
 
         session(40)
       . assert:
-          case Repl.Outcome.Ran(_, value, _) => value.let(_ == t"42").or(false)
+          case Repl.Outcome.Ran(_, value, _, _, _) => value.let(_ == t"42").or(false)
           case _                             => false
 
       test(m"a lifted def can reference both a block binding and an outside value"):
@@ -306,7 +532,7 @@ object Tests extends Suite(m"Flame Tests"):
 
           repl.interpret(t"total")
       . assert:
-          case Repl.Outcome.Ran(_, value, _) => value.let(_ == t"105").or(false)
+          case Repl.Outcome.Ran(_, value, _, _, _) => value.let(_ == t"105").or(false)
           case _                             => false
 
       test(m"a lifted def references a field of an enclosing object, tracking changes"):
@@ -314,7 +540,7 @@ object Tests extends Suite(m"Flame Tests"):
           ReplFixture.greeting = "hi"     // length 2; then mutated to "changed" (7)
           ReplFixture.session
       . assert:
-          case (Repl.Outcome.Ran(_, before, _), Repl.Outcome.Ran(_, after, _)) =>
+          case (Repl.Outcome.Ran(_, before, _, _, _), Repl.Outcome.Ran(_, after, _, _, _)) =>
             before.let(_ == t"2").or(false) && after.let(_ == t"7").or(false)
           case _ =>
             false
@@ -340,7 +566,7 @@ object Tests extends Suite(m"Flame Tests"):
           repl.interpret(t"make.sum")               // lifted def uses the import
           repl.interpret(t"ListBuffer(9, 9).sum")   // a later line uses it directly
       . assert:
-          case Repl.Outcome.Ran(_, value, _) => value.let(_ == t"18").or(false)
+          case Repl.Outcome.Ran(_, value, _, _, _) => value.let(_ == t"18").or(false)
           case _                             => false
 
       test(m"a block-local var can be reassigned from a REPL line"):
@@ -351,5 +577,5 @@ object Tests extends Suite(m"Flame Tests"):
           repl.interpret(t"counter = counter + 5")
           repl.interpret(t"counter")
       . assert:
-          case Repl.Outcome.Ran(_, value, _) => value.let(_ == t"15").or(false)
+          case Repl.Outcome.Ran(_, value, _, _, _) => value.let(_ == t"15").or(false)
           case _                             => false

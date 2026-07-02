@@ -43,19 +43,26 @@ import scala.collection.mutable as scm
 
 import soundness.*
 
-import backstops.silent
-import charEncoders.utf8
-import classloaders.threadContext
+// The `soundness-all` umbrella (pulled in for the REPL's own classpath) exports a
+// linear-algebra `Vector`; re-import `scala.Vector` — a named import outranks the wildcard —
+// so `Vector(…)` here is unambiguously the immutable sequence.
+import scala.Vector
+
+import escapade.Faint
+import textMetrics.uniformMetric
+
+import backstops.silentBackstop
+import classloaders.threadContextClassloader
 import executives.completions
 import harlequin.Accent
-import internetAccess.enabled
-import interpreters.posix
-import logging.silent
-import probates.cancel
-import supervisors.global
-import systems.java
-import temporaryDirectories.system
-import threading.platform
+import internetAccess.online
+import interpreters.posixInterpreter
+import logging.silentLogging
+import probates.cancelProbate
+import supervisors.globalSupervisor
+import systems.javaSystem
+import temporaryDirectories.systemTemporaryDirectory
+import threading.platformThreading
 
 // A front-end for a Flame REPL. With a TCP port, `flame serve <port>` runs a
 // server and `flame <port>` connects to one on localhost. With no port,
@@ -67,31 +74,43 @@ import threading.platform
 // are several. Either way the client drives an interactive, live-highlighted session
 // until Ctrl+D, Ctrl+C or `/quit`.
 @main
-def repl(): Unit = cli:
-  arguments match
-    case Argument("serve") :: Argument(As[Int](portNumber)) :: Nil =>
-      execute(serve(portNumber))
+def repl(): Unit = externalize:
+  cli:
+    arguments match
+      case Argument("serve") :: Argument(As[Int](portNumber)) :: Nil =>
+        execute(serve(portNumber))
 
-    case Argument("serve") :: Nil =>
-      execute(serveSocket())
+      case Argument("serve") :: Nil =>
+        execute(serveSocket())
 
-    case Argument(As[Int](portNumber)) :: Nil =>
-      execute:
-        safely(Port[Tcp](portNumber)).lay(invalidPort(portNumber)): port =>
-          connect(port)(converse(_)).or(unreachable(portNumber))
+      case Argument(As[Int](portNumber)) :: Nil =>
+        execute:
+          safely(Port[Tcp](portNumber)).lay(invalidPort(portNumber)): port =>
+            connect(port)(converse(_)).or(unreachable(portNumber))
 
-    case Nil =>
-      execute(connectSocket())
+      // Launch the web-based front-end instead of the terminal client. `--http` alone
+      // serves on port 8080; `--port` overrides it (in either order).
+      case Argument("--http") :: Nil =>
+        execute(httpServe(8080))
 
-    // TEMPORARY keyboard-diagnostic mode: print each keypress instead of editing.
-    case Argument("keys") :: Argument("kitty") :: Nil =>
-      execute(keyTest(kitty = true))
+      case Argument("--http") :: Argument("--port") :: Argument(As[Int](portNumber)) :: Nil =>
+        execute(httpServe(portNumber))
 
-    case Argument("keys") :: Nil =>
-      execute(keyTest(kitty = false))
+      case Argument("--port") :: Argument(As[Int](portNumber)) :: Argument("--http") :: Nil =>
+        execute(httpServe(portNumber))
 
-    case _ =>
-      execute(Exit.Fail(1))
+      case Nil =>
+        execute(connectSocket())
+
+      // TEMPORARY keyboard-diagnostic mode: print each keypress instead of editing.
+      case Argument("keys") :: Argument("kitty") :: Nil =>
+        execute(keyTest(kitty = true))
+
+      case Argument("keys") :: Nil =>
+        execute(keyTest(kitty = false))
+
+      case _ =>
+        execute(Exit.Fail(1))
 
 // Runs a REPL server on the given TCP port and blocks until interrupted.
 private def serve(portNumber: Int)(using Stdio, Monitor, Probate, System): Exit =
@@ -99,17 +118,37 @@ private def serve(portNumber: Int)(using Stdio, Monitor, Probate, System): Exit 
   given Classloader = serverClassloader
 
   safely(Port[Tcp](portNumber)).lay(invalidPort(portNumber)): port =>
-    whereas:
+    recover:
       case BindError(_) => Out.println(t"flame: port $portNumber is unavailable"); Exit.Fail(5)
       case error: Error => Out.println(t"flame: ${error.message}"); Exit.Fail(6)
 
-    . recover:
+    . protect:
         val repl    = Repl()
         val service = repl.serve(port)
         Out.println(t"flame: serving a REPL on port $portNumber (Ctrl+C or /quit to stop)")
         repl.awaitQuit()
         service.stop()
         Exit.Ok
+
+// Launches the web-based front-end (`flame.web`) on the given TCP port, blocking until
+// interrupted. It reuses `serverClassloader` — the same compile-classpath loader the
+// socket server uses — so the embedded engine finds the scala library under the
+// Burdock/Ethereal launcher, exactly as the terminal server does.
+private def httpServe(portNumber: Int)(using Stdio, Monitor, Probate, System, Cli): Exit =
+  given Classloader = serverClassloader
+
+  // There is no interactive editor to read Ctrl+C as a keypress, so handle SIGINT as a
+  // signal: stop the server (fulfil `quit`) and exit cleanly.
+  val quit: Promise[Unit] = Promise()
+  trap:
+    case Signal.Int => quit.offer(()) yet SignalResponse.Accept
+
+  // Printed from the client (not the daemon) so it reaches the user's terminal; the URL is
+  // on its own line so terminals render it as a clean, clickable link.
+  Out.println(t"flame: serving the web REPL (press Ctrl+C to stop):")
+  Out.println(t"  http://localhost:$portNumber/")
+  serveHttp(portNumber, quit)
+  Exit.Ok
 
 // The directory holding per-process REPL sockets, and this process's socket file.
 // UNIX domain sockets are a Unix-only feature, so the directory follows
@@ -153,23 +192,39 @@ private def serveSocket()(using Stdio, Monitor, Probate, System): Exit =
     Exit.Fail(6)
 
 // Builds the classloader the REPL compiles against inside the Ethereal daemon.
-// The launch classloader is not a `URLClassLoader`, so it exposes no compile
-// classpath, and `java.class.path` is this executable — a shebang-prefixed jar
-// with no `.jar` suffix, which dotc refuses to read as a library. We symlink it
-// to a `.jar` path (a `ZipFile` reads the appended archive past the shebang) and
-// hand the REPL a *parent-first* `URLClassLoader` over it: the jar lands on
-// dotc's compile classpath so it finds the bundled scala libraries, while
-// parent-first delegation keeps runtime classes (notably `ReplBridge`, whose
+//
+// Under the Burdock launcher the daemon runs with a bootstrap `URLClassLoader`
+// (the thread-context loader) whose entries are this executable plus the
+// externalized dependency jars — the scala library, the compiler, the soundness
+// modules — fetched into `~/.cache/burdock`. dotc needs all of them on its compile
+// classpath. The fetched jars already carry `.jar` paths it can read, but the
+// executable entry is a shebang-prefixed file with no `.jar` suffix that dotc
+// refuses to read (a `ZipFile` still reads the appended archive past the shebang),
+// so we symlink it to a `.jar` path and substitute the symlink for it.
+//
+// We hand the REPL a *parent-first* `URLClassLoader` over [symlink ++ fetched jars]
+// with the bootstrap loader as parent: the jars land on dotc's compile classpath,
+// while parent-first delegation keeps runtime classes (notably `ReplBridge`, whose
 // session registry must be shared) identical to the daemon's. Outside the daemon
-// (e.g. `ethereal.script` unset) we fall back to the thread-context loader.
+// (e.g. `ethereal.script` unset, or a non-`URLClassLoader` launcher) we fall back
+// to the thread-context loader.
 private def serverClassloader(using System): Classloader =
   try
     val executable: Text = unsafely(System.properties.ethereal.script[Text]())
     val link: jnf.Path = jnf.Files.createTempDirectory("flame").nn.resolve("flame.jar").nn
     jnf.Files.createSymbolicLink(link, jnf.Path.of(executable.s)).nn
     val url: jn.URL = ji.File(link.toString).toURI.nn.toURL.nn
-    new Classloader(jn.URLClassLoader(Array(url), threadContext.java))
-  catch case _: Throwable => threadContext
+
+    val executablePath: Text = ji.File(executable.s).getCanonicalPath.nn.tt
+    val bootstrapUrls: List[jn.URL] = threadContextClassloader.java match
+      case loader: jn.URLClassLoader =>
+        loader.getURLs.nn.iterator.to(List).map(_.nn).filter: entry =>
+          safely(ji.File(entry.toURI).getCanonicalPath.nn.tt) != executablePath
+      case _ =>
+        Nil
+
+    new Classloader(jn.URLClassLoader((url :: bootstrapUrls).toArray, threadContextClassloader.java))
+  catch case _: Throwable => threadContextClassloader
 
 private def invalidPort(portNumber: Int)(using Stdio): Exit =
   Out.println(t"flame: $portNumber is not a valid TCP port")
@@ -231,12 +286,12 @@ private def launchServer[result]()(using Stdio, System)(body: Duplex => result):
 // keys — including Shift+Enter — are decoded. With `kitty = true` the kitty
 // keyboard protocol is enabled first. Ctrl+C or Ctrl+D stops it.
 private def keyTest(kitty: Boolean)(using Stdio, Monitor, Probate, Console, Environment): Exit =
-  whereas:
+  recover:
     case TerminalError() =>
       Out.println(t"flame: the terminal could not be initialised")
       Exit.Fail(4)
 
-  . recover:
+  . protect:
       interactive: terminal ?=>
         given Stdio = terminal.stdio
         if kitty then Out.print(t"\e[>1u")
@@ -317,7 +372,7 @@ private def connectSocket()(using Stdio, Monitor, Probate, Console, Environment,
 private def converse(duplex: Duplex)(using Stdio, Monitor, Probate, Console, Environment): Exit =
   // The kitty keyboard protocol (applied by `interactive`) makes the terminal report
   // Shift+Enter distinctly, so the editor can submit on it.
-  import terminalFeatures.kittyKeyboard
+  import terminalFeatures.kittyKeyboardFeature
 
   val state       = LiveState()
   val pending     = TrieMap[Int, Int]()                  // tokenize id → version
@@ -325,18 +380,18 @@ private def converse(duplex: Duplex)(using Stdio, Monitor, Probate, Console, Env
   val completions = juc.LinkedBlockingQueue[List[Repl.CompletionItem]]()
   val nextId      = juc.atomic.AtomicInteger(1)          // 0 is reserved for submit
 
-  whereas:
+  recover:
     case TerminalError() =>
       Out.println(t"flame: the terminal could not be initialised")
       Exit.Fail(4)
 
-  . recover:
+  . protect:
       interactive: terminal ?=>
         runRepl(duplex, state, pending, nextId, submits, completions)
         Exit.Ok
 
 // One REPL input line is an inline block at the bottom of the console — a bordered,
-// live-highlighted editor with, when completions are active, a pane above it listing
+// live-highlighted editor with, when completions are active, a pane below it listing
 // them. On submit the block is frozen in place (`finish`), the result is printed below
 // it, and the next line opens a fresh block beneath, so output scrolls up into the
 // console's own scrollback above the editor. Rendering goes through ultimatum's
@@ -360,6 +415,32 @@ private def runRepl
   lazy val chunks: Iterator[Data] = duplex.stream.iterator
   @volatile var live = true
 
+  // Inline autosuggestion ("ghost text"): on each edit we ask the server (with a non-zero
+  // id, to distinguish from a Tab completion's id 0) for completions at the cursor; the
+  // reply, paired with the value it was for, is stashed here and a redraw posted. The
+  // editor renders the unique completion's remainder (or the common stem + "...") faint.
+  @volatile var ghostReply: Optional[(Text, List[Repl.CompletionItem])] = Unset
+  val ghostPending: TrieMap[Int, Text] = TrieMap()
+
+  // The server's latest verdict on whether the current line is an incomplete prefix (so
+  // Enter continues onto a new line) or ready to submit, paired with the value it was
+  // computed for. Read synchronously by the Multiline submit predicate; until a verdict for
+  // the current value arrives, the predicate falls back to a cheap bracket check.
+  @volatile var incompleteFor: Optional[(Text, Boolean)] = Unset
+  val incompletePending: TrieMap[Int, Text] = TrieMap()
+
+  // Enter submits only when the line is not an incomplete prefix (per the engine's parser);
+  // otherwise it inserts a continuation newline. Shift+Enter always submits (profanity's
+  // `Multiline`). The bracket-balance fallback covers the brief window before the first
+  // verdict for `text` arrives, and the empty line (never tokenized, so never submitted).
+  // A line beginning `/` is a REPL command, not Scala, so it always submits — the engine
+  // parses `/clear`, `/quit`, … as Scala and reports them "incomplete", which must be ignored.
+  def readyToSubmit(text: Text): Boolean =
+    if text.starts(t"/") then true
+    else incompleteFor.lay(balanced(text)): verdict =>
+      val (value, incomplete) = verdict
+      if value == text then !incomplete else balanced(text)
+
   // Background reader: route replies by kind. A `tokenize` reply refines the live
   // highlight and posts a `Redraw`, so the refined colour appears as soon as the server
   // answers — not one keypress later. Other replies are a `submit` result the loop
@@ -375,12 +456,16 @@ private def runRepl
 
       if data.absent then live = false
       else safely[Exception](Bintel.read[Repl.Reply](data.vouch)).let:
-        case Repl.Reply.Tokenized(id, highlight) =>
+        case Repl.Reply.Tokenized(id, highlight, incomplete) =>
           pending.remove(id).foreach(state.reconcile(_, highlight))
+          incompletePending.remove(id).foreach { value => incompleteFor = (value, incomplete) }
           terminal.events.put(TerminalInfo.Redraw)
 
-        case Repl.Reply.Completed(_, items) =>
-          completions.put(items)
+        case Repl.Reply.Completed(id, items) =>
+          if id == 0 then completions.put(items)
+          else ghostPending.remove(id).foreach: forValue =>
+            ghostReply = (forValue, items)
+            terminal.events.put(TerminalInfo.Redraw)
 
         case reply =>
           submits.put(reply)
@@ -388,9 +473,61 @@ private def runRepl
   val events = terminal.eventIterator()
   var running = true
 
+  // The inline block's rendering policy (ultimatum). `Inline` renders the editor RELATIVE to the
+  // cursor, so each line's block appears exactly where output has flowed to — right after the
+  // previous result — and never docks to a fixed screen edge. This makes the REPL flow like an
+  // ordinary terminal: submit → result → next prompt, always tight, with unused space simply being
+  // blank screen below. It also gives the desired edit-time behaviour for free: when the editor (or
+  // its completion pane) shrinks, the inline shrink holds the block's top and clears the rows below,
+  // so the box stays put rather than jumping — no reserved-height workaround needed. Early in a
+  // session the block sits mid-screen (wherever the cursor is); once output fills the screen it
+  // naturally rides the bottom, scrolling like any REPL. It also governs the static replay boxes.
+  given InlineAnchoring = InlineAnchoring.Inline
+
+  // Resize hysteresis: each `WindowSize` bumps this generation and schedules a settle check;
+  // only the latest generation, once no newer resize has arrived, redraws — so a drag that
+  // fires many events collapses to a single redraw once the terminal size stops changing.
+  // `resizeReplay` tells the `Redraw` handler that this redraw is the settle: replay the
+  // transcript from the top before drawing the editor, rather than just repainting in place.
+  @volatile var resizeGen: Int = 0
+  @volatile var resizeReplay: Boolean = false
+
+  // The session transcript: one entry per submitted line, holding what is needed to re-render
+  // it from scratch — the source text (to compute the box's wrapped height at any width), the
+  // highlight tokens (to redraw the box), and the result text printed below it. Kept so a resize
+  // can wipe the reflowed screen and lay the whole session out afresh at the new width.
+  val transcript: scm.ArrayBuffer[TranscriptEntry] = scm.ArrayBuffer()
+
+  // Re-render the whole session from the top at the current width. A resize reflows all prior
+  // on-screen content unpredictably, so instead of reconciling it we clear the screen AND its
+  // scrollback (`\e[3J`), then replay each transcript entry — the box reflows to the new width,
+  // the result is reprinted verbatim — leaving the cursor right after the last result, where the
+  // caller then draws the live editor. Each box is a throwaway static `InlineRoot` (`Inline`
+  // anchoring, so it flows at the cursor and drops the cursor below itself, exactly like a live
+  // submission did). Overflow scrolls into the (freshly cleared) scrollback, one clean copy.
+  def replay(): Unit =
+    Out.print(t"\e[2J\e[3J\e[H")
+    val innerWidth = (terminal.knownColumns - 4).max(1)
+
+    transcript.each: entry =>
+      val rows = LineEditor.cursorPosition(entry.text, entry.text.length, innerWidth)._1 + 1
+      val staticRoot = InlineRoot(terminal)
+      paint(staticRoot, replayBox(entry.tokens, rows))
+      staticRoot.finish()
+      if entry.result != t"" then Out.print(entry.result)
+
+  // Shell-style command history, like the web front-end: Up/Down cycle through submitted
+  // lines. `histIdx == history.length` is the current draft; the draft is saved on the first
+  // Up and restored when Down returns past the newest entry. Consecutive duplicates are
+  // skipped. Recall happens only from the first/last line, so Up/Down still move the cursor
+  // between the rows of a multi-line entry.
+  val history: scm.ArrayBuffer[Text] = scm.ArrayBuffer()
+  var histIdx: Int = 0
+  var draft: Text = t""
+
   while running do
     val root = InlineRoot(terminal)
-    var editor: LineEditor = LineEditor(mode = LineEditor.Mode.Multiline(balanced))
+    var editor: LineEditor = LineEditor(mode = LineEditor.Mode.Multiline(readyToSubmit))
     var candidates: List[Repl.CompletionItem] = Nil
     var tokens: List[Repl.Token] = Nil
     var lastValue: Text = t""
@@ -406,13 +543,53 @@ private def runRepl
         lastVersion = version
         val id = nextId.getAndIncrement
         pending(id) = version
+        incompletePending(id) = editor.value
         duplex.send(Stream(framed(encode(Repl.Request.Tokenize(id, editor.value)))))
 
+        // Ask for the inline suggestion too, but only with the cursor at the end of the
+        // line (where the ghost is shown).
+        if editor.position == editor.value.length then
+          val gid = nextId.getAndIncrement
+          ghostPending(gid) = editor.value
+          duplex.send(Stream(framed(encode(Repl.Request.Complete(gid, editor.value, editor.position)))))
+
+    // The inline suggestion for the current line: the remainder of a unique completion, or
+    // the common stem of several (then "..."), shown only with the cursor at the line's end
+    // and only while the latest reply still matches the value on screen.
+    def ghost: Text =
+      if editor.value.length == 0 || editor.position != editor.value.length then t"" else
+        ghostReply.lay(t""): reply =>
+          val (forValue, items) = reply
+          if forValue != editor.value then t"" else
+            val stem: Text =
+              if editor.value.starts(t"/") then editor.value
+              else editor.value.skip(identifierStart(editor))
+
+            items match
+              case Nil => t""
+              case single :: Nil =>
+                if single.name.length > stem.length && single.name.starts(stem)
+                then single.name.skip(stem.length) else t""
+
+              case many =>
+                val common = longestCommonPrefix(many.map(_.name))
+                if common.length > stem.length && common.starts(stem)
+                then t"${common.skip(stem.length)}..." else t""
+
     def frame(): Unit =
-      val innerWidth = (terminal.knownColumns - 2).max(1)
+      // The editor's text width: the terminal less the border (2) and one column of padding
+      // inside each border edge (2) — matching `replPane`, so wrapping and height agree.
+      val innerWidth = (terminal.knownColumns - 4).max(1)
       val rows = LineEditor.cursorPosition(editor.value, editor.value.length, innerWidth)._1 + 1
-      paint(root, replPane(editor, tokens, candidates, rows))
-      root.flush()
+
+      val compLines: List[Teletype] =
+        if candidates.isEmpty then Nil
+        else completionTable(candidates.take(candidates.length.min(10)), terminal.knownColumns.max(1))
+
+      // `paint` already flushes the block to the terminal (via `InlineRoot.flush`), so no explicit
+      // `root.flush()` is needed here — and a second flush would be actively wrong, re-running the
+      // inline shrink handling against an already-settled block.
+      paint(root, replPane(editor, tokens, ghost, rows, compLines))
 
     refresh()
     frame()
@@ -431,19 +608,73 @@ private def runRepl
           case Keypress.Escape          => running = false; editing = false
 
           case _: TerminalInfo.WindowSize =>
-            root.invalidate()
-            frame()
+            // A resize reflows all prior on-screen content unpredictably, so there is no sound
+            // way to reconcile the existing inline layout. Instead WIPE the screen and reset the
+            // block, then — once the resize settles (hysteresis) — redraw the editor fresh from the
+            // top. Clearing on every event keeps the screen blank during a drag, not garbled; the
+            // reset means any frame in the meantime (a keystroke) also draws cleanly from the top.
+            Out.print(t"\e[2J\e[H")
+            root.reset()
+            resizeGen += 1
+            val gen = resizeGen
+
+            async:
+              jl.Thread.sleep(200)
+              if resizeGen == gen then
+                resizeReplay = true
+                terminal.events.put(TerminalInfo.Redraw)
 
           // A tokenize reply arrived (posted by the reader): re-derive the highlight
           // from the reconciled checkpoint and repaint, with no edit and no new request.
           case TerminalInfo.Redraw =>
-            tokens = state.record(editor.value, editor.value)._2
-            frame()
+            // The settle after a resize: lay the whole session out afresh from the top, then draw
+            // the (reset) editor immediately below it. Otherwise it is a tokenize repaint.
+            if resizeReplay then
+              resizeReplay = false
+              replay()
+              root.reset()
+              frame()
+            else
+              tokens = state.record(editor.value, editor.value)._2
+              frame()
 
           case Keypress.Tab =>
             val (advanced, shown) = completeAt(editor, duplex, completions)
             editor = advanced
             candidates = shown
+            refresh()
+            frame()
+
+          // Right at the end of the line accepts the ghost suggestion (its stem, dropping a
+          // trailing "..."), fish-style; elsewhere it falls through to move the cursor.
+          case Keypress.Right if editor.position == editor.value.length && ghost != t"" =>
+            val suggestion: Text = ghost
+            val accepted: Text = if suggestion.ends(t"...") then suggestion.keep(suggestion.length - 3) else suggestion
+            val value: Text = t"${editor.value}$accepted"
+            editor = LineEditor(value, value.length, editor.mode)
+            candidates = Nil
+            refresh()
+            frame()
+
+          // Up from the first line recalls the previous submission (saving the draft first);
+          // from a lower line it falls through to move the cursor up within a multi-line entry.
+          case Keypress.Up if !editor.value.keep(editor.position).contains(t"\n") && history.nonEmpty =>
+            if histIdx == history.length then draft = editor.value
+            if histIdx > 0 then
+              histIdx -= 1
+              val entry = history(histIdx)
+              editor = LineEditor(entry, entry.length, editor.mode)
+              candidates = Nil
+              refresh()
+              frame()
+
+          // Down from the last line recalls the next submission (or the saved draft once past
+          // the newest); from a higher line it falls through to move the cursor down.
+          case Keypress.Down if !editor.value.skip(editor.position).contains(t"\n") && histIdx < history.length =>
+            histIdx += 1
+            val entry = if histIdx == history.length then draft else history(histIdx)
+            editor = LineEditor(entry, entry.length, editor.mode)
+            candidates = Nil
             refresh()
             frame()
 
@@ -460,71 +691,163 @@ private def runRepl
           case _ =>
             ()
 
-    // Freeze the block onto the screen (cursor drops below it) and print the result
-    // there, so it scrolls above the next line's fresh block.
+    // Drop any open completion pane before finishing, so the frozen block is just the editor box
+    // (the inline shrink holds the box's top and clears the pane below it); otherwise `finish`
+    // would leave the listing frozen in the scrollback between the line and its result.
+    if candidates.nonEmpty then
+      candidates = Nil
+      frame()
+
+    // Freeze the block onto the screen (the cursor drops onto the row right after it) and print
+    // the result there; the next line's inline block then flows immediately below.
     root.finish()
 
     submitted.let: line =>
-      if line == t"/disconnect" then
-        running = false
-      else if line == t"/quit" then
-        duplex.send(Stream(framed(encode(Repl.Request.Quit(0)))))
-        running = false
-      else if line.starts(t"/") then
-        Out.println(t"flame: unknown command: $line")
-      else
-        duplex.send(Stream(framed(encode(Repl.Request.Submit(0, line)))))
+      // Record the submission for Up/Down recall (skip a consecutive duplicate), then reset
+      // the cursor back to the newest position, exactly as the web front-end does on submit.
+      if line.trim != t"" && history.lastOption != Some(line) then history += line
+      histIdx = history.length
+      draft = t""
 
-        submits.take().nn match
-          case Repl.Reply.Ran(_, value, output, tpe, diagnostics, _) =>
-            if output != t"" then Out.print(output)
+      // Server-side commands go through `Submit` like ordinary input; the engine recognises
+      // them and replies with a confirmation message. `/disconnect` and `/quit` are the only
+      // client-only commands.
+      def serverCommand(name: Text): Boolean = line == name || line.starts(t"$name ")
 
-            value.let: rendered =>
-              tpe.lay(Out.println(rendered)): typeName =>
-                Out.println(t"$rendered : $typeName")
+      // The text shown below the box — the result, error, or command message. Captured (rather
+      // than printed straight to `Out`) so the identical rendering is reused when the transcript
+      // is replayed after a resize. It ends with a newline when non-empty, so the next inline
+      // block starts on a fresh line; empty means the line produced nothing (a definition/Unit).
+      val result: Text =
+        if line == t"/disconnect" then
+          running = false
+          t""
+        else if line == t"/quit" then
+          duplex.send(Stream(framed(encode(Repl.Request.Quit(0)))))
+          running = false
+          t""
+        else if line == t"/clear" then
+          // Drop the whole session and wipe the screen AND scrollback (`\e[3J`), leaving a fresh
+          // editor at the top. The just-submitted `/clear` box (already frozen by `finish`) is
+          // cleared along with it, and the emptied transcript means a later resize starts clean.
+          transcript.clear()
+          Out.print(t"\e[2J\e[3J\e[H")
+          t""
+        else if line.starts(t"/") && !serverCommand(t"/set") && !serverCommand(t"/unimport") then
+          t"flame: unknown command: $line\n"
+        else
+          duplex.send(Stream(framed(encode(Repl.Request.Submit(0, line)))))
+          replyText(submits.take().nn)
 
-            if diagnostics != t"" then Out.println(diagnostics)
+      if result != t"" then Out.print(result)
 
-          case Repl.Reply.Threw(_, output, diagnostics, _) =>
-            if output != t"" then Out.print(output)
-            Out.println(diagnostics)
-
-          case Repl.Reply.Rejected(_, diagnostics, _) => Out.println(diagnostics)
-          case Repl.Reply.Crashed(_, diagnostics, _)  => Out.println(diagnostics)
-          case Repl.Reply.Failed(_, message)          => Out.println(message)
-          case Repl.Reply.Tokenized(_, _)             => ()
-          case Repl.Reply.Completed(_, _)             => ()
+      // Keep the line so a resize can re-render the whole session from the top: the box redraws
+      // from `tokens` (reflowing to the new width) and the result is reprinted verbatim. `/clear`
+      // is the exception — it just wiped the session, so it must not re-seed the transcript.
+      if line != t"/clear" then transcript += TranscriptEntry(line, tokens, result)
 
   // The loop has exited (Ctrl+D/C, Escape, /quit, or a closed stream): stop the reader.
   live = false
 
 // The inline block: a bordered editor box showing the live-highlighted line with its
-// caret, and — when completions are active — a pane above it listing them, which
+// caret, and — when completions are active — a pane below it listing them, which
 // auto-sizes to the candidate count (capped) and vanishes when there are none.
 private def replPane
-  ( editor:     LineEditor,
-    tokens:     List[Repl.Token],
-    candidates: List[Repl.CompletionItem],
-    rows:       Int )
+  ( editor:    LineEditor,
+    tokens:    List[Repl.Token],
+    ghost:     Text,
+    rows:      Int,
+    compLines: List[Teletype] )
 :   Pane =
 
+  // A one-column empty spacer, so the editor sits one character in from each border edge.
+  def edge: Pane = panel(minWidth = 1, maxWidth = 1)(())
+
   val box = border(BorderStyle.rounded):
-    panel(minHeight = rows, maxHeight = rows):
-      val extent = summon[Extent]
-      val cols = extent.width.max(1)
-      extent.put(colourful(tokens))
-      val (curRow, curCol) = LineEditor.cursorPosition(editor.value, editor.position, cols)
-      extent.showCaret(curCol.z, curRow.z)
+    file
+     ( edge,
+       panel(minHeight = rows, maxHeight = rows):
+         val extent = summon[Extent]
+         val cols = extent.width.max(1)
+         // The ghost is shown faint after the line; it is not part of `editor.value`, so the
+         // caret still sits at the cursor, with the suggestion trailing to its right.
+         extent.put(if ghost == t"" then colourful(tokens) else colourful(tokens)+e"$Faint($ghost)")
+         val (curRow, curCol) = LineEditor.cursorPosition(editor.value, editor.position, cols)
+         extent.showCaret(curCol.z, curRow.z),
+       edge )
 
-  if candidates.isEmpty then box
+  // The completion pane below the box, sized exactly to the candidate lines (joined without a
+  // trailing newline, which would scroll the panel and clip the first row). When the pane
+  // shrinks or vanishes, the inline anchoring holds the box's top and clears the rows below it,
+  // so the editor never moves; when there are no candidates the block is just the box.
+  if compLines.isEmpty then box
   else
-    val shown = candidates.length.min(10)
+    val list = panel(minHeight = compLines.length, maxHeight = compLines.length):
+      Out.print(compLines.join(e"\n"))
 
-    val list = panel(minHeight = shown, maxHeight = shown):
-      candidates.take(shown).each: item =>
-        Out.println(t"${item.name}  ${item.signature}")
+    rank(box, list)
 
-    rank(list, box)
+// One replayable line of the session: the source `text` (to compute the box's wrapped height at
+// any terminal width), the highlight `tokens` (to redraw the box), and the `result` text printed
+// below it. See `runRepl`'s `transcript`/`replay`.
+private case class TranscriptEntry(text: Text, tokens: List[Repl.Token], result: Text)
+
+// A static (non-interactive) editor box for transcript replay: the same rounded border and
+// 1-column inner padding as `replPane`'s box, showing the highlighted line, but with no caret,
+// ghost, or completion pane. `rows` is the line's wrapped height at the current width.
+private def replayBox(tokens: List[Repl.Token], rows: Int): Pane =
+  def edge: Pane = panel(minWidth = 1, maxWidth = 1)(())
+
+  border(BorderStyle.rounded):
+    file
+     ( edge,
+       panel(minHeight = rows, maxHeight = rows)(summon[Extent].put(colourful(tokens))),
+       edge )
+
+// Renders a server reply to the text shown below the submitted line's box — the SAME text
+// whether printed live or reprinted when the transcript is replayed after a resize. Each
+// non-empty part ends with a newline (as the live output did), so lines flow correctly; an
+// empty result means the line produced no visible value (a definition, import, or Unit).
+private def replyText(reply: Repl.Reply): Text = reply match
+  case Repl.Reply.Ran(_, value, output, tpe, name, diagnostics, _) =>
+    // The value is shown only when there is one, as `name = value : type`, each part omitted
+    // when absent — so no bare `=`/`:` appears when there is no result.
+    val valueLine: Text =
+      val rendered: Text = value.or(t"")
+      if rendered == t"" then t"" else
+        val binding: Text = name.let { each => t"$each = " }.or(t"")
+        val typed:   Text = tpe.let { each => t" : $each" }.or(t"")
+        t"$binding$rendered$typed\n"
+
+    val diag: Text = if diagnostics != t"" then t"$diagnostics\n" else t""
+    t"$output$valueLine$diag"
+
+  case Repl.Reply.Threw(_, output, diagnostics, _) => t"$output$diagnostics\n"
+  case Repl.Reply.Rejected(_, diagnostics, _)      => t"$diagnostics\n"
+  case Repl.Reply.Crashed(_, diagnostics, _)       => t"$diagnostics\n"
+  case Repl.Reply.Failed(_, message)               => t"$message\n"
+  case Repl.Reply.Tokenized(_, _, _)               => t""
+  case Repl.Reply.Completed(_, _)                  => t""
+
+// The completion candidates as a minimally-styled Escritoire table (name / kind / type),
+// pre-rendered to lines so the pane can be sized to fit them exactly.
+private def completionTable(items: List[Repl.CompletionItem], width: Int): List[Teletype] =
+  import tableStyles.minimalTableStyle
+  import columnAttenuation.ignoreAttenuation
+
+  // Truncate the (often long) type so each candidate stays on one row — name + kind take the
+  // rest of the width.
+  val typeWidth = (width - 28).max(8)
+  def signature(text: Text): Text =
+    if text.length > typeWidth then t"${text.keep(typeWidth - 1)}…" else text
+
+  val table =
+    Scaffold[Repl.CompletionItem]
+     ( Column(e"name")(item => e"${item.name}"),
+       Column(e"kind")(item => e"${item.kind}"),
+       Column(e"type")(item => e"${signature(item.signature)}") )
+
+  table.tabulate(items).grid(width.max(1)).render.to(List)
 
 // On Tab, complete: a `/`-command line completes locally against `slashCommands`;
 // otherwise the server is asked and we block for the reply. A unique candidate is
@@ -612,7 +935,7 @@ private def accentOf(accent: Text): Accent =
 // Reconstructs the source line from the highlight tokens, colouring each through
 // the palette via Harlequin's syntax-highlighting renderer.
 private def colourful(tokens: List[Repl.Token]): Teletype =
-  import harlequin.syntaxHighlighting.teletypeable
+  import harlequin.syntaxHighlighting.tokenTeletypeable
 
   tokens.map: token =>
     harlequin.Token(token.text, accentOf(token.accent)).teletype
@@ -771,11 +1094,13 @@ private class LiveState:
       checkpointTokens = tokens
       log = log.filter(_._1 > v)
 
-// The client `/`-commands, with help text, offered as Tab completions when the line
-// starts with `/`. Keep in step with the dispatch in `converse`.
+// The `/`-commands offered as Tab completions when the line starts with `/`: the engine's
+// own commands (shared with the web front-end via `Repl.slashCommands`) plus the client-only
+// ones. Keep the client-only entries in step with the dispatch in `converse`.
 private val slashCommands: List[(Text, Text)] =
-  List
-    ( t"/disconnect" -> t"leave the session, keeping the server running",
+  Repl.slashCommands ++ List
+    ( t"/clear"      -> t"clear the screen and forget the session history",
+      t"/disconnect" -> t"leave the session, keeping the server running",
       t"/quit"       -> t"stop the server and quit" )
 
 // Replaces the partial identifier ending at the cursor with the completion `name`,
