@@ -29,7 +29,7 @@ import webserverErrorPages.minimalErrorPage
 // Messages exchanged with the browser as JSON over the WebSocket. Flat case classes (not
 // enums) so the JSON shape — `{"kind":…,"seq":…,…}` — is predictable for the JavaScript.
 case class WebRequest(kind: Text, seq: Int, code: Text, offset: Int)
-case class WebToken(text: Text, accent: Text)
+case class WebToken(text: Text, accent: Text, role: Text = t"")
 case class WebCompletion(name: Text, kind: Text, signature: Text)
 
 case class WebReply
@@ -76,13 +76,15 @@ val replScript: Text = t"""
     ".tok-modifier { color: #569cd6; }",
     ".tok-string { color: #ce9178; }",
     ".tok-number { color: #b5cea8; }",
-    ".tok-typed { color: #4ec9b0; }",
-    ".tok-term { color: #dcdcaa; }",
-    ".tok-ident { color: #9cdcfe; }",
+    ".tok-typal { color: #4ec9b0; }",
+    ".tok-term { color: #9cdcfe; }",
     ".tok-symbol { color: #d4d4d4; }",
     ".tok-parens { color: #ffd700; }",
     ".tok-error { color: #f48771; text-decoration: underline; }",
-    ".tok-unparsed { color: #6a9955; }"
+    ".tok-unparsed { color: #6a9955; }",
+    // A term/type token's role is a second class: italicise bindings (a `val`/`def`/param or
+    // pattern name, a class/type definition, or a type parameter) on top of the accent's colour.
+    ".binding { font-style: italic; }"
   ].join("\\n");
   var styleEl = document.createElement("style");
   styleEl.textContent = css;
@@ -228,7 +230,9 @@ val replScript: Text = t"""
   function makeSpans(parent, tokens) {
     for (var i = 0; i < tokens.length; i++) {
       var span = document.createElement("span");
-      span.className = "tok-" + tokens[i].accent;
+      // The accent is the colour class; a term/type token's role (binding/usage) is a second
+      // class, so the stylesheet can e.g. italicise .binding on top of the accent's colour.
+      span.className = "tok-" + tokens[i].accent + (tokens[i].role ? " " + tokens[i].role : "");
       span.textContent = tokens[i].text;
       parent.appendChild(span);
     }
@@ -253,6 +257,20 @@ val replScript: Text = t"""
     if (cls) div.className = cls;
     div.textContent = text;
     log.appendChild(div);
+  }
+
+  // A result value is server-rendered HTML (the engine's HTML typeclass cascade), so it is inserted
+  // as innerHTML, not text. The value itself is already HTML-safe (honeycomb-escaped server-side).
+  function logHtml(cls, html) {
+    if (!html) return;
+    var div = document.createElement("div");
+    if (cls) div.className = cls;
+    div.innerHTML = html;
+    log.appendChild(div);
+  }
+
+  function escapeHtml(s) {
+    return s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
   }
 
   function submit() {
@@ -555,11 +573,13 @@ val replScript: Text = t"""
     logBlock("", out);
     if (msg.kind === "result") {
       var v = msg.value;
+      var html = "";
       if (v) {
-        if (msg.name) v = msg.name + " = " + v;
-        if (msg.tpe) v += " : " + msg.tpe;
+        html = v;
+        if (msg.name) html = escapeHtml(msg.name) + " = " + html;
+        if (msg.tpe) html += " : " + escapeHtml(msg.tpe);
       }
-      logBlock("result", v);
+      logHtml("result", html);
       logBlock("error", msg.diagnostics);
     } else {
       logBlock("error", msg.diagnostics);
@@ -623,7 +643,7 @@ class ReplPage() extends Archetype:
     Fragment[Flow](H1(t"Flame REPL"), Pre(), Code(), Script(replScript))
 
 private def webTokens(tokens: List[Repl.Token]): List[WebToken] =
-  tokens.map { token => WebToken(token.text, token.accent) }
+  tokens.map { token => WebToken(token.text, token.accent, token.role.or(t"")) }
 
 private def webCompletions(items: List[Repl.CompletionItem]): List[WebCompletion] =
   items.map { item => WebCompletion(item.name, item.kind, item.signature) }
@@ -661,8 +681,10 @@ def serveHttp(port: Int, quit: Promise[Unit])(using Monitor, System, Probate, Cl
   given Scalac[3.8] = Scalac(Nil)
 
   // A single shared session — REPL state is shared across browser tabs, exactly as the
-  // socket server shares it across connections; `react` serializes concurrent submits.
-  val repl = Repl()
+  // socket server shares it across connections; `react` serializes concurrent submits. The web
+  // front-end renders result values as HTML (via `flame.HtmlRender`'s Renderable→Showable→toString
+  // cascade), unlike the CLI's teletype `Inspect` rendering.
+  val repl = Repl.make(Repl.Prelude.empty, Repl.Rendering.Html)
 
   // A token unique to this server process. The client remembers it and, on reconnecting,
   // compares: a different token means it reached a fresh process (e.g. after a restart),

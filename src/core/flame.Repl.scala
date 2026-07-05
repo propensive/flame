@@ -37,8 +37,10 @@ import java.lang as jl
 import java.net as jn
 import java.nio.channels as jnc
 import java.nio.file as jnf
+import java.util.regex as jur
 
 import scala.collection.concurrent.TrieMap
+import scala.collection.mutable as scm
 import scala.quoted.*
 
 // Dotty parser internals, used (aliased, to avoid clashing with Soundness names) only to
@@ -109,12 +111,12 @@ object Repl:
     case Crashed(notices: List[Notice], error: StackTrace)
 
   // One syntax-highlighting token of the submitted line: its verbatim text, the
-  // lowercased name of its Harlequin accent (`keyword`, `ident`, `number`, …),
-  // and — where the typechecker resolved one — the fully-qualified Scala type of
-  // the token (`Unset` for keywords, punctuation, whitespace, …). Sent in the
-  // JSON response for the client to colourise; ANSI rendering is the client's
-  // concern.
-  case class Token(text: Text, accent: Text, tpe: Optional[Text])
+  // lowercased name of its Harlequin accent (a COLOUR category — `keyword`, `term`,
+  // `typal`, `number`, …), the token's `role` (`binding`/`usage` for a term or type,
+  // `Unset` otherwise — a styling policy may e.g. italicise bindings), and — where the
+  // typechecker resolved one — the fully-qualified Scala type of the token. Sent to the
+  // client to colourise/style; ANSI/CSS rendering is the front-end's concern.
+  case class Token(text: Text, accent: Text, tpe: Optional[Text], role: Optional[Text] = Unset)
 
   // One tab-completion candidate: the `name` to insert, its `kind` (term, method,
   // type, …) and its rendered type `signature`. The Harlequin `Completion`'s
@@ -197,7 +199,11 @@ object Repl:
   private def project(source: SourceCode): List[Token] =
     val lines: List[List[Token]] = source.lines.to(List).map: line =>
       line.map: token =>
-        Token(token.text, token.accent.toString.tt.lower, token.meta.let(_.tpe.qualified))
+        Token
+         ( token.text,
+           token.accent.toString.tt.lower,
+           token.meta.let(_.tpe.qualified),
+           token.role.let(_.toString.tt.lower) )
 
     // `SourceCode.lines` was split on (and dropped) the newlines, so re-insert a
     // newline token between consecutive lines — otherwise multi-line code collapses
@@ -221,9 +227,18 @@ object Repl:
     import highlighting.typecheckedScala
 
     val contextLines: Text = context.map { line => t"$line\n" }.join
-    val prefix:  Text = if code.trim.starts(t"import ") then contextLines
-                        else t"${contextLines}val __completion = "
-    val wrapped: Text = t"$prefix$code"
+
+    // The completion point can sit inside a DEFINITION, not just a bare expression — e.g.
+    // `def foo() = System.o`, `val x = System.o`, or a nested `class C { def m = System.o }`.
+    // `val __completion = <code>` only parses when `<code>` is an expression (`val __ = def f = …`
+    // is a syntax error), which is why completing inside a `def`/`val`/`class` body previously
+    // produced nothing. Wrapping in a BLOCK — `val __completion = { <code> }` — accepts ANY
+    // statement (a definition, an expression, even an import), so completion works anywhere in the
+    // line. A line that IS an import is still placed at top level, where a bare `import` is valid.
+    val importLine: Boolean = code.trim.starts(t"import ")
+    val prefix:  Text = if importLine then contextLines else t"${contextLines}val __completion = {\n"
+    val suffix:  Text = if importLine then t"" else t"\n}"
+    val wrapped: Text = t"$prefix$code$suffix"
     val caret:   Int  = prefix.length + offset
 
     Scala.highlight(wrapped, caret = caret.z).completions.lay(Nil): completions =>
@@ -299,7 +314,7 @@ object Repl:
         t"package", t"import", t"export", t"case", t"extension", t"new")
 
   private val defKeywordSet: Set[Text] = Set(t"def", t"class", t"trait", t"enum", t"given", t"extension")
-  private val valueAccents:  Set[Text] = Set(t"ident", t"number", t"string", t"term", t"typed")
+  private val valueAccents:  Set[Text] = Set(t"term", t"number", t"string", t"typal")
 
   // Every Scala 3 keyword, hard and soft. Harlequin's lexer tags SOFT keywords (`inline`,
   // `transparent`, `opaque`, `open`, `using`, `extension`, …) as identifiers — as Scala does —
@@ -478,13 +493,45 @@ object Repl:
 
     if i < 0 then 0 else i
 
+  // A compiler setting toggleable with `/set <name> [on|off]`: the user-facing `name`, the scalac
+  // `flag` it adds to every subsequent line's compile, and a short `description`. Held as raw flag
+  // text (rather than anthology's version-typed `scalacOptions` values) so flame can build
+  // `Scalac.Option[version](flag)` directly for its `version`, exactly as it did for `-experimental`.
+  case class CompilerSetting(name: Text, flag: Text, description: Text)
+
+  // The settings `/set` recognises. Curated to flags that are boolean toggles (no argument) and
+  // valid for the REPL's Scala version; `experimental` keeps its original meaning. Order is the
+  // listing order for `/set` with no argument.
+  val compilerSettings: List[CompilerSetting] =
+    List
+     ( CompilerSetting(t"experimental", t"-experimental",
+         t"enable experimental language features and definitions"),
+       CompilerSetting(t"explain", t"-explain",
+         t"print a detailed explanation for each error"),
+       CompilerSetting(t"capture-checking", t"-language:experimental.captureChecking",
+         t"enable experimental capture checking"),
+       CompilerSetting(t"safer-exceptions", t"-language:experimental.saferExceptions",
+         t"enable the saferExceptions checked-exceptions feature"),
+       CompilerSetting(t"explicit-nulls", t"-Yexplicit-nulls",
+         t"treat reference types as non-nullable (Null is a separate type)"),
+       CompilerSetting(t"deprecation", t"-deprecation",
+         t"warn about uses of deprecated APIs"),
+       CompilerSetting(t"feature", t"-feature",
+         t"warn about uses of advanced language features that should be enabled explicitly"),
+       CompilerSetting(t"new-syntax", t"-new-syntax",
+         t"require the new `then`/`do`-free control-flow syntax") )
+
   // The `/`-commands the engine itself recognises, with help text. Front-ends offer these
   // as completions when a line begins with `/`; the CLI appends its own client-only
-  // commands (`/disconnect`, `/quit`) to these.
+  // commands (`/disconnect`, `/quit`) to these. Every compiler setting contributes a
+  // `/set <name>` entry so each is offered (and documented) in tab-completion.
   val slashCommands: List[(Text, Text)] =
-    List
-     ( t"/set experimental" -> t"enable experimental language features and definitions",
-       t"/unimport"         -> t"remove an earlier import from scope (by the tokens it was imported with)" )
+    List(t"/context" -> t"show the imports currently in scope")
+    ::: compilerSettings.map { setting => t"/set ${setting.name}" -> setting.description }
+    ::: List
+         ( t"/tasty"    -> t"show the rendered TASTy (typed AST) of an expression",
+           t"/bytecode" -> t"show the JVM bytecode of an expression or definition",
+           t"/unimport" -> t"remove an earlier import from scope (by the tokens it was imported with)" )
 
   // Completions for a `/`-command line: the recognised commands whose names extend `prefix`,
   // each rendered as a `command` candidate carrying its help text as the signature.
@@ -548,6 +595,122 @@ object Repl:
     val identifier: String = code.s.trim.nn
     identifier.matches("[A-Za-z_$][A-Za-z0-9_$]*").nn && !allKeywords.contains(identifier.tt)
 
+  // A `val`/`var`/`def` line's kind and the name it binds, past any leading modifiers — so the REPL
+  // can show a definition's name/value/signature the way it shows an auto-named expression's. `Unset`
+  // for anything else (imports, `given`/`type`/`class`, pattern `val (a, b) = …`, symbolic operator
+  // names, plain statements), which then keep their current no-output behaviour.
+  private val definitionPattern: jur.Pattern =
+    val modifiers = "private|protected|final|lazy|override|inline|transparent|implicit|sealed|abstract|open"
+    jur.Pattern.compile(s"^(?:(?:$modifiers)\\s+)*(val|var|def)\\s+([A-Za-z_\\$$][A-Za-z0-9_\\$$]*)\\b.*",
+        jur.Pattern.DOTALL).nn
+
+  def definitionKind(line: Text): Optional[(Text, Text)] =
+    val matcher = definitionPattern.matcher(line.trim.s).nn
+    if matcher.matches then (matcher.group(1).nn.tt, matcher.group(2).nn.tt) else Unset
+
+  // The index in `line` of the `def` body's `=` — the first `=` at bracket depth 0 that is not part
+  // of `=>`, `==`, `<=`, `>=` or `!=` (so default-argument `=`s, inside parens, and a `Int => String`
+  // return type are all skipped). `-1` if there is none (an abstract `def`, not valid at the REPL).
+  private def defBodyEquals(line: Text): Int =
+    val s: String = line.s
+    var depth: Int = 0
+    var i: Int = 0
+    var found: Int = -1
+    while found < 0 && i < s.length do
+      s.charAt(i) match
+        case '(' | '[' | '{' => depth += 1
+        case ')' | ']' | '}' => depth -= 1
+        case '=' if depth == 0 =>
+          val prev = if i > 0 then s.charAt(i - 1) else ' '
+          val next = if i + 1 < s.length then s.charAt(i + 1) else ' '
+          if next != '>' && next != '=' && prev != '<' && prev != '>' && prev != '!' && prev != '='
+          then found = i
+        case _ => ()
+      i += 1
+
+    found
+
+  // A `def`'s header — everything up to (not including) its body `=`, trimmed — e.g. `def f(a: Int):
+  // String`. Used to display the signature without invoking the method.
+  private def defHeader(line: Text): Text =
+    val equals = defBodyEquals(line)
+    (if equals < 0 then line else line.s.substring(0, equals).nn.tt).trim
+
+  // Whether a `def` header annotates its return type: a `:` at bracket depth 0 (a parameter's `:` is
+  // inside `(…)`, a type-parameter bound's inside `[…]`, so only the return-type colon is at depth 0).
+  private def annotatesReturnType(header: Text): Boolean =
+    val s: String = header.s
+    var depth: Int = 0
+    var i: Int = 0
+    var found: Boolean = false
+    while !found && i < s.length do
+      s.charAt(i) match
+        case '(' | '[' | '{' => depth += 1
+        case ')' | ']' | '}' => depth -= 1
+        case ':' if depth == 0 => found = true
+        case _ => ()
+      i += 1
+
+    found
+
+  // Applies `name` to a `???` for each parameter its header declares (`f(???, ???)(using ???)`), so
+  // typechecking `{ <def>; <application> }` yields the method's return type — used to infer an
+  // omitted return type without invoking the method (`???` is `Nothing`, so it conforms everywhere).
+  // Nullary `def`s (no parameter list) apply to nothing.
+  private def defApplication(header: Text, name: Text): Text =
+    // Each top-level `(…)` group's contents, in order.
+    def groups(text: Text): List[Text] =
+      val out:     scm.ListBuffer[Text] = scm.ListBuffer()
+      val current: StringBuilder        = StringBuilder()
+      var depth:   Int                  = 0
+      text.s.foreach: char =>
+        char match
+          case '(' =>
+            if depth > 0 then current.append(char)
+            depth += 1
+
+          case ')' =>
+            depth -= 1
+            if depth == 0 then out += current.toString.tt.also(current.setLength(0))
+            else current.append(char)
+
+          case _ =>
+            if depth > 0 then current.append(char)
+
+      out.to(List)
+
+    // The number of top-level (comma-separated) parameters in one clause's contents.
+    def params(clause: Text): Int =
+      if clause.trim == t"" then 0 else
+        var depth: Int = 0
+        var commas: Int = 0
+        clause.s.foreach:
+          case '(' | '[' | '{' => depth += 1
+          case ')' | ']' | '}' => depth -= 1
+          case ',' if depth == 0 => commas += 1
+          case _ => ()
+        commas + 1
+
+    val clauses: List[Text] = groups(header)
+    val applied: Text = clauses.map: clause =>
+      val prefix: Text = if clause.trim.starts(t"using ") || clause.trim.starts(t"implicit ") then t"using " else t""
+      val holes:  Text = List.fill(params(clause))(t"???").join(t", ")
+      t"($prefix$holes)"
+    . join
+
+    t"$name$applied"
+
+  // A `def`'s displayed signature: its header, plus the inferred return type when the source omits
+  // one (`def f(a: Int) = a` → `def f(a: Int): Int`). Inference typechecks the def applied to `???`s;
+  // if that fails (an unusual signature), the header is shown without a return type.
+  def defSignature(line: Text, name: Text, context: List[Text])(using Scalac[?], LocalClasspath): Text =
+    val header: Text = defHeader(line)
+    if annotatesReturnType(header) then header else
+      val probe: Text = t"{ $line\n${defApplication(header, name)} }"
+      safely(resultType(context, probe)).let(_.qualified) match
+        case tpe: Text => t"$header: $tpe"
+        case _         => header
+
   object Prelude:
     val empty: Prelude = Prelude(Nil, Nil)
 
@@ -558,12 +721,21 @@ object Repl:
   // fidelity.
   case class Prelude(imports: List[String], seedTasty: List[String])
 
+  // How a result value is rendered for display. `Inspect` (the default, the CLI) uses spectacular's
+  // `Inspectable` to produce a teletype/text rendering; `Html` (the web front-end) uses the
+  // `flame.HtmlRender` cascade (a `Renderable` → HTML, else `Showable` → text, else `toString`),
+  // producing an HTML string. Both render INSIDE the compiled wrapper (where the value's static type
+  // is known) and stash the resulting `Text` via `ReplBridge`, so the choice only changes the
+  // rendering call emitted into the wrapper.
+  enum Rendering:
+    case Inspect, Html
+
   def make[version <: Scalac.Versions]
-    ( prelude: Repl.Prelude )
+    ( prelude: Repl.Prelude, render: Repl.Rendering = Repl.Rendering.Inspect )
     ( using Scalac[version], Classloader, TemporaryDirectory )
   :   Repl[version] =
 
-    new Repl[version](prelude = prelude)
+    new Repl[version](prelude = prelude, render = render)
 
   inline def apply[version <: Scalac.Versions](inline body: Unit = ())
     ( using scalac: Scalac[version], classloader: Classloader, temporary: TemporaryDirectory )
@@ -572,8 +744,9 @@ object Repl:
     ${ReplMacro.bound[version]('body, 'scalac, 'classloader, 'temporary)}
 
 class Repl[version <: Scalac.Versions]
-  ( layout:  Repl.Layout  = Repl.Layout.Standard(),
-    prelude: Repl.Prelude = Repl.Prelude.empty )
+  ( layout:  Repl.Layout    = Repl.Layout.Standard(),
+    prelude: Repl.Prelude   = Repl.Prelude.empty,
+    render:  Repl.Rendering = Repl.Rendering.Inspect )
   ( using scalac: Scalac[version], classloader: Classloader, temporary: TemporaryDirectory ):
 
   import Repl.Outcome
@@ -608,9 +781,10 @@ class Repl[version <: Scalac.Versions]
   // and re-inject them into every subsequent line, exactly as the prelude's imports are.
   private var imports: List[Text] = Nil
 
-  // When set (with `/set experimental`), `-experimental` is added to the compiler options
-  // for every later line, so the user can define and use `@experimental` features.
-  private var experimentalEnabled: Boolean = false
+  // The compiler settings the user has switched on with `/set <name>`; each contributes its scalac
+  // flag to every later line's compile (see `effectiveScalac`). Holds setting NAMES (keys into
+  // `Repl.compilerSettings`), not the flags themselves.
+  private val enabledSettings: scm.Set[Text] = scm.Set()
 
   private val out: Path on Linux = unsafely(temporaryDirectory/Uuid())
   locally(jnf.Files.createDirectories(jnf.Path.of(out.encode.s)).nn)
@@ -637,12 +811,16 @@ class Repl[version <: Scalac.Versions]
   // runs its body). `rendered` is evaluated after a successful run to supply the
   // `Outcome.Ran` value — `Unset` for statements, or the inspected result for an
   // expression line.
-  // The compiler to use for the next line: the session's `Scalac` plus `-experimental`
-  // when the user has turned it on. `Scalac.Option` is contravariant in its version, so a
-  // `-experimental` option built for this `version` is a valid extra flag for it.
+  // The compiler to use for the next line: the session's `Scalac` plus the flag of every setting the
+  // user has switched on (`/set <name>`). `Scalac.Option` is contravariant in its version, so an
+  // option built for this `version` is a valid extra flag for it.
   private def effectiveScalac: Scalac[version] =
-    if !experimentalEnabled then scalac
-    else Scalac(scalac.options :+ Scalac.Option[version](t"-experimental"))
+    val extra: List[Scalac.Option[version]] =
+      Repl.compilerSettings
+        .filter { setting => enabledSettings.contains(setting.name) }
+        .map { setting => Scalac.Option[version](setting.flag) }
+
+    if extra.isEmpty then scalac else Scalac(scalac.options ::: extra)
 
   private def compile(imports: List[Text], code: Text)(rendered: => Optional[Text])
       (using Monitor, System, Probate)
@@ -698,9 +876,29 @@ class Repl[version <: Scalac.Versions]
 
   // The import statements a submitted line introduces — each `;`-or-newline segment that
   // begins with `import`, so any definition or expression sharing the line is left out
-  // (those persist as history members, or not at all).
+  // (those persist as history members, or not at all). A single `import a.*, b.C` statement
+  // is a SEQUENCE of imports: its comma-separated clauses are split into one `import` each, so
+  // the session tracks (and confirms, lists, and un-imports) them individually.
   private def importsIn(line: Text): List[Text] =
-    line.cut(t"\n").flatMap(_.cut(t";")).map(_.trim).filter(_.starts(t"import "))
+    line.cut(t"\n").flatMap(_.cut(t";")).map(_.trim).filter(_.starts(t"import ")).flatMap: statement =>
+      importClauses(statement.skip(t"import ".length)).map { clause => t"import $clause" }
+
+  // Splits an import clause-list on its top-level commas — those outside any `{…}` selector group
+  // (or `[…]`/`(…)`), which are separators between clauses, not within one — trimming each clause
+  // and dropping empties. E.g. `a.*, b.{c, d}, e.given` → `a.*`, `b.{c, d}`, `e.given`.
+  private def importClauses(clauses: Text): List[Text] =
+    val parts:   scm.ListBuffer[Text] = scm.ListBuffer()
+    val current: StringBuilder        = StringBuilder()
+    var depth:   Int                  = 0
+
+    clauses.s.foreach:
+      case ch @ ('{' | '[' | '(') => depth += 1; current.append(ch)
+      case ch @ ('}' | ']' | ')') => depth -= 1; current.append(ch)
+      case ','  if depth == 0     => parts += current.toString.tt.trim; current.clear()
+      case ch                     => current.append(ch)
+
+    parts += current.toString.tt.trim
+    parts.to(List).filter(_ != t"")
 
   // The imports to prepend to a line's wrapper: the prelude's plus the user's accumulated
   // imports, minus any the line itself repeats (so re-importing the same path never makes
@@ -714,14 +912,25 @@ class Repl[version <: Scalac.Versions]
   // sits in an `@experimental` scope because `Inspectable` is `@experimental`, so
   // this compiles even when the contextual `Scalac` is not in experimental mode.
   // Imports are not baked in here — `compile` places them at file scope.
-  private def expressionCode(name: Text, key: Text, line: Text): Text =
-    val put: Text = t"flame.ReplBridge.put(${session.toString.tt}L, \"$key\", $name.inspect)"
+  // The two lines that render the value bound to `ref` and stash the rendering under `key` for the
+  // outcome: an `@experimental` initializer (experimental mode is enabled just here, since spectacular
+  // `inspect` is `@experimental`) whose body renders per the session's `render` mode — `Inspect` uses
+  // `.inspect` (teletype/text, CLI), `Html` uses `flame.HtmlRender.render` (the typeclass cascade →
+  // HTML, web). The rendering runs INSIDE the wrapper, where `ref`'s static type is known.
+  private def renderInto(ref: Text, key: Text): List[Text] =
+    val put: Text = render match
+      case Repl.Rendering.Inspect =>
+        t"import spectacular.inspect; flame.ReplBridge.put(${session.toString.tt}L, \"$key\", $ref.inspect)"
+
+      case Repl.Rendering.Html =>
+        t"flame.ReplBridge.put(${session.toString.tt}L, \"$key\", flame.HtmlRender.render($ref))"
 
     List
-      ( t"val $name = $line",
-        t"@scala.annotation.experimental private val ${name}_inspected: scala.Unit =",
-        t"  { import spectacular.inspect; $put }" )
-    . join(t"\n")
+      ( t"@scala.annotation.experimental private val ${ref}_shown: scala.Unit =",
+        t"  { $put }" )
+
+  private def expressionCode(name: Text, key: Text, line: Text): Text =
+    (t"val $name = $line" :: renderInto(name, key)).join(t"\n")
 
   // Like `expressionCode`, but for a line that is just an existing identifier: the value is bound
   // to a PRIVATE, differently-named val (`${name}_echo`, not `val $name = $name`, which would be a
@@ -731,13 +940,70 @@ class Repl[version <: Scalac.Versions]
   // (only the `inspect` renderer, which is itself `@experimental`, sits in that scope).
   private def echoCode(name: Text, key: Text, line: Text): Text =
     val bound: Text = t"${name}_echo"
-    val put: Text = t"flame.ReplBridge.put(${session.toString.tt}L, \"$key\", $bound.inspect)"
+    (t"private val $bound = $line" :: renderInto(bound, key)).join(t"\n")
 
+  // The probe object body for `/tasty <expr>`: it reflects `<expr>`'s typed AST with hyperbole's
+  // `syntax` macro (which runs at compile time and reifies the tree WITHOUT evaluating `<expr>`),
+  // renders it to a coloured ANSI table via `flame.TastyRender`, and prints it — so the render is
+  // captured as the line's `output`. Wrapped by `layout.wrap`, it sits inside the numbered object
+  // with the history imports, so `<expr>` sees the session's prior imports and definitions.
+  // The `val` is `@experimental` because hyperbole (`Introspect`/`internal`) is itself experimental
+  // (built with `genericNumberLiterals`); the annotation enables experimental mode for its
+  // initializer, so no session-wide `/set experimental` is needed — exactly as `expressionCode`
+  // does for the `@experimental` `inspect` renderer.
+  private def tastyProbe(expr: Text): Text =
     List
-      ( t"private val $bound = $line",
-        t"@scala.annotation.experimental private val ${bound}_inspected: scala.Unit =",
-        t"  { import spectacular.inspect; $put }" )
+      ( t"@scala.annotation.experimental private val tastyRendered: scala.Unit =",
+        t"  scala.Predef.print(flame.TastyRender.render(hyperbole.Introspect.syntax(false)($expr)))" )
     . join(t"\n")
+
+  // `/tasty <expr>` shows the rendered TASTy (typed AST) of an expression — e.g. `/tasty (x: Int) =>
+  // x + 1` or `/tasty List(1, 2, 3).map(_ + 1)`. It compiles the probe above in the session scope;
+  // the expression is only type-checked and reflected, never run. A blank argument prints usage.
+  private def tasty(line: Text)(using Monitor, System, Probate)
+  :   Outcome logs CompileEvent raises CompilerError raises AsyncError =
+
+    val expr: Text = line.skip(t"/tasty".length).trim
+    if expr == t"" then Outcome.Ran(Nil, Unset, t"flame: usage: /tasty <expression>\n")
+    else compile(contextImports(line), tastyProbe(expr))(Unset)
+
+  // `/bytecode <code>` disassembles the JVM bytecode of an expression or definition — e.g. `/bytecode
+  // def fib(n: Int): Int = if n < 2 then n else fib(n - 1) + fib(n - 2)`. Unlike `/tasty`, this is a
+  // pure COMPILE (no macro, no run): the code is compiled into a throwaway wrapper object in the
+  // session scope, then `flame.BytecodeRender` reads that class's bytes back through the REPL's
+  // classloader (never loading the class) and renders each method. An expression is wrapped in a
+  // method first (so it becomes disassemblable code); a definition that cannot be a method's RHS is
+  // then compiled directly. The wrapper is neither run nor added to `history`, so it does not pollute
+  // the session — only `index` advances, to keep the object name unique.
+  private def bytecode(line: Text)(using Monitor, System, Probate)
+  :   Outcome logs CompileEvent raises CompilerError raises AsyncError =
+
+    val code: Text = line.skip(t"/bytecode".length).trim
+    if code == t"" then Outcome.Ran(Nil, Unset, t"flame: usage: /bytecode <expression or definition>\n")
+    else
+      given LocalClasspath = classpath
+      val name: Text = layout.objectName(index)
+
+      // Compile `body` as the wrapper object's contents, returning the result and its notices.
+      def attempt(body: Text): (CompileResult, List[Notice]) =
+        val source  = layout.wrap(index, history, contextImports(line), body)
+        val process = effectiveScalac(classpath)(Map(t"$name.scala" -> source), out)
+        (process.complete(), process.notices.to(List))
+
+      // Try the code as an expression (wrapped in a method) first, then as a raw definition.
+      val (result, notices) = attempt(t"def bytecodeResult = $code") match
+        case (CompileResult.Success, ns) => (CompileResult.Success, ns)
+        case _                           => attempt(code)
+
+      result match
+        case CompileResult.Success =>
+          index += 1
+          BytecodeRender.render(t"$name$$.class")(using loader) match
+            case rendered: Text if rendered.trim != t"" => Outcome.Ran(Nil, Unset, t"$rendered\n")
+            case _ => Outcome.Ran(Nil, Unset, t"flame: no bytecode was produced\n")
+
+        case CompileResult.Crash(trace) => Outcome.Crashed(notices, trace)
+        case CompileResult.Failure      => Outcome.Rejected(notices)
 
   private def evaluate(line: Text)(using Monitor, System, Probate)
   :   Outcome logs CompileEvent raises CompilerError raises AsyncError =
@@ -781,15 +1047,34 @@ class Repl[version <: Scalac.Versions]
 
     expression match
       case _: Outcome.Rejected =>
-        val statement = compile(contextImports(line), line)(Unset)
+        // The line is a definition or statement, not an expression. A `val`/`var`/`def` is displayed
+        // like an auto-named expression (name/value/type, or a `def`'s signature); everything else
+        // (imports, `given`/`class`/…, plain statements) keeps its prior no-output behaviour.
+        Repl.definitionKind(line) match
+          case (t"val" | t"var", bound: Text) => valDefinition(line, bound, key, context)
 
-        // The line compiled as a statement; if it introduced imports, remember them so
-        // every later line re-establishes them.
-        statement match
-          case _: Outcome.Ran => imports = (imports ::: importsIn(line)).distinct
-          case _              => ()
+          case (t"def", defName: Text) =>
+            compile(contextImports(line), line)(Unset) match
+              case ran: Outcome.Ran => ran.copy(output = t"${Repl.defSignature(line, defName, context)}\n")
+              case other            => other
 
-        statement
+          case _ =>
+            val statement = compile(contextImports(line), line)(Unset)
+
+            // The line compiled as a statement; if it introduced imports, remember them so every
+            // later line re-establishes them, and confirm each imported clause on its own line.
+            statement match
+              case ran: Outcome.Ran =>
+                val introduced: List[Text] = importsIn(line)
+                imports = (imports ::: introduced).distinct
+
+                if introduced.isEmpty then ran else
+                  val confirmed: Text =
+                    introduced.map { each => t"Imported ${importClause(each)}" }.join(t"", t"\n", t"\n")
+
+                  ran.copy(output = t"${ran.output}$confirmed")
+
+              case other => other
 
       case ran: Outcome.Ran =>
         // An echoed identifier consumes no `resN` number — it introduced no new result.
@@ -798,6 +1083,35 @@ class Repl[version <: Scalac.Versions]
 
       case other =>
         other
+
+  // Displays a `val`/`var` definition like an auto-named expression: the definition is compiled (so
+  // the binding persists in the session) with an appended inspection of its value, then shown as
+  // `name = value : type`. A `lazy val` is NOT inspected — that would force it — so only its name and
+  // type are shown. The type comes from typechecking `{ <definition>; <name> }` (never run).
+  private def valDefinition(line: Text, bound: Text, key: Text, context: List[Text])
+      (using Monitor, System, Probate)
+  :   Outcome logs CompileEvent raises CompilerError raises AsyncError =
+
+    given LocalClasspath = classpath
+
+    val tpe: Optional[Text] =
+      safely(Repl.resultType(context, t"{ $line\n$bound }")).let(_.qualified)
+
+    val lazyVal: Boolean =
+      line.trim.cut(t" ").takeWhile { word => word != t"val" && word != t"var" }.contains(t"lazy")
+
+    if lazyVal then
+      compile(contextImports(line), line)(Unset) match
+        case ran: Outcome.Ran => ran.copy(output = t"$bound${tpe.let { each => t": $each" }.or(t"")}\n")
+        case other            => other
+    else
+      val inspected: Text = (line :: renderInto(bound, key)).join(t"\n")
+
+      compile(contextImports(line), inspected):
+        Optional(ReplBridge.fetch[String](session, key.s)).let(_.tt)
+      . match
+          case ran: Outcome.Ran => ran.copy(name = bound, tpe = tpe)
+          case other            => other
 
   // The prelude's pickled definitions and binding accessors are recompiled once,
   // as the first object (`rs$line$0`), straight from TASTy — preserving the
@@ -851,18 +1165,42 @@ class Repl[version <: Scalac.Versions]
         imports = kept
         Outcome.Ran(Nil, Unset, t"flame: removed import: ${importClause(arg)}\n")
 
+  // `/set <name> [on|off]` toggles a compiler setting (see `Repl.compilerSettings`) for every
+  // subsequent line — no argument means `on`. `/set` with no name lists the settings and their
+  // current state; an unknown name reports the known ones.
   private def set(line: Text): Outcome =
     line.cut(t" ").filter(_ != t"") match
-      case _ :: setting :: rest if setting == t"experimental" =>
-        experimentalEnabled = rest match
-          case value :: _ => !(value.lower == t"off" || value.lower == t"false")
-          case Nil        => true
+      case _ :: name :: rest =>
+        Repl.compilerSettings.find(_.name == name) match
+          case Some(setting) =>
+            val enable: Boolean = rest match
+              case value :: _ => !(value.lower == t"off" || value.lower == t"false")
+              case Nil        => true
 
-        val word: Text = if experimentalEnabled then t"enabled" else t"disabled"
-        Outcome.Ran(Nil, Unset, t"flame: experimental mode $word\n")
+            if enable then enabledSettings.add(name) else enabledSettings.remove(name)
+            val word: Text = if enable then t"enabled" else t"disabled"
+            Outcome.Ran(Nil, Unset, t"flame: $name $word\n")
+
+          case None =>
+            val known: Text = Repl.compilerSettings.map(_.name).join(t", ")
+            Outcome.Ran(Nil, Unset, t"flame: unknown setting: $name (known: $known)\n")
 
       case _ =>
-        Outcome.Ran(Nil, Unset, t"flame: usage: /set experimental [on|off]\n")
+        val listing: Text = Repl.compilerSettings.map: setting =>
+          val mark: Text = if enabledSettings.contains(setting.name) then t"on " else t"off"
+          t"  [$mark] ${setting.name} — ${setting.description}"
+        . join(t"\n")
+
+        Outcome.Ran(Nil, Unset, t"flame: compiler settings (/set <name> [on|off]):\n$listing\n")
+
+  // `/context` lists every import currently in scope — the prelude's baseline imports plus the
+  // ones the user has added — so the session's namespace can be inspected without changing it.
+  private def showContext: Outcome =
+    val all = prelude.imports.map(_.tt) ::: imports
+    if all.isEmpty then Outcome.Ran(Nil, Unset, t"flame: no imports in scope\n")
+    else
+      val listing = all.map { each => t"  import ${importClause(each)}" }.join(t"\n")
+      Outcome.Ran(Nil, Unset, t"flame: imports in scope:\n$listing\n")
 
   def interpret(line: Text)(using Monitor, System, Probate)
   :   Outcome logs CompileEvent raises CompilerError raises AsyncError =
@@ -874,6 +1212,9 @@ class Repl[version <: Scalac.Versions]
     def lineOutcome: Outcome =
       if line.trim.starts(t"/unimport") then unimport(line.trim)
       else if line.trim.starts(t"/set") then set(line.trim)
+      else if line.trim == t"/context" then showContext
+      else if line.trim.starts(t"/tasty") then tasty(line.trim)
+      else if line.trim.starts(t"/bytecode") then bytecode(line.trim)
       else evaluate(line)
 
     ensureSeeded().lay(lineOutcome):
@@ -1000,48 +1341,63 @@ class Repl[version <: Scalac.Versions]
   def completionsAt(code: Text, offset: Int)(using Monitor, System, Probate)
   :   List[Repl.CompletionItem] logs CompileEvent =
 
-    // `/unimport <tokens>` completes against the imports currently in scope, so the user can
-    // pick the one to remove; other `/`-command lines complete against the engine's known
-    // commands (the same list the CLI uses), not the Scala compiler.
+    // `/unimport <tokens>` completes against the imports currently in scope, so the user can pick
+    // the one to remove; `/tasty <expr>` and `/bytecode <code>` complete their ARGUMENT as ordinary
+    // Scala (the command prefix is stripped and the offset shifted, so member/keyword completion
+    // behaves as on a normal line — the client's token-based insertion keeps the command prefix);
+    // other `/`-command lines complete against the engine's known commands, not the Scala compiler.
+    val exprHead: Optional[Text] = List(t"/tasty ", t"/bytecode ").find(code.starts(_)).getOrElse(Unset)
+
     if code.trim.starts(t"/unimport") then
       val arg = code.trim.skip(t"/unimport".length).trim
       imports.filter { each => importClause(each).starts(arg) }.map: each =>
         Repl.CompletionItem(t"/unimport ${importClause(each)}", t"command", t"")
-    else if code.trim.starts(t"/") then Repl.slashCompletions(code.trim)
-    else
-      given LocalClasspath = classpath
+    else exprHead match
+      case head: Text => scalaCompletions(code.skip(head.length), (offset - head.length).max(0))
+      case _ =>
+        if code.trim.starts(t"/") then Repl.slashCompletions(code.trim)
+        else scalaCompletions(code, offset)
 
-      // The scope a compiled line would see: the prelude's and the user's persistent imports,
-      // plus the prior wrapper objects' members and givens (as `import rs$line$N.{given, *}`).
-      val context: List[Text] =
-        (prelude.imports.map(_.tt) ::: imports) ::: history.map { name => t"import $name.{given, *}" }
+  // Ordinary Scala completions at `offset` in `code`: member selection (`expr.partial`), infix
+  // (`expr partial`, plus `match`), or — at a bare position — the syntactic keywords merged with
+  // the compiler's name/definition completions. Split out of `completionsAt` so `/tasty <expr>`
+  // can reuse it on the stripped expression.
+  private def scalaCompletions(code: Text, offset: Int)(using Monitor, System, Probate)
+  :   List[Repl.CompletionItem] logs CompileEvent =
 
-      // The full member list of `expr.`, compiled ONCE and cached under the base, so typing
-      // further member characters (or backspacing) costs no recompilation. The base's type is
-      // fixed within a line; the cache is cleared on the next submission (`interpret`). Shared
-      // by member selection (`expr.partial`) and infix completion (`expr partial`).
-      def members(base: Text): List[Repl.CompletionItem] =
-        completionCache.getOrElseUpdate(base, safely(Repl.complete(context, base, base.length)).or(Nil))
+    given LocalClasspath = classpath
 
-      Repl.memberBase(code, offset) match
-        case (base: Text, prefix) =>
-          mutex(members(base)).filter(_.name.starts(prefix))
+    // The scope a compiled line would see: the prelude's and the user's persistent imports,
+    // plus the prior wrapper objects' members and givens (as `import rs$line$N.{given, *}`).
+    val context: List[Text] =
+      (prelude.imports.map(_.tt) ::: imports) ::: history.map { name => t"import $name.{given, *}" }
 
-        case _ =>
-          Repl.infixBase(code, offset) match
-            // A value followed by a space: offer the receiver's methods (usable infix) plus the
-            // `match` keyword (only ever offered here, i.e. after a trailing space).
-            case (base: Text, prefix) =>
-              val matched  = mutex(members(base)).filter(_.name.starts(prefix))
-              val matchKw  =
-                if t"match".starts(prefix) then List(Repl.CompletionItem(t"match", t"keyword", t"")) else Nil
+    // The full member list of `expr.`, compiled ONCE and cached under the base, so typing
+    // further member characters (or backspacing) costs no recompilation. The base's type is
+    // fixed within a line; the cache is cleared on the next submission (`interpret`). Shared
+    // by member selection (`expr.partial`) and infix completion (`expr partial`).
+    def members(base: Text): List[Repl.CompletionItem] =
+      completionCache.getOrElseUpdate(base, safely(Repl.complete(context, base, base.length)).or(Nil))
 
-              matchKw ::: matched
+    Repl.memberBase(code, offset) match
+      case (base: Text, prefix) =>
+        mutex(members(base)).filter(_.name.starts(prefix))
 
-            // Otherwise prepend the keywords valid at this position (the compiler offers none)
-            // to its name/definition completions.
-            case _ =>
-              Repl.keywordCompletions(code, offset) ::: mutex(safely(Repl.complete(context, code, offset)).or(Nil))
+      case _ =>
+        Repl.infixBase(code, offset) match
+          // A value followed by a space: offer the receiver's methods (usable infix) plus the
+          // `match` keyword (only ever offered here, i.e. after a trailing space).
+          case (base: Text, prefix) =>
+            val matched  = mutex(members(base)).filter(_.name.starts(prefix))
+            val matchKw  =
+              if t"match".starts(prefix) then List(Repl.CompletionItem(t"match", t"keyword", t"")) else Nil
+
+            matchKw ::: matched
+
+          // Otherwise prepend the keywords valid at this position (the compiler offers none)
+          // to its name/definition completions.
+          case _ =>
+            Repl.keywordCompletions(code, offset) ::: mutex(safely(Repl.complete(context, code, offset)).or(Nil))
 
   // Computes tab completions at `offset` in `code` and replies (with `id`).
   private def complete(id: Int, code: Text, offset: Int)(using Monitor, System, Probate)
@@ -1080,7 +1436,9 @@ class Repl[version <: Scalac.Versions]
           Repl.Reply.Rejected(id, notices.map(_.message).join(t"; "), tokens)
 
         case Outcome.Threw(_, error, output) =>
-          Repl.Reply.Threw(id, output, error.toString.tt, tokens)
+          // Render the exception's (trimmed) stack trace as a coloured teletype listing, rather than
+          // just its `toString`, so a thrown error surfaces where it came from.
+          Repl.Reply.Threw(id, output, StackTraceRender.render(error), tokens)
 
         case Outcome.Crashed(notices, _) =>
           Repl.Reply.Crashed(id, notices.map(_.message).join(t"; "), tokens)

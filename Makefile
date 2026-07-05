@@ -14,6 +14,9 @@ flame.jar: assembly
 flame: flame.jar
 	java -Dbuild.executable=flame -jar flame.jar
 
+install: flame
+	cp flame ${HOME}/.local/bin/
+
 # Run the REPL directly from the assembly.
 run: assembly
 	java -jar out/flame/client/assembly.dest/out.jar
@@ -31,4 +34,4 @@ test:
 dev:
 	mill -w flame.client.compile
 
-.PHONY: assembly run web test dev
+.PHONY: assembly run web test dev install

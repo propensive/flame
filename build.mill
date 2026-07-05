@@ -45,7 +45,14 @@ object settings:
   // see every top-level name — some clash with `scala.*` (e.g. a linear-algebra `Vector`
   // shadowing `scala.Vector`); those are disambiguated with a named `import scala.X` where
   // they occur (see `flame_client.scala`).
-  val coreDeps = Seq(mvn"dev.soundness:soundness-all:$soundnessVersion")
+  // `hyperbole` (TASTy-tree introspection, for `/tasty`) and `mandible` (JVM bytecode
+  // disassembly, for `/bytecode`) are NOT part of the `soundness-all` umbrella (both embryonic),
+  // so they are added explicitly — bringing escapade, dendrology, escritoire and iridescence onto
+  // the REPL's compile+run classpath transitively (mandible depends on hyperbole).
+  val coreDeps = Seq(
+    mvn"dev.soundness:soundness-all:$soundnessVersion",
+    mvn"dev.soundness:hyperbole-core:$soundnessVersion",
+    mvn"dev.soundness:mandible-core:$soundnessVersion")
 
   val clientDeps = Seq(
     mvn"dev.soundness:ethereal-core:$soundnessVersion",

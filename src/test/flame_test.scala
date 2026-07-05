@@ -157,6 +157,54 @@ object Tests extends Suite(m"Flame Tests"):
           case Repl.Outcome.Ran(_, value, _, _, _) => value == t"14"
           case _                             => false
 
+      test(m"a `val` definition shows its name, value and type"):
+        supervise:
+          Repl().interpret(t"val x = 40 + 2")
+      . assert:
+          case Repl.Outcome.Ran(_, value, _, name, tpe) =>
+            value == t"42" && name == t"x" && tpe == t"scala.Int"
+          case _ => false
+
+      test(m"a `var` definition shows its name, value and type"):
+        supervise:
+          Repl().interpret(t"var y = List(1, 2, 3)")
+      . assert:
+          case Repl.Outcome.Ran(_, value, _, name, _) => value == t"[1, 2, 3]" && name == t"y"
+          case _                                       => false
+
+      test(m"a `val` definition still persists for later lines"):
+        supervise:
+          val repl = Repl()
+          repl.interpret(t"val x = 40 + 2")
+          repl.interpret(t"x + 1")
+      . assert:
+          case Repl.Outcome.Ran(_, value, _, _, _) => value == t"43"
+          case _                                    => false
+
+      test(m"a `lazy val` shows its type without being forced"):
+        supervise:
+          val repl = Repl()
+          repl.interpret(t"var forced = false")
+          repl.interpret(t"lazy val z = { forced = true; 99 }")
+          repl.interpret(t"forced")
+      . assert:
+          case Repl.Outcome.Ran(_, value, _, _, _) => value == t"false"
+          case _                                    => false
+
+      test(m"a `def` shows its signature with the written return type, uninvoked"):
+        supervise:
+          Repl().interpret(t"def f(a: Int, b: String): String = b*a")
+      . assert:
+          case Repl.Outcome.Ran(_, _, output, _, _) => output.trim == t"def f(a: Int, b: String): String"
+          case _                                     => false
+
+      test(m"a `def` with an omitted return type shows the inferred one"):
+        supervise:
+          Repl().interpret(t"def g(n: Int) = n + 1")
+      . assert:
+          case Repl.Outcome.Ran(_, _, output, _, _) => output.trim == t"def g(n: Int): scala.Int"
+          case _                                     => false
+
       test(m"/set experimental enables experimental definitions"):
         supervise:
           val repl = Repl()
@@ -171,6 +219,18 @@ object Tests extends Suite(m"Flame Tests"):
       test(m"completions are offered for a member prefix"):
         supervise:
           val code = t"List(1, 2, 3).ma"
+          Repl().completionsAt(code, code.length).map(_.name)
+      . assert(_.contains(t"map"))
+
+      test(m"completions are offered inside a definition's right-hand side"):
+        supervise:
+          val code = t"def foo() = System.o"
+          Repl().completionsAt(code, code.length).map(_.name)
+      . assert(_.contains(t"out"))
+
+      test(m"completions are offered inside a val's right-hand side"):
+        supervise:
+          val code = t"val xs = List(1, 2, 3).ma"
           Repl().completionsAt(code, code.length).map(_.name)
       . assert(_.contains(t"map"))
 
@@ -332,6 +392,15 @@ object Tests extends Suite(m"Flame Tests"):
           case Repl.Outcome.Threw(_, _, _) => true
           case _                           => false
 
+      test(m"a thrown exception's reply renders its stack trace"):
+        supervise:
+          Repl().react(0, t"throw new RuntimeException(\"boom\")")
+      . assert:
+          case Repl.Reply.Threw(_, _, diagnostics, _) =>
+            diagnostics.contains(t"RuntimeException") && diagnostics.contains(t"boom")
+            && diagnostics.contains(t".scala")
+          case _ => false
+
     suite(m"REPL binding tests"):
       given Scalac[3.8] = Scalac(Nil)
 
@@ -384,9 +453,9 @@ object Tests extends Suite(m"Flame Tests"):
           case Repl.Outcome.Ran(_, value, _, _, _) => value.let(_ == t"42").or(false)
           case _                             => false
 
-      test(m"a definition renders no value"):
+      test(m"a type/class definition renders no value"):
         supervise:
-          Repl().interpret(t"val x = 5")
+          Repl().interpret(t"class C(n: Int)")
       . assert:
           case Repl.Outcome.Ran(_, value, _, _, _) => value.absent
           case _                             => false

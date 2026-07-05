@@ -43,13 +43,9 @@ import scala.collection.mutable as scm
 
 import soundness.*
 
-// The `soundness-all` umbrella (pulled in for the REPL's own classpath) exports a
-// linear-algebra `Vector`; re-import `scala.Vector` — a named import outranks the wildcard —
-// so `Vector(…)` here is unambiguously the immutable sequence.
-import scala.Vector
-
 import escapade.Faint
-import textMetrics.uniformMetric
+import escapade.Italic
+import iridescence.WebColors
 
 import backstops.silentBackstop
 import classloaders.threadContextClassloader
@@ -64,41 +60,38 @@ import systems.javaSystem
 import temporaryDirectories.systemTemporaryDirectory
 import threading.platformThreading
 
-// A front-end for a Flame REPL. With a TCP port, `flame serve <port>` runs a
-// server and `flame <port>` connects to one on localhost. With no port,
-// `flame serve` opens a per-process UNIX domain socket (named after the JVM's
-// PID, under the XDG runtime dir) and `flame` connects to it — starting its own
-// background server first if none is running (so `flame` alone is a self-contained
-// REPL whose session, living in the separate server process, can be reconnected to by
-// running `flame` again), picking the lone running server, or listing them if there
-// are several. Either way the client drives an interactive, live-highlighted session
-// until Ctrl+D, Ctrl+C or `/quit`.
+val Serve = Subcommand("serve", "serve the Flame web front-end")
+val Install = Subcommand("install", "install tab-completions into the shell")
+val WebPort = Flag[Int]("port", false, List('p'), "the HTTP port for the web front-end")
+
 @main
 def repl(): Unit = externalize:
   cli:
     arguments match
-      case Argument("serve") :: Argument(As[Int](portNumber)) :: Nil =>
-        execute(serve(portNumber))
+      // `flame serve [--port N | -p N]` — the web front-end (default port 8080). `WebPort()`
+      // registers the flag (so it is offered in tab-completion) and reads its value; decoding the
+      // `Int` needs a `Tactic[NumberError]`, so `recover` supplies one and falls back to 8080 for
+      // an absent or non-numeric value.
+      case Serve() :: _ =>
+        val port: Int =
+          recover:
+            case NumberError(_, _, _) => 8080
+          . protect:
+              WebPort().or(8080)
 
-      case Argument("serve") :: Nil =>
+        execute(httpServe(port))
+
+      // `flame install` — install this command's tab-completions into the user's shell.
+      case Install() :: _ =>
+        execute(installCompletions())
+
+      // Internal: the per-process UNIX-socket REPL server that `connectSocket`/`launchServer`
+      // spawns in the background (see `launchServer`). Not a user-facing command — `serve` now
+      // serves the web front-end — so it uses a distinct argument the launcher passes itself.
+      case Argument("serve-socket") :: Nil =>
         execute(serveSocket())
 
-      case Argument(As[Int](portNumber)) :: Nil =>
-        execute:
-          safely(Port[Tcp](portNumber)).lay(invalidPort(portNumber)): port =>
-            connect(port)(converse(_)).or(unreachable(portNumber))
-
-      // Launch the web-based front-end instead of the terminal client. `--http` alone
-      // serves on port 8080; `--port` overrides it (in either order).
-      case Argument("--http") :: Nil =>
-        execute(httpServe(8080))
-
-      case Argument("--http") :: Argument("--port") :: Argument(As[Int](portNumber)) :: Nil =>
-        execute(httpServe(portNumber))
-
-      case Argument("--port") :: Argument(As[Int](portNumber)) :: Argument("--http") :: Nil =>
-        execute(httpServe(portNumber))
-
+      // `flame` — the terminal REPL (connects to, or starts, a background socket server).
       case Nil =>
         execute(connectSocket())
 
@@ -134,12 +127,15 @@ private def serve(portNumber: Int)(using Stdio, Monitor, Probate, System): Exit 
 // interrupted. It reuses `serverClassloader` — the same compile-classpath loader the
 // socket server uses — so the embedded engine finds the scala library under the
 // Burdock/Ethereal launcher, exactly as the terminal server does.
-private def httpServe(portNumber: Int)(using Stdio, Monitor, Probate, System, Cli): Exit =
+private def httpServe(portNumber: Int)
+   (using Stdio, Monitor, Probate, System, Cli, Console, Environment)
+:   Exit =
+
   given Classloader = serverClassloader
 
-  // There is no interactive editor to read Ctrl+C as a keypress, so handle SIGINT as a
-  // signal: stop the server (fulfil `quit`) and exit cleanly.
   val quit: Promise[Unit] = Promise()
+
+  // A real SIGINT (e.g. `kill -INT <pid>`) fulfils `quit` and stops the server cleanly.
   trap:
     case Signal.Int => quit.offer(()) yet SignalResponse.Accept
 
@@ -147,8 +143,47 @@ private def httpServe(portNumber: Int)(using Stdio, Monitor, Probate, System, Cl
   // on its own line so terminals render it as a clean, clickable link.
   Out.println(t"flame: serving the web REPL (press Ctrl+C to stop):")
   Out.println(t"  http://localhost:$portNumber/")
+
+  // A TYPED Ctrl+C never reaches the `trap`: the Ethereal launcher reads the terminal in raw mode
+  // and forwards the keystroke as a byte (never a SIGINT), and there is no editor to consume it. So
+  // read the terminal ourselves — in the background, while the server blocks on `quit` — and fulfil
+  // `quit` on Ctrl+C (or Ctrl+D). This is why the server never responded to Ctrl+C before.
+  async:
+    safely:
+      interactive: terminal ?=>
+        given Stdio = terminal.stdio
+        val events = terminal.eventIterator()
+        var reading = true
+
+        while reading && events.hasNext do events.next() match
+          case Keypress.Ctrl('C' | 'D') => quit.offer(()); reading = false
+          case _                        => ()
+
   serveHttp(portNumber, quit)
   Exit.Ok
+
+// Installs this command's shell tab-completions (`flame install`) — the zsh/bash/fish completion
+// script that calls `flame '{completions}' …`, driven by the subcommand/flag tree the CLI registers
+// (`Serve`/`Install`/`WebPort`). Exoskeleton's `Completions.ensure` does the write (the same call the
+// built-in `{admin} install` uses); it needs an `Entrypoint`, which the ambient Ethereal
+// `DaemonService` supplies (it extends `Entrypoint`). `force` installs even when `flame` is not yet
+// on the `PATH`, so a freshly-built binary can set completions up before it is installed as a command.
+private def installCompletions()(using stdio: Stdio, service: DaemonService[?])(using erased Effectful)
+:   Exit =
+
+  import errorDiagnostics.stackTracesDiagnostics
+  import workingDirectories.javaWorkingDirectory
+
+  given Entrypoint = service
+
+  recover:
+    case error: InstallError =>
+      Out.println(t"flame: could not install tab-completions")
+      Exit.Fail(8)
+
+  . protect:
+      Completions.ensure(force = true).each(Out.println(_))
+      Exit.Ok
 
 // The directory holding per-process REPL sockets, and this process's socket file.
 // UNIX domain sockets are a Unix-only feature, so the directory follows
@@ -251,7 +286,7 @@ private def failedToLaunch(using Stdio): Exit =
   Out.println(t"flame: could not start a REPL server")
   Exit.Fail(3)
 
-// Starts a REPL server in the background — a detached `flame serve` process on its
+// Starts a REPL server in the background — a detached `flame serve-socket` process on its
 // own per-process domain socket — waits for it to bind, and connects to it. Because
 // the server is a separate process it outlives this client, so the same session can
 // be reconnected to later by running `flame` again. Returns the live connection,
@@ -260,7 +295,7 @@ private def launchServer[result]()(using Stdio, System)(body: Duplex => result):
   safely(System.properties.ethereal.script[Text]()).lay(Unset): executable =>
     val before: List[Text] = socketPaths(socketDirectory)
 
-    val builder = jl.ProcessBuilder(executable.s, "serve")
+    val builder = jl.ProcessBuilder(executable.s, "serve-socket")
     builder.redirectOutput(jl.ProcessBuilder.Redirect.DISCARD)
     builder.redirectError(jl.ProcessBuilder.Redirect.DISCARD)
     builder.redirectInput(ji.File("/dev/null"))
@@ -429,17 +464,28 @@ private def runRepl
   @volatile var incompleteFor: Optional[(Text, Boolean)] = Unset
   val incompletePending: TrieMap[Int, Text] = TrieMap()
 
-  // Enter submits only when the line is not an incomplete prefix (per the engine's parser);
-  // otherwise it inserts a continuation newline. Shift+Enter always submits (profanity's
-  // `Multiline`). The bracket-balance fallback covers the brief window before the first
-  // verdict for `text` arrives, and the empty line (never tokenized, so never submitted).
-  // A line beginning `/` is a REPL command, not Scala, so it always submits — the engine
-  // parses `/clear`, `/quit`, … as Scala and reports them "incomplete", which must be ignored.
+  // What Enter does depends on how much has been typed:
+  //  - a SINGLE line submits as soon as it is a COMPLETE (not incomplete-prefix) statement or
+  //    expression; while it is still an incomplete prefix (`def f =`, `{`, `1 +`, …), Enter instead
+  //    opens a new line to continue it.
+  //  - a MULTI-LINE entry submits only once a BLANK line is left at the end (i.e. press Enter twice),
+  //    so a deliberately multi-line block is never submitted before the user is done. The trailing
+  //    blank line is stripped on submit (see the event loop), so the frozen box and the transcript
+  //    render tight.
+  // Shift+Enter always submits (profanity's `Multiline`). A line beginning `/` is a REPL command,
+  // not Scala (the engine would parse `/clear`, `/quit`, … as incomplete Scala), so it always submits.
   def readyToSubmit(text: Text): Boolean =
     if text.starts(t"/") then true
-    else incompleteFor.lay(balanced(text)): verdict =>
+    else if text.contains(t"\n") then blankLastLine(text) && text.trim != t""
+    else notIncomplete(text)
+
+  // The single-line completeness verdict: the server parser's authoritative result for this exact
+  // text, or — until it arrives (and for the empty line, never tokenized) — the local heuristic, so a
+  // clearly-incomplete first line (`def f =`) still continues onto a new line on a cold server.
+  def notIncomplete(text: Text): Boolean =
+    incompleteFor.lay(singleLineComplete(text)): verdict =>
       val (value, incomplete) = verdict
-      if value == text then !incomplete else balanced(text)
+      if value == text then !incomplete else singleLineComplete(text)
 
   // Background reader: route replies by kind. A `tokenize` reply refines the live
   // highlight and posts a `Redraw`, so the refined colour appears as soon as the server
@@ -562,7 +608,7 @@ private def runRepl
           val (forValue, items) = reply
           if forValue != editor.value then t"" else
             val stem: Text =
-              if editor.value.starts(t"/") then editor.value
+              if editor.value.starts(t"/") && !completesAsScala(editor.value) then editor.value
               else editor.value.skip(identifierStart(editor))
 
             items match
@@ -679,7 +725,17 @@ private def runRepl
             frame()
 
           case event if editor.submitsOn(event) =>
-            submitted = editor.value
+            // A multi-line entry submitted by leaving a blank line at the end drops that blank line,
+            // so the frozen box, the transcript and what is sent to the server all render tight. When
+            // it strips something, re-highlight and repaint so `finish` freezes the tight box.
+            val tight: Text = stripTrailingBlank(editor.value)
+            if tight != editor.value then
+              editor = LineEditor(tight, tight.length, editor.mode)
+              candidates = Nil
+              refresh()
+              frame()
+
+            submitted = tight
             editing = false
 
           case keypress: Keypress =>
@@ -733,7 +789,8 @@ private def runRepl
           transcript.clear()
           Out.print(t"\e[2J\e[3J\e[H")
           t""
-        else if line.starts(t"/") && !serverCommand(t"/set") && !serverCommand(t"/unimport") then
+        else if line.starts(t"/") && !serverCommand(t"/set") && !serverCommand(t"/unimport")
+            && !serverCommand(t"/context") && !serverCommand(t"/tasty") && !serverCommand(t"/bytecode") then
           t"flame: unknown command: $line\n"
         else
           duplex.send(Stream(framed(encode(Repl.Request.Submit(0, line)))))
@@ -763,7 +820,7 @@ private def replPane
   // A one-column empty spacer, so the editor sits one character in from each border edge.
   def edge: Pane = panel(minWidth = 1, maxWidth = 1)(())
 
-  val box = border(BorderStyle.rounded):
+  val box = cadetBorder:
     file
      ( edge,
        panel(minHeight = rows, maxHeight = rows):
@@ -783,7 +840,7 @@ private def replPane
   if compLines.isEmpty then box
   else
     val list = panel(minHeight = compLines.length, maxHeight = compLines.length):
-      Out.print(compLines.join(e"\n"))
+      summon[Extent].put(compLines.join(e"\n"))
 
     rank(box, list)
 
@@ -798,11 +855,41 @@ private case class TranscriptEntry(text: Text, tokens: List[Repl.Token], result:
 private def replayBox(tokens: List[Repl.Token], rows: Int): Pane =
   def edge: Pane = panel(minWidth = 1, maxWidth = 1)(())
 
-  border(BorderStyle.rounded):
+  cadetBorder:
     file
      ( edge,
        panel(minHeight = rows, maxHeight = rows)(summon[Extent].put(colourful(tokens))),
        edge )
+
+// The editor box's border, drawn in CadetBlue. Mirrors ultimatum's `border` (rounded style),
+// but colours each glyph — the library's `border` renders its rules and corners uncoloured.
+private def cadetBorder(child: Pane): Pane =
+  val style  = BorderStyle.rounded
+  val colour = WebColors.CadetBlue
+
+  def horizontalRule: Pane = panel(minHeight = 1, maxHeight = 1):
+    val extent = summon[Extent]
+    extent.move(Prim, Prim)
+    extent.put(e"$colour(${style.horizontal*extent.width})")
+
+  def verticalRule: Pane = panel(minWidth = 1, maxWidth = 1):
+    val extent = summon[Extent]
+    var row = 0
+    while row < extent.height do
+      extent.move(Prim, row.z)
+      extent.put(e"$colour(${style.vertical})")
+      row += 1
+
+  def corner(glyph: Text): Pane =
+    panel(minWidth = 1, maxWidth = 1, minHeight = 1, maxHeight = 1):
+      summon[Extent].put(e"$colour($glyph)")
+
+  def band(left: Text, right: Text): Pane = file(corner(left), horizontalRule, corner(right))
+
+  rank
+   ( band(style.topLeft, style.topRight),
+     file(verticalRule, child, verticalRule),
+     band(style.bottomLeft, style.bottomRight) )
 
 // Renders a server reply to the text shown below the submitted line's box — the SAME text
 // whether printed live or reprinted when the transcript is replayed after a resize. Each
@@ -829,25 +916,44 @@ private def replyText(reply: Repl.Reply): Text = reply match
   case Repl.Reply.Tokenized(_, _, _)               => t""
   case Repl.Reply.Completed(_, _)                  => t""
 
-// The completion candidates as a minimally-styled Escritoire table (name / kind / type),
-// pre-rendered to lines so the pane can be sized to fit them exactly.
+// The completion candidates as a compact, HEADER-LESS list — one Teletype line each: a kind glyph,
+// the name, then the type signature (subdued, truncated to fit). The kind (replacing the old `kind`
+// column) is a single Unicode glyph, and the glyph + name are coloured by the kind's broad category
+// using the syntax palette — a term/callable peach, a type/namespace teal, a keyword orange — so a
+// method reads like a term and a type like a type, matching how each would look in code.
 private def completionTable(items: List[Repl.CompletionItem], width: Int): List[Teletype] =
-  import tableStyles.minimalTableStyle
-  import columnAttenuation.ignoreAttenuation
+  def style(kind: Text): (Text, Color in Srgb) = kind.lower match
+    case t"method"    => (t"ƒ", palette.scalaTerm)
+    case t"term"      => (t"•", palette.scalaTerm)
+    case t"given"     => (t"⊢", palette.scalaTerm)
+    case t"extension" => (t"⊕", palette.scalaTerm)
+    case t"type"      => (t"◇", palette.scalaType)
+    case t"module"    => (t"◆", palette.scalaType)
+    case t"package"   => (t"▦", palette.scalaType)
+    case t"keyword"   => (t"▸", palette.scalaKeyword)
+    case t"command"   => (t"⌘", palette.scalaKeyword)
+    case _            => (t"·", palette.foreground)
 
-  // Truncate the (often long) type so each candidate stays on one row — name + kind take the
-  // rest of the width.
-  val typeWidth = (width - 28).max(8)
-  def signature(text: Text): Text =
-    if text.length > typeWidth then t"${text.keep(typeWidth - 1)}…" else text
+  // The name column is as wide as the widest name (capped so the signature keeps room); the glyph
+  // takes 1 column + 1 space, and the signature the remainder — kept 1 column short of the terminal
+  // so an ambiguous-width glyph can't push the line into a wrap.
+  val nameCol: Int = items.map(_.name.length).maxOption.getOrElse(0).min((width - 12).max(1))
+  val sigCol:  Int = (width - nameCol - 4).max(1)
 
-  val table =
-    Scaffold[Repl.CompletionItem]
-     ( Column(e"name")(item => e"${item.name}"),
-       Column(e"kind")(item => e"${item.kind}"),
-       Column(e"type")(item => e"${signature(item.signature)}") )
+  items.map: item =>
+    val (glyph, colour) = style(item.kind)
+    val name:   Text = item.name
+    val padded: Text = if name.length >= nameCol then name.keep(nameCol) else name+t" "*(nameCol - name.length)
+    val sig0:   Text = item.signature
+    val sig:    Text = if sig0.length > sigCol then t"${sig0.keep(sigCol - 1)}…" else sig0
 
-  table.tabulate(items).grid(width.max(1)).render.to(List)
+    e"${colour}($glyph) ${colour}($padded) ${palette.scalaComment}($sig)"
+
+// A `/`-command line whose ARGUMENT is completed as ordinary Scala by the server (which strips the
+// command prefix), rather than locally against the command list — the editor's token-based insertion
+// keeps the command prefix intact. Currently `/tasty <expr>` and `/bytecode <code>`.
+private def completesAsScala(value: Text): Boolean =
+  value.starts(t"/tasty ") || value.starts(t"/bytecode ")
 
 // On Tab, complete: a `/`-command line completes locally against `slashCommands`;
 // otherwise the server is asked and we block for the reply. A unique candidate is
@@ -859,7 +965,10 @@ private def completeAt
     completions: juc.LinkedBlockingQueue[List[Repl.CompletionItem]] )
 :   (LineEditor, List[Repl.CompletionItem]) =
 
-  if editor.value.starts(t"/") then
+  // A `/`-command line completes locally against `slashCommands` — EXCEPT the argument-completing
+  // commands (`/tasty`, `/bytecode`), whose argument the server completes as ordinary Scala, so they
+  // fall through to the server branch below.
+  if editor.value.starts(t"/") && !completesAsScala(editor.value) then
     slashCommands.filter { (name, _) => name.starts(editor.value) } match
       case (name, _) :: Nil =>
         (LineEditor(name, name.length, editor.mode), Nil)
@@ -894,36 +1003,51 @@ private def completeAt
 
         (advanced, candidates)
 
+// An `Srgb` colour from a 24-bit `0xRRGGBB` hex literal (the form Zed themes use), so the palette
+// below can be transcribed straight from `~/.config/zed/themes/propensive.json`.
+private def hex(rgb: Int): Color in Srgb =
+  Srgb(((rgb >> 16) & 0xff)/255.0, ((rgb >> 8) & 0xff)/255.0, (rgb & 0xff)/255.0)
+
 // The editor's syntax-highlighting colours, *specified* here as an iridescence
 // `Palette` rather than hardcoded per accent. Harlequin's `syntaxHighlighting`
 // renderer turns tokens into a `Teletype` using these colours, and the terminal's
 // colour depth is applied when the `Teletype` is rendered (see `render`). Swap this
 // given — or `import` a different `ScalaSyntaxPalette` — to retheme the REPL.
+//
+// Matched to the user's Zed theme "Propensive" (its `style.syntax` scopes): scalaKeyword→keyword,
+// scalaType→type, scalaString→string, scalaNumber→number, scalaTerm→variable, scalaComment→comment;
+// the two symbol accents map to Zed's punctuation.bracket and operator (see the note at those
+// methods). A Harlequin accent is now a COLOUR CATEGORY only: every term (a `val`/`def` name AND a
+// reference) shares `scalaTerm`, and the binding-vs-usage distinction is a `Role` styled separately
+// (italic — see `colourful`). Zed has no distinct "modifier" scope (modifiers share the keyword
+// colour) and no error/margin syntax scopes, so those reuse the nearest editor/UI colours; and
+// Harlequin has no boolean accent, so `true`/`false` render as keywords, not Zed's pink.
 private given palette: ScalaSyntaxPalette = new Palette:
   type Form = Srgb
-  def background:       Color in Srgb = WebColors.Black
-  def foreground:       Color in Srgb = WebColors.Gainsboro
-  def scalaError:       Color in Srgb = WebColors.Crimson
-  def scalaNumber:      Color in Srgb = WebColors.Goldenrod
-  def scalaString:      Color in Srgb = WebColors.ForestGreen
-  def scalaIdentifier:  Color in Srgb = WebColors.DodgerBlue
-  def scalaTerm:        Color in Srgb = WebColors.Gainsboro
-  def scalaType:        Color in Srgb = WebColors.SteelBlue
-  def scalaKeyword:     Color in Srgb = WebColors.MediumPurple
-  def scalaSymbol:      Color in Srgb = WebColors.SlateGray
-  def scalaParenthesis: Color in Srgb = WebColors.SlateGray
-  def scalaModifier:    Color in Srgb = WebColors.MediumPurple
-  def scalaComment:     Color in Srgb = WebColors.Gray
-  def subdued:          Color in Srgb = WebColors.DimGray
-  def accented:         Color in Srgb = WebColors.White
-  def margin:           Color in Srgb = WebColors.Black
+  def background:       Color in Srgb = hex(0x000000)  // editor.background
+  def foreground:       Color in Srgb = hex(0xd4be98)  // editor.foreground
+  def scalaError:       Color in Srgb = hex(0xea6962)  // deleted (a clear red)
+  def scalaNumber:      Color in Srgb = hex(0xcc3366)  // number
+  def scalaString:      Color in Srgb = hex(0x99ffff)  // string
+  def scalaTerm:        Color in Srgb = hex(0xffcc99)  // variable — every term (binding or usage)
+  def scalaType:        Color in Srgb = hex(0x00cc99)  // type
+  def scalaKeyword:     Color in Srgb = hex(0xff6633)  // keyword
+  // Harlequin's `Symbol` accent covers brackets and `:` (Zed punctuation.bracket); its `Parens`
+  // accent covers `=`/`.`-style operators (Zed operator) — the names read backwards, so the colours
+  // are assigned by which tokens actually carry each accent, not by the method name.
+  def scalaSymbol:      Color in Srgb = hex(0xcc6699)  // punctuation.bracket — `(` `)` `[` `]` `:`
+  def scalaParenthesis: Color in Srgb = hex(0xf28534)  // operator — `=` `.`
+  def scalaModifier:    Color in Srgb = hex(0xff6633)  // keyword (no distinct modifier scope)
+  def scalaComment:     Color in Srgb = hex(0x928374)  // comment
+  def subdued:          Color in Srgb = hex(0x5a524c)  // editor.line_number
+  def accented:         Color in Srgb = hex(0xd4be98)  // editor.active_line_number
+  def margin:           Color in Srgb = hex(0x111111)  // editor.gutter.background
 
 // Maps a Harlequin accent name (as carried on the wire) back to its `Accent`.
 private def accentOf(accent: Text): Accent =
   if accent == t"keyword"       then Accent.Keyword
   else if accent == t"modifier" then Accent.Modifier
-  else if accent == t"typed"    then Accent.Typed
-  else if accent == t"ident"    then Accent.Ident
+  else if accent == t"typal"    then Accent.Typal
   else if accent == t"string"   then Accent.String
   else if accent == t"number"   then Accent.Number
   else if accent == t"symbol"   then Accent.Symbol
@@ -932,13 +1056,19 @@ private def accentOf(accent: Text): Accent =
   else if accent == t"unparsed" then Accent.Unparsed
   else Accent.Term
 
-// Reconstructs the source line from the highlight tokens, colouring each through
-// the palette via Harlequin's syntax-highlighting renderer.
+// Reconstructs the source line from the highlight tokens, colouring each through the palette via
+// Harlequin's syntax-highlighting renderer — and italicising a NEWLY-INTRODUCED identifier. The
+// accent gives only the colour (a term is `term`, a type is `typal`, whether bound or used); the
+// token's `role` says whether it is a `binding` (a `val`/`def`/parameter/pattern name, a class/type
+// definition, or a type parameter) or a `usage`. So italicising the `binding` role distinguishes
+// `foo`/`T` where introduced from where applied — as the styling policy Harlequin#1439 leaves to the
+// front-end. (A live-heuristic token has no role yet, so it is refined to italic by the server.)
 private def colourful(tokens: List[Repl.Token]): Teletype =
   import harlequin.syntaxHighlighting.tokenTeletypeable
 
   tokens.map: token =>
-    harlequin.Token(token.text, accentOf(token.accent)).teletype
+    val coloured: Teletype = harlequin.Token(token.text, accentOf(token.accent)).teletype
+    if token.role.let(_ == t"binding").or(false) then e"$Italic($coloured)" else coloured
 
   . join
 
@@ -964,6 +1094,10 @@ private def accentKind(accent: Text): CharKind =
   else if accent == t"unparsed" then CharKind.Space
   else CharKind.Word
 
+// The heuristic accent for a freshly-typed run before the server's tokenize refines it. A word is a
+// `term` (all terms share one colour now). A heuristic token carries no `role`, so it is not italic;
+// the server then annotates an actual definition with the `binding` role (→ italic). So a typed
+// reference never flickers italic — only a confirmed binding gains it once the tokenize reply lands.
 private def defaultAccent(kind: CharKind): Text = kind match
   case CharKind.Word   => t"term"
   case CharKind.Symbol => t"symbol"
@@ -1004,8 +1138,8 @@ private def insertChar(tokens: List[Repl.Token], p: Int, c: Char): List[Repl.Tok
 
       val mid =
         if kind == accentKind(t.accent) || t.accent == t"string"
-        then Vector(tok(t.text.keep(at) + ch + t.text.skip(at), t.accent))
-        else Vector(tok(t.text.keep(at), t.accent), tok(ch, defaultAccent(kind)),
+        then Series(tok(t.text.keep(at) + ch + t.text.skip(at), t.accent))
+        else Series(tok(t.text.keep(at), t.accent), tok(ch, defaultAccent(kind)),
                     tok(t.text.skip(at), t.accent))
 
       (arr.take(i) ++ mid ++ arr.drop(i + 1)).to(List)
@@ -1030,10 +1164,10 @@ private def insertChar(tokens: List[Repl.Token], p: Int, c: Char): List[Repl.Tok
         val rk = accentKind(r.accent)
 
         if kind == lk
-        then (arr.take(i - 1) ++ Vector(tok(l.text + ch, l.accent)) ++ arr.drop(i)).to(List)
+        then (arr.take(i - 1) ++ Series(tok(l.text + ch, l.accent)) ++ arr.drop(i)).to(List)
         else if kind == rk
-        then (arr.take(i) ++ Vector(tok(ch + r.text, r.accent)) ++ arr.drop(i + 1)).to(List)
-        else (arr.take(i) ++ Vector(tok(ch, defaultAccent(kind))) ++ arr.drop(i)).to(List)
+        then (arr.take(i) ++ Series(tok(ch + r.text, r.accent)) ++ arr.drop(i + 1)).to(List)
+        else (arr.take(i) ++ Series(tok(ch, defaultAccent(kind))) ++ arr.drop(i)).to(List)
 
 private def deleteChar(tokens: List[Repl.Token], p: Int): List[Repl.Token] =
   var offset = 0
@@ -1137,6 +1271,22 @@ private def longestCommonPrefix(names: List[Text]): Text = names match
 
 // Whether the editor content is "complete" enough to submit on Enter: non-empty
 // with every bracket closed. Open brackets continue the input onto a new line.
+// Whether `text`'s last line — the text after its final newline — is blank. This is the "leave a
+// blank line at the end" trigger that submits a multi-line entry.
+private def blankLastLine(text: Text): Boolean =
+  val string:  String = text.s
+  val newline: Int    = string.lastIndexOf('\n')
+  newline >= 0 && string.substring(newline + 1).nn.trim.nn.isEmpty
+
+// Drops a single trailing blank line (the final newline and any whitespace-only last line), so a
+// multi-line entry submitted by leaving a blank line renders tight everywhere it is shown or stored.
+// Text with no trailing blank line is returned unchanged.
+private def stripTrailingBlank(text: Text): Text =
+  val string:  String = text.s
+  val newline: Int    = string.lastIndexOf('\n')
+  if newline >= 0 && string.substring(newline + 1).nn.trim.nn.isEmpty then string.substring(0, newline).nn.tt
+  else text
+
 private def balanced(text: Text): Boolean =
   val string: String = text.s
   var depth:  Int    = 0
@@ -1151,6 +1301,28 @@ private def balanced(text: Text): Boolean =
     index += 1
 
   string.length > 0 && depth <= 0
+
+// A local, cheap heuristic for whether a SINGLE line reads as a complete statement/expression —
+// used to decide Enter's behaviour before (or instead of) the server's authoritative parser verdict
+// arrives (notably on a cold server, whose first verdict is slow). A line is treated as INCOMPLETE
+// (so Enter continues onto a new line) when its brackets are unbalanced, it ends with an operator /
+// assignment / selector / separator that needs a right-hand side (`def f =`, `x +`, `a.`, `xs,`), or
+// it ends with a keyword that must be followed by more (`if … then`, `for`, `new`, `def`, …).
+private val continuationKeywords: Set[Text] =
+  Set(t"then", t"else", t"do", t"yield", t"match", t"catch", t"finally", t"extends", t"with",
+      t"derives", t"if", t"while", t"for", t"new", t"def", t"val", t"var", t"lazy", t"given",
+      t"import", t"export", t"return", t"throw", t"case", t"try")
+
+private def endsWithContinuation(text: Text): Boolean =
+  val trimmed: String = text.s.trim.nn
+  if trimmed.isEmpty then true else
+    val last:     Char    = trimmed.charAt(trimmed.length - 1)
+    val operator: Boolean = "+-*/%<>=&|^.:,@".indexOf(last.toInt) >= 0
+    val lastWord: Text    = trimmed.split("\\s+").nn.last.nn.tt
+    operator || continuationKeywords.contains(lastWord)
+
+private def singleLineComplete(text: Text): Boolean =
+  balanced(text) && !endsWithContinuation(text)
 
 
 // Serializes a `Request` to BinTEL body bytes, deriving the schema from the type
