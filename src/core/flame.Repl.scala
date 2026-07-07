@@ -36,7 +36,6 @@ import java.io as ji
 import java.lang as jl
 import java.net as jn
 import java.nio.channels as jnc
-import java.nio.file as jnf
 import java.util.regex as jur
 
 import scala.collection.concurrent.TrieMap
@@ -58,6 +57,7 @@ import contingency.*
 import denominative.*
 import digression.*
 import distillate.*
+import galilei.*
 import gossamer.*
 import harlequin.*
 import hellenism.*
@@ -67,10 +67,10 @@ import prepositional.*
 import rudiments.*
 import serpentine.*
 import stratiform.*
-import turbulence.*
-import urticose.*
 import vacuous.*
 
+import filesystemOptions.createNonexistentParents.enabled
+import filesystemOptions.overwritePreexisting.disabled
 import interfaces.paths.pathOnLinux
 import stenography.Syntax
 
@@ -141,6 +141,9 @@ object Repl:
     case Tokenize(id: Int, code: Text)
     case Complete(id: Int, code: Text, offset: Int)
     case Quit(id: Int)
+    // Switch this connection to the session named `name`, or — when `name` is empty — just report the
+    // current session and the list of all sessions (used on connect and to refresh tab-completion).
+    case Session(id: Int, name: Text)
 
   // A reply to a connected client, echoing the request's `id`. `highlight` is the
   // Harlequin tokenization of the submitted line. Serialized as JSON with a `kind`
@@ -156,6 +159,13 @@ object Repl:
     case Threw(id: Int, output: Text, diagnostics: Text, highlight: List[Token])
     case Crashed(id: Int, diagnostics: Text, highlight: List[Token])
     case Failed(id: Int, message: Text)
+    // Sent in async mode (`/set async`) when a submission's result is not ready within the grace
+    // window: an immediate placeholder acknowledgement. The real result follows out-of-band later as
+    // an ordinary `Ran`/`Threw`/`Rejected`/`Crashed`/`Failed` reply carrying this same `id`.
+    case Pending(id: Int)
+    // The connection's current session `name`, plus `names` — every session on the server (for the
+    // startup display and `/session` tab-completion).
+    case Session(id: Int, name: Text, names: List[Text])
 
   // Highlights `code` with Harlequin's typechecked pipeline (the compiler
   // resolves symbols, so accents are accurate and each token carries its type).
@@ -527,6 +537,7 @@ object Repl:
   // `/set <name>` entry so each is offered (and documented) in tab-completion.
   val slashCommands: List[(Text, Text)] =
     List(t"/context" -> t"show the imports currently in scope")
+    ::: List(t"/set async" -> t"evaluate submissions asynchronously (slow results arrive later)")
     ::: compilerSettings.map { setting => t"/set ${setting.name}" -> setting.description }
     ::: List
          ( t"/tasty"    -> t"show the rendered TASTy (typed AST) of an expression",
@@ -538,6 +549,37 @@ object Repl:
   def slashCompletions(prefix: Text): List[CompletionItem] =
     slashCommands.filter { (name, _) => name.starts(prefix) }.map: (name, help) =>
       CompletionItem(name, t"command", help)
+
+  // The leading tokens of the `/`-commands the ENGINE recognises (`/set`, `/context`, `/tasty`, …),
+  // so a front-end can tell a real command from a typo without hard-coding the list. Connection-level
+  // commands (`/session`, `/clear`, `/quit`, `/disconnect`) belong to the front-end and are handled
+  // before this check.
+  lazy val commandTokens: Set[Text] = slashCommands.map { (name, _) => name.cut(t" ").head }.to(Set)
+
+  // True when `line` begins with a `/`-command the engine recognises. Used by both front-ends to give
+  // the identical `unknown command` message (see `messages.unknownCommand`) for anything else.
+  def isCommand(line: Text): Boolean = commandTokens.contains(line.cut(t" ").head)
+
+  // The user-facing status/notice lines that BOTH front-ends show, kept here so the CLI and the web
+  // stay word-for-word identical. Each is a complete line carrying the `flame:` program prefix (as the
+  // engine's other messages, e.g. `/tasty` usage, already do); the front-end adds its own trailing
+  // newline (CLI) or styling (web).
+  object messages:
+    def session(name: Text): Text = t"flame: session $name"
+
+    def sessionList(name: Text, names: List[Text]): Text =
+      t"flame: session $name — available: ${names.join(t", ")}"
+
+    def switched(name: Text): Text = t"flame: switched to session $name"
+    def noSession(name: Text): Text = t"flame: no session named '$name'"
+
+    def joinFailed(requested: Text, started: Text): Text =
+      t"flame: no session named '$requested' — started session $started"
+
+    def unknownCommand(line: Text): Text = t"flame: unknown command: $line"
+
+    val serverRestarted: Text =
+      t"flame: the server restarted — your previous session (definitions, imports and settings) was lost"
 
   // The Scala type of an expression, read from a typechecked highlight of
   // `<context> val __result = <code>`: the binding's token carries the resolved type as a
@@ -753,12 +795,6 @@ class Repl[version <: Scalac.Versions]
 
   val session: Long = ReplBridge.freshSession()
 
-  // Fulfilled when a connected client sends a `Quit` request; a server host can
-  // `attend` it to block until then and shut down cleanly.
-  private val quit: Promise[Unit] = Promise()
-
-  def awaitQuit(): Unit = quit.attend()
-
   // Serializes `interpret` across connections: the shared `Scalac` compiler is
   // not reentrant and the REPL's state is mutable.
   private val mutex: Mutex = Mutex()
@@ -786,8 +822,14 @@ class Repl[version <: Scalac.Versions]
   // `Repl.compilerSettings`), not the flags themselves.
   private val enabledSettings: scm.Set[Text] = scm.Set()
 
+  // Async mode (`/set async`): when on, a front-end evaluates each submission on a background worker,
+  // acknowledging with a placeholder and delivering the real result out-of-band once it is ready, so a
+  // slow computation never blocks the editor. A plain per-session boolean (not a compiler flag).
+  private var asyncMode: Boolean = false
+  def asyncEnabled: Boolean = asyncMode
+
   private val out: Path on Linux = unsafely(temporaryDirectory/Uuid())
-  locally(jnf.Files.createDirectories(jnf.Path.of(out.encode.s)).nn)
+  locally(unsafely(out.create[Directory]()))
 
   private lazy val loader: Classloader =
     LocalClasspath((Classpath.Directory(out) :: Nil)*).classloader(classloader)
@@ -1169,29 +1211,41 @@ class Repl[version <: Scalac.Versions]
   // subsequent line — no argument means `on`. `/set` with no name lists the settings and their
   // current state; an unknown name reports the known ones.
   private def set(line: Text): Outcome =
+    // The `on`/`off` word of a `/set <name> [on|off]` line — defaulting to on when omitted.
+    def enabledBy(rest: List[Text]): Boolean = rest match
+      case value :: _ => !(value.lower == t"off" || value.lower == t"false")
+      case Nil        => true
+
     line.cut(t" ").filter(_ != t"") match
+      // `async` is a plain session toggle, NOT a compiler flag, so it is intercepted before the
+      // `compilerSettings` lookup (adding it there would inject a bogus scalac flag via
+      // `effectiveScalac`). It changes how submissions are dispatched, not how they compile.
+      case _ :: t"async" :: rest =>
+        asyncMode = enabledBy(rest)
+        val word: Text = if asyncMode then t"enabled" else t"disabled"
+        Outcome.Ran(Nil, Unset, t"flame: async $word\n")
+
       case _ :: name :: rest =>
         Repl.compilerSettings.find(_.name == name) match
           case Some(setting) =>
-            val enable: Boolean = rest match
-              case value :: _ => !(value.lower == t"off" || value.lower == t"false")
-              case Nil        => true
-
+            val enable: Boolean = enabledBy(rest)
             if enable then enabledSettings.add(name) else enabledSettings.remove(name)
             val word: Text = if enable then t"enabled" else t"disabled"
             Outcome.Ran(Nil, Unset, t"flame: $name $word\n")
 
           case None =>
-            val known: Text = Repl.compilerSettings.map(_.name).join(t", ")
+            val known: Text = (t"async" :: Repl.compilerSettings.map(_.name)).join(t", ")
             Outcome.Ran(Nil, Unset, t"flame: unknown setting: $name (known: $known)\n")
 
       case _ =>
-        val listing: Text = Repl.compilerSettings.map: setting =>
-          val mark: Text = if enabledSettings.contains(setting.name) then t"on " else t"off"
-          t"  [$mark] ${setting.name} — ${setting.description}"
-        . join(t"\n")
+        val asyncMark: Text = if asyncMode then t"on " else t"off"
+        val settings: List[Text] =
+          t"  [$asyncMark] async — evaluate submissions asynchronously (slow results arrive later)"
+          :: Repl.compilerSettings.map: setting =>
+               val mark: Text = if enabledSettings.contains(setting.name) then t"on " else t"off"
+               t"  [$mark] ${setting.name} — ${setting.description}"
 
-        Outcome.Ran(Nil, Unset, t"flame: compiler settings (/set <name> [on|off]):\n$listing\n")
+        Outcome.Ran(Nil, Unset, t"flame: settings (/set <name> [on|off]):\n${settings.join(t"\n")}\n")
 
   // `/context` lists every import currently in scope — the prelude's baseline imports plus the
   // ones the user has added — so the session's namespace can be inspected without changing it.
@@ -1220,119 +1274,6 @@ class Repl[version <: Scalac.Versions]
     ensureSeeded().lay(lineOutcome):
       case _: Outcome.Ran => lineOutcome
       case failure        => failure
-
-  // Starts a TCP server on `port` and accepts connections. Each connection is an
-  // interactive session over the *same* REPL state. Messages are JSON `Request`/
-  // `Reply` values, one per line, each terminated by a blank line (compact JSON
-  // has no embedded newline, so the delimiter is unambiguous). Returns a handle
-  // whose `stop()` shuts the server down.
-  def serve(port: Port over Tcp)(using Monitor, System, Probate)
-  :   SocketService logs CompileEvent raises BindError raises StreamError =
-
-    port.listen: socket =>
-      converse(socket.getInputStream.nn, socket.getOutputStream.nn)
-      Data()
-
-  // Serves the REPL over a UNIX domain socket at `socketPath` (used when no TCP
-  // port is given). Coaxial's domain-socket `Connection` does not expose its
-  // streams for the bidirectional, asynchronously-written protocol this server
-  // needs, so the accept loop runs directly over an NIO channel.
-  def serve(socketPath: Text)(using Monitor, System, Probate): SocketService logs CompileEvent =
-    val address: jn.UnixDomainSocketAddress = jn.UnixDomainSocketAddress.of(socketPath.s).nn
-
-    val channel: jnc.ServerSocketChannel =
-      jnc.ServerSocketChannel.open(jn.StandardProtocolFamily.UNIX).nn
-
-    channel.configureBlocking(true)
-    channel.bind(address)
-
-    @volatile var listening: Boolean = true
-
-    val task = async:
-      while listening do
-        safely:
-          val client: jnc.SocketChannel = channel.accept().nn
-          val input  = jnc.Channels.newInputStream(client).nn
-          val output = jnc.Channels.newOutputStream(client).nn
-
-          async:
-            try converse(input, output) finally safely(client.close())
-
-    new SocketService:
-      def stop(): Unit =
-        listening = false
-        safely(channel.close())
-        safely(task.await())
-
-  private def converse(input: ji.InputStream, output: ji.OutputStream)
-    ( using Monitor, System, Probate )
-  :   Unit logs CompileEvent =
-
-    // The TCP caller's `listen` owns the accepted socket — it writes this lambda's
-    // result to the socket after we return — so we must NOT close it here, or
-    // that write fails. And any I/O error (typically the client disconnecting)
-    // must not escape: it would propagate out of the accept loop and stop the
-    // server from accepting any further connections.
-    //
-    // Each message is handled in its own task, so a slow `submit` doesn't hold up
-    // the `tokenize` replies a client fires while editing: `tokenize` is stateless
-    // (runs concurrently), `submit` is serialized by `mutex`, and replies may go
-    // back out of order. A write mutex stops concurrent replies interleaving.
-    val writes: Mutex = Mutex()
-
-    // Each message is a 4-byte big-endian length prefix followed by that many BinTEL
-    // body bytes (binary, so no textual delimiter is safe). `readInt` raises at EOF.
-    try
-      val in: ji.DataInputStream  = ji.DataInputStream(ji.BufferedInputStream(input))
-      val out: ji.DataOutputStream = ji.DataOutputStream(ji.BufferedOutputStream(output))
-      var continue: Boolean = true
-
-      while continue do
-        val length: Int = try in.readInt() catch case _: ji.IOException => -1
-
-        if length < 0 then continue = false
-        else
-          val bytes: Array[Byte] = new Array[Byte](length)
-          in.readFully(bytes)
-          val message: Data = bytes.immutable(using Unsafe)
-
-          async:
-            // A stray throwable in one message becomes an error reply, not a
-            // dropped connection, so the session survives. `Unset` (a `quit`) is
-            // not answered.
-            val response: Optional[Data] =
-              try respond(message)
-              catch case error: Throwable =>
-                encode(Repl.Reply.Failed(0, error.toString.tt))
-
-            response.let: payload =>
-              writes:
-                try
-                  out.writeInt(payload.length)
-                  out.write(payload.mutable(using Unsafe))
-                  out.flush()
-                catch case _: Throwable => ()
-
-    catch case _: Throwable => ()
-
-  // Decodes one JSON `Request` and dispatches: a `tokenize` only highlights (cheap,
-  // for live editing); a `submit` compiles and runs; a `quit` signals the server to
-  // shut down and is not answered. A malformed request becomes a `Failed` reply
-  // rather than a dropped connection. `Unset` means no reply is sent.
-  private def respond(message: Data)(using Monitor, System, Probate)
-  :   Optional[Data] logs CompileEvent =
-
-    val request: Optional[Repl.Request] =
-      safely[Exception](Bintel.read[Repl.Request](message))
-
-    request.lay(encode(Repl.Reply.Failed(0, t"the request could not be parsed"))):
-      case Repl.Request.Tokenize(id, code)         => tokenized(id, code)
-      case Repl.Request.Submit(id, code)           => submit(id, code)
-      case Repl.Request.Complete(id, code, offset) => complete(id, code, offset)
-      case Repl.Request.Quit(_)                    => quit.offer(()) yet Unset
-
-  private def tokenized(id: Int, code: Text): Data =
-    encode(Repl.Reply.Tokenized(id, Repl.tokenize(code), Repl.incomplete(code)))
 
   // Tab completions at character `offset` in `code`, from the typechecked engine, computed
   // under the compiler mutex (the shared compiler is not reentrant). Public so in-process
@@ -1399,14 +1340,6 @@ class Repl[version <: Scalac.Versions]
           case _ =>
             Repl.keywordCompletions(code, offset) ::: mutex(safely(Repl.complete(context, code, offset)).or(Nil))
 
-  // Computes tab completions at `offset` in `code` and replies (with `id`).
-  private def complete(id: Int, code: Text, offset: Int)(using Monitor, System, Probate)
-  :   Data logs CompileEvent =
-    encode(Repl.Reply.Completed(id, completionsAt(code, offset)))
-
-  // Typecheck-highlights, compiles, and runs `code`, replying (with `id`) with the
-  // highlighting, the result value, and any diagnostics. The whole body holds
-  // `mutex`, so concurrent submits serialize and never drive the compiler at once.
   // Typecheck-highlights, compiles, and runs `code`, returning a `Reply` with the
   // highlighting, the result value, its rendered type, and any diagnostics. The whole
   // body holds `mutex`, so concurrent submits serialize and never drive the
@@ -1442,10 +1375,3 @@ class Repl[version <: Scalac.Versions]
 
         case Outcome.Crashed(notices, _) =>
           Repl.Reply.Crashed(id, notices.map(_.message).join(t"; "), tokens)
-
-  private def submit(id: Int, code: Text)(using Monitor, System, Probate): Data logs CompileEvent =
-    encode(react(id, code))
-
-  // Serializes a `Reply` to BinTEL body bytes, deriving the schema from the type
-  // (`value.bintel`). A valid reply always type-assigns, so the encode is total.
-  private def encode(reply: Repl.Reply): Data = unsafely(reply.bintel)

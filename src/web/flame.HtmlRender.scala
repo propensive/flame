@@ -21,6 +21,7 @@ import scala.compiletime.summonFrom
 import scala.language.implicitConversions
 
 import anticipation.*
+import archimedes.*
 import honeycomb.*
 import prepositional.*
 import spectacular.*
@@ -40,9 +41,10 @@ import spectacular.*
 // — only `flame.HtmlRender` on the classpath.
 object HtmlRender:
   inline def render[value](v: value): Text = summonFrom:
-    case renderable: (`value` is Renderable) => serialize(renderable.render(v))
-    case showable:   (`value` is Showable)   => escape(showable.text(v))
-    case _                                   => escape(v.toString.tt)
+    case renderable: (`value` is Renderable)  => serialize(renderable.render(v))
+    case given (`value` is Encodable in Math) => serialize(v.math.html)
+    case showable:   (`value` is Showable)    => escape(showable.text(v))
+    case _                                    => escape(v.toString.tt)
 
   // Serialize an `Html` node to a `Text` (honeycomb's `Html is Showable`, which HTML-escapes text).
   def serialize(node: Html of ?): Text = node.show

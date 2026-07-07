@@ -232,10 +232,12 @@ object ReplMacro:
             // parameter is typed `Object | Null` so the override matches under
             // explicit-nulls (and collapses to `Object` without it).
             def consumer(assign: Expr[Object => Unit]): Expr[ju.function.Consumer[Object]] =
-              ' { val function = $assign
+              ' {
+                  val function = $assign
 
                   new ju.function.Consumer[Object]:
-                    def accept(value: Object | Null): Unit = function(value.asInstanceOf[Object]) }
+                    def accept(value: Object | Null): Unit = function(value.asInstanceOf[Object])
+                }
 
             // Each binding's value is registered live, keyed by session and name.
             // A free `var` also registers a consumer that assigns back to the host;
@@ -273,7 +275,8 @@ object ReplMacro:
                 // A block-local `var`: REPL-local mutable storage shared by the
                 // supplier and the consumer.
                 val cellPut: Expr[Unit] =
-                  ' { val cell: Array[Object] = new Array[Object](1)
+                  ' {
+                      val cell: Array[Object] = new Array[Object](1)
                       cell(0) = $read
 
                       val supply: ju.function.Supplier[Object] =
@@ -282,7 +285,8 @@ object ReplMacro:
 
                       val assign: Object => Unit = cell(0) = _
                       ReplBridge.putSupplier(repl.session, ${Expr(bind.name)}, supply)
-                      ReplBridge.putSetter(repl.session, ${Expr(bind.name)}, ${consumer('assign)}) }
+                      ReplBridge.putSetter(repl.session, ${Expr(bind.name)}, ${consumer('assign)})
+                    }
 
                 List(cellPut)
 

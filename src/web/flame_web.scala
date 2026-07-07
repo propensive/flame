@@ -1,5 +1,7 @@
 package flame
 
+import java.util.concurrent.atomic as juca
+
 import soundness.*
 import perihelion.*
 import perihelion.given
@@ -7,6 +9,7 @@ import perihelion.given
 import doms.html.whatwg.*
 import Control.*
 
+import anticipation.abstractables.durationAbstractable
 import charEncoders.utf8Encoder
 import classloaders.threadContextClassloader
 import formatting.compactJsonFormatting
@@ -50,11 +53,14 @@ case class WebReply
 val replScript: Text = t"""
 (function() {
   var css = [
-    "body { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; margin: 1rem;",
+    // JetBrains Mono, loaded from Google Fonts. An `@import` must be the first rule in the sheet.
+    "@import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;700&display=swap');",
+    "body { font-family: 'JetBrains Mono', ui-monospace, SFMono-Regular, Menlo, monospace; margin: 1rem;",
     "  background: #1e1e1e; color: #d4d4d4; }",
     "h1 { font-size: 1.1rem; font-weight: normal; color: #d7ba7d; }",
-    "pre { white-space: pre-wrap; word-break: break-word; margin: 0 0 0.5rem; }",
-    "code { display: block; white-space: pre-wrap; word-break: break-word; outline: none;",
+    // `pre`/`code` carry the UA's own monospace font, so make them inherit `body`'s JetBrains Mono.
+    "pre { font-family: inherit; white-space: pre-wrap; word-break: break-word; margin: 0 0 0.5rem; }",
+    "code { font-family: inherit; display: block; white-space: pre-wrap; word-break: break-word; outline: none;",
     "  border: 1px solid #3a3a3a; border-radius: 4px; padding: 0.4rem 0.6rem;",
     "  min-height: 1.4em; background: #252526; caret-color: #d4d4d4; }",
     "code::after { content: attr(data-ghost); color: #5c6370; }",
@@ -62,6 +68,7 @@ val replScript: Text = t"""
     ".result { color: #b5cea8; }",
     ".error { color: #f48771; white-space: pre-wrap; }",
     ".notice { color: #e5c07b; font-weight: bold; white-space: pre-wrap; }",
+    ".pending { color: #808080; font-style: italic; }",
     ".completions { position: fixed; z-index: 20; background: #252526; border: 1px solid #454545;",
     "  max-height: 14em; overflow-y: auto; box-shadow: 0 2px 10px rgba(0,0,0,0.5); }",
     ".completions div { padding: 1px 10px 1px 8px; white-space: pre; cursor: default; }",
@@ -82,6 +89,10 @@ val replScript: Text = t"""
     ".tok-parens { color: #ffd700; }",
     ".tok-error { color: #f48771; text-decoration: underline; }",
     ".tok-unparsed { color: #6a9955; }",
+    // A `/`-command line is highlighted specially (see `makeSpans`): the command word in gold, and its
+    // parameters in a fainter, more-yellow colour so they recede behind the command.
+    ".tok-command { color: #d7ba7d; }",
+    ".tok-command-param { color: #a1843c; }",
     // A term/type token's role is a second class: italicise bindings (a `val`/`def`/param or
     // pattern name, a class/type definition, or a type parameter) on top of the accent's colour.
     ".binding { font-style: italic; }"
@@ -106,6 +117,7 @@ val replScript: Text = t"""
   var socket;
   var seq = 0;
   var serverInstance = null;
+  var sessionName = null;
   var connected = false;
   var everConnected = false;
   var reconnectTimer = null;
@@ -228,13 +240,24 @@ val replScript: Text = t"""
   }
 
   function makeSpans(parent, tokens) {
+    // A `/`-command line is a REPL command, not Scala, so it is coloured specially rather than by the
+    // Scala accents: the command word (before the first space) reads as a command, and its parameters
+    // (everything after) are shown fainter and more yellow. `sp` is the first space; a token is a
+    // parameter when it begins at or after it.
+    var full = "";
+    for (var i = 0; i < tokens.length; i++) full += tokens[i].text;
+    var slash = full.charAt(0) === "/";
+    var sp = slash ? full.indexOf(" ") : -1;
+    var off = 0;
     for (var i = 0; i < tokens.length; i++) {
       var span = document.createElement("span");
+      if (slash) span.className = (sp !== -1 && off >= sp) ? "tok-command-param" : "tok-command";
       // The accent is the colour class; a term/type token's role (binding/usage) is a second
       // class, so the stylesheet can e.g. italicise .binding on top of the accent's colour.
-      span.className = "tok-" + tokens[i].accent + (tokens[i].role ? " " + tokens[i].role : "");
+      else span.className = "tok-" + tokens[i].accent + (tokens[i].role ? " " + tokens[i].role : "");
       span.textContent = tokens[i].text;
       parent.appendChild(span);
+      off += tokens[i].text.length;
     }
   }
 
@@ -271,6 +294,24 @@ val replScript: Text = t"""
 
   function escapeHtml(s) {
     return s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+  }
+
+  // Renders a result/error reply INTO `target` — output, then the value line (`name = value : type`,
+  // the value already server-rendered HTML, the rest escaped), then diagnostics. Shared by the normal
+  // result path and the async fill so a placeholder fills identically to an inline result.
+  function fillResult(target, msg) {
+    var html = "";
+    var out = msg.output;
+    if (out) { if (out.charAt(out.length - 1) === "\\n") out = out.slice(0, -1); }
+    if (out) html += "<div>" + escapeHtml(out) + "</div>";
+    if (msg.value) {
+      var line = msg.value;
+      if (msg.name) line = escapeHtml(msg.name) + " = " + line;
+      if (msg.tpe) line += " : " + escapeHtml(msg.tpe);
+      html += "<div class='result'>" + line + "</div>";
+    }
+    if (msg.diagnostics) html += "<div class='error'>" + escapeHtml(msg.diagnostics) + "</div>";
+    target.innerHTML = html;
   }
 
   function submit() {
@@ -330,9 +371,21 @@ val replScript: Text = t"""
   function insertNewline() {
     var sel = window.getSelection();
     if (!sel.rangeCount) return;
+    // Auto-indent: when the caret is at the end of the current line (nothing to its right on that
+    // line, so the newline isn't splitting text), start the new line with the same leading whitespace
+    // as the line being left — matching the CLI front-end.
+    var text = editor.textContent, caret = getCaret();
+    var after = text.slice(caret);
+    var indent = "";
+    if (after === "" || after.charAt(0) === "\\n") {
+      var before = text.slice(0, caret);
+      var line = before.slice(before.lastIndexOf("\\n") + 1);
+      var m = line.match(/^[ \\t]*/);
+      indent = m ? m[0] : "";
+    }
     var range = sel.getRangeAt(0);
     range.deleteContents();
-    var nl = document.createTextNode("\\n");
+    var nl = document.createTextNode("\\n" + indent);
     range.insertNode(nl);
     range.setStartAfter(nl);
     range.collapse(true);
@@ -553,7 +606,14 @@ val replScript: Text = t"""
       if (serverInstance === null) serverInstance = msg.value;
       else if (msg.value !== serverInstance) {
         serverInstance = msg.value;
-        logBlock("notice", "The server restarted - your previous session (definitions, imports and settings) was lost.");
+        logBlock("notice", "${Repl.messages.serverRestarted}");
+        log.scrollIntoView(false);
+      }
+      // Show this connection's auto-started session name (and any later switch). The banner text
+      // (`msg.output`) is built in core, so it reads identically to the CLI's startup line.
+      if (msg.name && msg.name !== sessionName) {
+        sessionName = msg.name;
+        logBlock("notice", msg.output);
         log.scrollIntoView(false);
       }
       return;
@@ -568,22 +628,31 @@ val replScript: Text = t"""
       if (msg.seq in tokenizeCode) { incompleteText = tokenizeCode[msg.seq]; incomplete = msg.incomplete; delete tokenizeCode[msg.seq]; }
       return;
     }
-    var out = msg.output;
-    if (out && out.charAt(out.length - 1) === "\\n") out = out.slice(0, -1);
-    logBlock("", out);
-    if (msg.kind === "result") {
-      var v = msg.value;
-      var html = "";
-      if (v) {
-        html = v;
-        if (msg.name) html = escapeHtml(msg.name) + " = " + html;
-        if (msg.tpe) html += " : " + escapeHtml(msg.tpe);
-      }
-      logHtml("result", html);
-      logBlock("error", msg.diagnostics);
-    } else {
-      logBlock("error", msg.diagnostics);
+    // Async mode: a "pending" ack appends an empty placeholder block tagged with the submission's seq;
+    // the later "async" message (same seq) fills that block in place, so the result lands where the
+    // submission was, even though the editor has moved on.
+    if (msg.kind === "pending") {
+      var ph = document.createElement("div");
+      ph.className = "pending";
+      ph.setAttribute("data-id", msg.seq);
+      ph.textContent = "⋯ evaluating…";
+      log.appendChild(ph);
+      log.scrollIntoView(false);
+      return;
     }
+    if (msg.kind === "async") {
+      var target = log.querySelector('[data-id="' + msg.seq + '"]');
+      if (!target) { target = document.createElement("div"); log.appendChild(target); }
+      target.removeAttribute("data-id");
+      target.className = "";
+      fillResult(target, msg);
+      log.scrollIntoView(false);
+      return;
+    }
+    // A normal (synchronous) result or error: one block rendered by the shared helper.
+    var block = document.createElement("div");
+    fillResult(block, msg);
+    log.appendChild(block);
     log.scrollIntoView(false);
   }
 
@@ -670,6 +739,12 @@ private def resultReply(seq: Int, reply: Repl.Reply): WebReply = reply match
   case _ =>
     WebReply(t"error", seq, t"", t"", t"", t"", Nil)
 
+// The out-of-band fill for an async submission: the same content `resultReply` produces, but tagged
+// `async` so the browser fills the matching placeholder div (located by `seq`) rather than appending a
+// new block. The JS `async` handler renders value/output/diagnostics exactly like a normal result.
+private def asyncReply(seq: Int, reply: Repl.Reply): WebReply =
+  resultReply(seq, reply).copy(kind = t"async")
+
 // Serves the web REPL on `port`, blocking until the process is interrupted. The embedded
 // engine's compile classpath comes from the supplied `Classloader`, so each caller passes
 // the loader matching how it was launched: the standalone `web` main uses the
@@ -680,11 +755,10 @@ private def resultReply(seq: Int, reply: Repl.Reply): WebReply = reply match
 def serveHttp(port: Int, quit: Promise[Unit])(using Monitor, System, Probate, Classloader): Unit =
   given Scalac[3.8] = Scalac(Nil)
 
-  // A single shared session — REPL state is shared across browser tabs, exactly as the
-  // socket server shares it across connections; `react` serializes concurrent submits. The web
-  // front-end renders result values as HTML (via `flame.HtmlRender`'s Renderable→Showable→toString
-  // cascade), unlike the CLI's teletype `Inspect` rendering.
-  val repl = Repl.make(Repl.Prelude.empty, Repl.Rendering.Html)
+  // Multiple named sessions — each browser connection auto-starts a fresh randomly-named session and
+  // may `/session`-switch to any other. Result values render as HTML (via `flame.HtmlRender`'s
+  // Renderable→Showable→toString cascade), unlike the CLI's teletype `Inspect` rendering.
+  val sessions = Sessions(Repl.Rendering.Html)
 
   // A token unique to this server process. The client remembers it and, on reconnecting,
   // compares: a different token means it reached a fresh process (e.g. after a restart),
@@ -692,10 +766,15 @@ def serveHttp(port: Int, quit: Promise[Unit])(using Monitor, System, Probate, Cl
   // so the client can warn that the session was lost.
   val instance: Text = java.util.UUID.randomUUID.nn.toString.nn.tt
 
-  // Translate one JSON request from the browser into a JSON reply, reusing the engine:
-  // `tokenize` (the fast, compiler-free lexer) for live highlighting on every keystroke,
-  // and `react` (typechecked compile-and-run) for a submitted line.
-  def respondJson(payload: Text): Text =
+  // Translate one JSON request from the browser into a JSON reply, dispatched on this connection's
+  // CURRENT session (`current`): `tokenize` (the fast, compiler-free lexer) is stateless; `submit`/
+  // `complete` run on the current session (with `/session` intercepted to switch it); `hello` reports
+  // the session name for the startup banner.
+  // `push` sends an unsolicited frame to THIS browser (via the connection's WebSocket channel), used
+  // to deliver an async submission's result out-of-band once it is ready.
+  def respondJson(current: juca.AtomicReference[Text], push: Text => Unit, payload: Text): Text =
+    def session: Optional[Repl[3.8]] = sessions.session(current.get.nn)
+
     safely(payload.read[Json].as[WebRequest]).let: request =>
       request.kind match
         case t"tokenize" =>
@@ -704,11 +783,55 @@ def serveHttp(port: Int, quit: Promise[Unit])(using Monitor, System, Probate, Cl
              Repl.incomplete(request.code) )
 
         case t"submit" =>
-          resultReply(request.seq, repl.react(request.seq, request.code))
+          val code = request.code
+          if code == t"/session" || code.starts(t"/session ") then
+            val name = code.skip(t"/session".length).trim
+            val message: Text =
+              if name == t"" then Repl.messages.sessionList(current.get.nn, sessions.names)
+              else if sessions.session(name).let(_ => true).or(false) then
+                current.set(name)
+                Repl.messages.switched(name)
+              else Repl.messages.noSession(name)
+
+            WebReply(t"result", request.seq, t"", t"", message, t"", Nil)
+
+          // An unrecognised `/`-command gets the same message as the CLI, rather than being compiled
+          // as Scala (`Repl.isCommand` and the message text are shared with the CLI, via core).
+          else if code.starts(t"/") && !Repl.isCommand(code) then
+            WebReply(t"result", request.seq, t"", t"", Repl.messages.unknownCommand(code), t"", Nil)
+          else
+            session.lay(WebReply(t"error", request.seq, t"", t"", t"", t"flame: no active session", Nil)): repl =>
+              if !repl.asyncEnabled then resultReply(request.seq, repl.react(request.seq, code))
+              else
+                // Async mode: run the submission on a worker. If it finishes within the grace window,
+                // reply with the full result inline; otherwise acknowledge with a `pending` placeholder
+                // now and `push` the real reply (tagged `async`, correlated by `seq`) when it completes.
+                val promise: Promise[Repl.Reply] = Promise()
+
+                async:
+                  promise.offer:
+                    safely(repl.react(request.seq, code)).or
+                     (Repl.Reply.Failed(request.seq, t"the submission could not be processed"))
+
+                promise.attend(Sessions.graceMillis)
+
+                promise().let(resultReply(request.seq, _)).or:
+                  async:
+                    promise.attend()
+                    promise().let { reply => push(asyncReply(request.seq, reply).json.show) }
+
+                  WebReply(t"pending", request.seq, t"", t"", t"", t"", Nil)
 
         case t"complete" =>
-          val items = webCompletions(repl.completionsAt(request.code, request.offset))
-          WebReply(t"completions", request.seq, t"", t"", t"", t"", Nil, items)
+          if request.code.starts(t"/session ") then
+            val partial = request.code.skip(t"/session ".length)
+            val items = sessions.names.filter(_.starts(partial)).map: name =>
+              WebCompletion(t"/session $name", t"command", t"")
+
+            WebReply(t"completions", request.seq, t"", t"", t"", t"", Nil, items)
+          else
+            val completions = session.lay(Nil)(_.completionsAt(request.code, request.offset))
+            WebReply(t"completions", request.seq, t"", t"", t"", t"", Nil, webCompletions(completions))
 
         case t"ping" =>
           // The client's keep-alive heartbeat; the reply is ignored, but answering keeps
@@ -716,12 +839,15 @@ def serveHttp(port: Int, quit: Promise[Unit])(using Monitor, System, Probate, Cl
           WebReply(t"pong", request.seq, t"", t"", t"", t"", Nil)
 
         case t"hello" =>
-          // Sent on every (re)connect; the instance token lets the client tell a resumed
-          // connection (same process, session intact) from a new one (session lost).
-          WebReply(t"hello", request.seq, instance, t"", t"", t"", Nil)
+          // Sent on every (re)connect; the instance token lets the client tell a resumed connection
+          // from a new one, `name` carries this connection's session (for the switch-detection), and
+          // `output` is the ready-to-show startup banner (built in core, identical to the CLI's).
+          WebReply
+           ( t"hello", request.seq, instance, t"", Repl.messages.session(current.get.nn), t"", Nil,
+             name = current.get.nn )
 
         case _ =>
-          WebReply(t"error", request.seq, t"", t"", t"", t"unknown request", Nil)
+          WebReply(t"error", request.seq, t"", t"", t"", t"flame: unknown request", Nil)
 
     . lay(t"")(_.json.show)
 
@@ -731,11 +857,24 @@ def serveHttp(port: Int, quit: Promise[Unit])(using Monitor, System, Probate, Cl
         Http.Response(ReplPage())
 
       case t"/socket" =>
+        // Per-connection: a fresh session, switchable with `/session`.
+        val current: juca.AtomicReference[Text] = juca.AtomicReference(sessions.create())
+
         Http.Response:
-          webSocket(): (message: perihelion.Message) =>
-            message match
-              case perihelion.Message.Text(payload) => Reply(perihelion.Message.Text(respondJson(payload)), ())
-              case perihelion.Message.Binary(_)     => Continue(())
+          // Bind the socket to a `lazy val` so the handler can reach `ws.channel` (only dereferenced
+          // when a message arrives, by which point `ws` is initialised) to push async results out-of-
+          // band. `push` sends one Text frame — wire-identical to a normal reply.
+          lazy val ws: perihelion.Websocket[perihelion.Message, Unit] =
+            webSocket(): (message: perihelion.Message) =>
+              def push(text: Text): Unit = ws.channel.send(perihelion.Message.Text(text))
+
+              message match
+                case perihelion.Message.Text(payload) =>
+                  Reply(perihelion.Message.Text(respondJson(current, push, payload)), ())
+
+                case perihelion.Message.Binary(_) => Continue(())
+
+          ws
 
       case _ =>
         Http.Response(Http.NotFound)(t"not found")

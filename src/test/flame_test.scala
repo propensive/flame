@@ -35,11 +35,13 @@ package flame
 import _root_.java.io as ji
 import _root_.java.net as jn
 import _root_.java.nio.channels as jnc
-import _root_.java.nio.file as jnf
 
 import soundness.*
 
 import classloaders.threadContextClassloader
+import filesystemOptions.createNonexistentParents.enabled
+import filesystemOptions.overwritePreexisting.disabled
+import interfaces.paths.pathOnLinux
 import probates.awaitProbate
 import logging.silentLogging
 import strategies.throwUnsafely
@@ -496,7 +498,7 @@ object Tests extends Suite(m"Flame Tests"):
       test(m"a reply carries the value, type and highlighting"):
         supervise:
           val tcpPort = Port[Tcp]()
-          val service = Repl().serve(tcpPort)
+          val service = Sessions().serve(tcpPort)
           val socket  = jn.Socket("localhost", tcpPort.number)
 
           try exchange(socket, Repl.Request.Submit(1, t"1 + 1"))
@@ -512,16 +514,16 @@ object Tests extends Suite(m"Flame Tests"):
 
       test(m"a quit request fulfils the server's quit signal"):
         supervise:
-          val tcpPort = Port[Tcp]()
-          val repl    = Repl()
-          val service = repl.serve(tcpPort)
-          val socket  = jn.Socket("localhost", tcpPort.number)
+          val tcpPort  = Port[Tcp]()
+          val sessions = Sessions()
+          val service  = sessions.serve(tcpPort)
+          val socket   = jn.Socket("localhost", tcpPort.number)
 
           try
             send(socket, Repl.Request.Quit(0))
 
             // Wait (bounded) for the quit signal rather than blocking forever.
-            val runnable: Runnable = () => repl.awaitQuit()
+            val runnable: Runnable = () => sessions.awaitQuit()
             val waiter = Thread(runnable)
             waiter.start()
             waiter.join(5000L)
@@ -533,9 +535,10 @@ object Tests extends Suite(m"Flame Tests"):
 
       test(m"a message sent over a UNIX domain socket is answered"):
         supervise:
-          val directory    = jnf.Files.createTempDirectory("flame-test").nn
-          val socketPath   = directory.resolve("repl.sock").nn.toString.tt
-          val service      = Repl().serve(socketPath)
+          val directory: Path on Linux = temporaryDirectory/Uuid()
+          directory.create[Directory]()
+          val socketPath: Text = (directory/t"repl.sock").encode
+          val service      = Sessions().serve(socketPath)
           val address      = jn.UnixDomainSocketAddress.of(socketPath.s).nn
           val channel      = jnc.SocketChannel.open(address).nn
 
@@ -550,10 +553,45 @@ object Tests extends Suite(m"Flame Tests"):
           case Repl.Reply.Ran(_, value, _, _, _, _, _) => value.let(_ == t"42").or(false)
           case _                                    => false
 
+      test(m"sessions are independent and each has a distinct name"):
+        supervise:
+          val sessions = Sessions()
+          val a = sessions.create()
+          val b = sessions.create()
+          sessions.session(a).vouch.interpret(t"val marker = 111")
+          ( a != b && sessions.names.contains(a) && sessions.names.contains(b),
+            sessions.session(a).vouch.interpret(t"marker"),
+            sessions.session(b).vouch.interpret(t"marker") )
+      . assert:
+          case (true, Repl.Outcome.Ran(_, _, _, _, _), Repl.Outcome.Rejected(_)) => true
+          case _                                                                  => false
+
+      test(m"a Session request switches the connection and lists sessions"):
+        supervise:
+          val directory: Path on Linux = temporaryDirectory/Uuid()
+          directory.create[Directory]()
+          val socketPath: Text = (directory/t"repl2.sock").encode
+          val sessions = Sessions()
+          val service  = sessions.serve(socketPath)
+          val address  = jn.UnixDomainSocketAddress.of(socketPath.s).nn
+          val channel  = jnc.SocketChannel.open(address).nn
+          val in  = jnc.Channels.newInputStream(channel).nn
+          val out = jnc.Channels.newOutputStream(channel).nn
+
+          try
+            // Connecting auto-starts a session; querying reports it plus the list.
+            exchange(in, out, Repl.Request.Session(1, t""))
+          finally
+            channel.close()
+            service.stop()
+      . assert:
+          case Repl.Reply.Session(_, name, names) => name != t"" && names.contains(name)
+          case _                                  => false
+
       test(m"a completion request returns matching completions"):
         supervise:
           val tcpPort = Port[Tcp]()
-          val service = Repl().serve(tcpPort)
+          val service = Sessions().serve(tcpPort)
           val socket  = jn.Socket("localhost", tcpPort.number)
 
           try exchange(socket, Repl.Request.Complete(1, t"List(1, 2, 3).m", 15))

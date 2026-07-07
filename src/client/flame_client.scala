@@ -35,7 +35,6 @@ package flame
 import java.io as ji
 import java.lang as jl
 import java.net as jn
-import java.nio.file as jnf
 import java.util.concurrent as juc
 
 import scala.collection.concurrent.TrieMap
@@ -50,7 +49,11 @@ import iridescence.WebColors
 import backstops.silentBackstop
 import classloaders.threadContextClassloader
 import executives.completions
+import filesystemOptions.createNonexistentParents.enabled
+import filesystemOptions.deleteRecursively.disabled
+import filesystemOptions.overwritePreexisting.disabled
 import harlequin.Accent
+import interfaces.paths.pathOnLinux
 import internetAccess.online
 import interpreters.posixInterpreter
 import logging.silentLogging
@@ -62,7 +65,14 @@ import threading.platformThreading
 
 val Serve = Subcommand("serve", "serve the Flame web front-end")
 val Install = Subcommand("install", "install tab-completions into the shell")
-val WebPort = Flag[Int]("port", false, List('p'), "the HTTP port for the web front-end")
+val Listen = Subcommand("listen", "serve the terminal REPL over TCP, for remote clients")
+val Port = Flag[Int]("port", false, List('p'), "a TCP port — the web front-end, or a remote REPL server")
+val Host = Flag[Text]("host", false, List('H'), "connect to a flame REPL server running on this host")
+val Session = Flag[Text]("session", false, List('s'), "join an existing REPL session by name")
+
+// The default TCP port for `flame listen` (a remote-reachable REPL server) and for `flame --host`
+// when no `--port` is given. Arbitrary, but stable so the two ends agree without configuration.
+val defaultPort: Int = 4319
 
 @main
 def repl(): Unit = externalize:
@@ -77,7 +87,7 @@ def repl(): Unit = externalize:
           recover:
             case NumberError(_, _, _) => 8080
           . protect:
-              WebPort().or(8080)
+              Port().or(8080)
 
         execute(httpServe(port))
 
@@ -85,15 +95,23 @@ def repl(): Unit = externalize:
       case Install() :: _ =>
         execute(installCompletions())
 
+      // `flame listen [--port N | -p N]` — a REPL server bound to a TCP port (not a per-process UNIX
+      // socket), so a `flame --host` client on another machine can reach its sessions. Defaults to
+      // `defaultPort`; a non-numeric `--port` also falls back to it.
+      case Listen() :: _ =>
+        val port: Int =
+          recover:
+            case NumberError(_, _, _) => defaultPort
+          . protect:
+              Port().or(defaultPort)
+
+        execute(serve(port))
+
       // Internal: the per-process UNIX-socket REPL server that `connectSocket`/`launchServer`
       // spawns in the background (see `launchServer`). Not a user-facing command — `serve` now
       // serves the web front-end — so it uses a distinct argument the launcher passes itself.
       case Argument("serve-socket") :: Nil =>
         execute(serveSocket())
-
-      // `flame` — the terminal REPL (connects to, or starts, a background socket server).
-      case Nil =>
-        execute(connectSocket())
 
       // TEMPORARY keyboard-diagnostic mode: print each keypress instead of editing.
       case Argument("keys") :: Argument("kitty") :: Nil =>
@@ -101,6 +119,30 @@ def repl(): Unit = externalize:
 
       case Argument("keys") :: Nil =>
         execute(keyTest(kitty = false))
+
+      // `flame` — the terminal REPL (connects to, or starts, a background socket server). Bare `flame`
+      // starts a new session; `flame -s NAME` / `flame --session=NAME` joins an existing one (the
+      // `Session()` flag read handles both forms). The flag tokens are matched explicitly rather than
+      // reading `Session()` in the catch-all, so reading it never suppresses the subcommand suggestions
+      // (`serve`/`install`) offered when completing the bare `flame` first word.
+      case Nil =>
+        execute(connectSocket(Session()))
+
+      case Argument(head) :: _ if head == t"-s" || head.starts(t"--session") =>
+        execute(connectSocket(Session()))
+
+      // `flame --host HOST [--port N] [-s NAME]` — connect the terminal REPL to a flame server on
+      // another host over TCP (as started by `flame listen`), rather than the local UNIX-socket
+      // server. As with `-s`, the flag tokens are matched explicitly so reading the flags never
+      // suppresses the subcommand suggestions offered when completing the bare `flame` first word.
+      case Argument(head) :: _ if head == t"-H" || head.starts(t"--host") =>
+        val port: Int =
+          recover:
+            case NumberError(_, _, _) => defaultPort
+          . protect:
+              Port().or(defaultPort)
+
+        execute(connectRemote(Host(), port, Session()))
 
       case _ =>
         execute(Exit.Fail(1))
@@ -110,16 +152,16 @@ private def serve(portNumber: Int)(using Stdio, Monitor, Probate, System): Exit 
   given Scalac[3.8] = Scalac(Nil)
   given Classloader = serverClassloader
 
-  safely(Port[Tcp](portNumber)).lay(invalidPort(portNumber)): port =>
+  safely(urticose.Port[Tcp](portNumber)).lay(invalidPort(portNumber)): port =>
     recover:
       case BindError(_) => Out.println(t"flame: port $portNumber is unavailable"); Exit.Fail(5)
       case error: Error => Out.println(t"flame: ${error.message}"); Exit.Fail(6)
 
     . protect:
-        val repl    = Repl()
-        val service = repl.serve(port)
+        val sessions = Sessions()
+        val service  = sessions.serve(port)
         Out.println(t"flame: serving a REPL on port $portNumber (Ctrl+C or /quit to stop)")
-        repl.awaitQuit()
+        sessions.awaitQuit()
         service.stop()
         Exit.Ok
 
@@ -206,21 +248,37 @@ private def serveSocket()(using Stdio, Monitor, Probate, System): Exit =
   // Delete the socket on any exit (a clean stop, a crash, or a kill signal), so it
   // never lingers as a stale file a later client has to clean up.
   val removeSocket: Runnable = () =>
-    safely(jnf.Files.deleteIfExists(jnf.Path.of(socketPath.s)))
-    ()
+    recover:
+      case _: PathError | _: IoError => ()
+    . protect:
+      socketPath.decode[Path on Linux].wipe()
+      ()
 
   jl.Runtime.getRuntime.nn.addShutdownHook(jl.Thread(removeSocket))
 
   try
-    jnf.Files.createDirectories(jnf.Path.of(socketDirectory.s)).nn
-    jnf.Files.deleteIfExists(jnf.Path.of(socketPath.s))
+    // Prepare the socket directory and clear any stale socket, ignoring filesystem errors (a failure
+    // here just surfaces as `serve` failing below). `create[Directory]` is not idempotent (it fails
+    // if the directory exists), unlike `Files.createDirectories`, so the directory (which persists
+    // across processes) is created only when absent.
+    recover:
+      case _: PathError | _: IoError => ()
+    . protect:
+      val directory = socketDirectory.decode[Path on Linux]
+      if !directory.exists() then directory.create[Directory]()
+      socketPath.decode[Path on Linux].wipe()
 
-    val repl    = Repl()
-    val service = repl.serve(socketPath)
+    val sessions = Sessions()
+    val service  = sessions.serve(socketPath)
     Out.println(t"flame: serving a REPL on $socketPath (Ctrl+C or /quit to stop)")
-    repl.awaitQuit()
+    sessions.awaitQuit()
     service.stop()
-    safely(jnf.Files.deleteIfExists(jnf.Path.of(socketPath.s)))
+
+    recover:
+      case _: PathError | _: IoError => ()
+    . protect:
+      socketPath.decode[Path on Linux].wipe()
+
     Exit.Ok
   catch case error: Throwable =>
     Out.println(t"flame: could not serve on $socketPath: ${error.toString.tt}")
@@ -244,35 +302,51 @@ private def serveSocket()(using Stdio, Monitor, Probate, System): Exit =
 // (e.g. `ethereal.script` unset, or a non-`URLClassLoader` launcher) we fall back
 // to the thread-context loader.
 private def serverClassloader(using System): Classloader =
+  // `recover`/`protect` handles the filesystem errors the path operations RAISE; the outer `try`
+  // catches anything the classloader machinery THROWS (a missing `ethereal.script`, a non-URL
+  // launcher). Either way we fall back to the thread-context loader.
   try
-    val executable: Text = unsafely(System.properties.ethereal.script[Text]())
-    val link: jnf.Path = jnf.Files.createTempDirectory("flame").nn.resolve("flame.jar").nn
-    jnf.Files.createSymbolicLink(link, jnf.Path.of(executable.s)).nn
-    val url: jn.URL = ji.File(link.toString).toURI.nn.toURL.nn
+    recover:
+      case _: PathError | _: IoError => threadContextClassloader
+    . protect:
+      val executable: Text = unsafely(System.properties.ethereal.script[Text]())
+      val tmpDir: Path on Linux = temporaryDirectory/Uuid()
+      tmpDir.create[Directory]()
+      val link: Path on Linux = unsafely(tmpDir/t"flame.jar")
+      executable.decode[Path on Linux].symlinkTo(link)
+      val url: jn.URL = link.javaFile.toURI.nn.toURL.nn
 
-    val executablePath: Text = ji.File(executable.s).getCanonicalPath.nn.tt
-    val bootstrapUrls: List[jn.URL] = threadContextClassloader.java match
-      case loader: jn.URLClassLoader =>
-        loader.getURLs.nn.iterator.to(List).map(_.nn).filter: entry =>
-          safely(ji.File(entry.toURI).getCanonicalPath.nn.tt) != executablePath
-      case _ =>
-        Nil
+      val executablePath: Text = ji.File(executable.s).getCanonicalPath.nn.tt
+      val bootstrapUrls: List[jn.URL] = threadContextClassloader.java match
+        case loader: jn.URLClassLoader =>
+          loader.getURLs.nn.iterator.to(List).map(_.nn).filter: entry =>
+            safely(ji.File(entry.toURI).getCanonicalPath.nn.tt) != executablePath
+        case _ =>
+          Nil
 
-    new Classloader(jn.URLClassLoader((url :: bootstrapUrls).toArray, threadContextClassloader.java))
+      new Classloader(jn.URLClassLoader((url :: bootstrapUrls).toArray, threadContextClassloader.java))
   catch case _: Throwable => threadContextClassloader
 
 private def invalidPort(portNumber: Int)(using Stdio): Exit =
   Out.println(t"flame: $portNumber is not a valid TCP port")
   Exit.Fail(2)
 
-private def unreachable(portNumber: Int)(using Stdio): Exit =
-  Out.println(t"flame: could not connect to localhost:$portNumber")
+private def missingHost(using Stdio): Exit =
+  Out.println(t"flame: --host needs the hostname of a flame server to connect to")
+  Exit.Fail(2)
+
+private def invalidHost(host: Text)(using Stdio): Exit =
+  Out.println(t"flame: '$host' is not a valid hostname")
+  Exit.Fail(2)
+
+private def unreachableRemote(host: Text, portNumber: Int)(using Stdio): Exit =
+  Out.println(t"flame: could not connect to $host:$portNumber")
   Exit.Fail(3)
 
-// Runs `body` over a fresh TCP connection — always closing it afterwards — or returns
-// `Unset` if the connection is refused.
-private def connect[result](port: Port over Tcp)(body: Duplex => result): Optional[result] =
-  try (ip"127.0.0.1" via port).duplex(body) catch case _: ji.IOException => Unset
+// Runs `body` over a fresh TCP connection to `endpoint` — always closing it afterwards —
+// or returns `Unset` if the connection is refused.
+private def connect[result](endpoint: Endpoint[TcpPort])(body: Duplex => result): Optional[result] =
+  try endpoint.duplex(body) catch case _: ji.IOException => Unset
 
 // As `connect`, but over a UNIX domain socket.
 private def connectDomain[result](socket: DomainSocket)(body: Duplex => result): Optional[result] =
@@ -352,29 +426,20 @@ private def keyTest(kitty: Boolean)(using Stdio, Monitor, Probate, Console, Envi
 
         Exit.Ok
 
-// The full paths of the `.sock` files in the socket directory.
+// The full paths of the `.sock` files in the socket directory (an absent directory has no children,
+// so this is empty on the first run; an undecodable directory path yields nothing).
 private def socketPaths(directory: Text): List[Text] =
-  val listing: Array[ji.File | Null] | Null = ji.File(directory.s).listFiles()
-  val names: scm.ArrayBuffer[Text] = scm.ArrayBuffer()
-
-  if listing != null then
-    var index = 0
-
-    while index < listing.nn.length do
-      val file = listing.nn(index)
-
-      if file != null then
-        val name: Text = file.nn.getName.nn.tt
-        if name.ends(t".sock") then names += t"$directory/$name"
-
-      index += 1
-
-  names.to(List)
+  recover:
+    case _: PathError => Nil
+  . protect:
+    directory.decode[Path on Linux].children.map(_.encode).filter(_.ends(t".sock")).to(List)
 
 // Connects to a per-process UNIX domain socket. With no server running, launches one
 // in the background and attaches to it (so `flame` alone is a self-contained REPL,
 // reconnectable later); with exactly one, connects to it; with several, lists them.
-private def connectSocket()(using Stdio, Monitor, Probate, Console, Environment, System): Exit =
+private def connectSocket(join: Optional[Text])
+    (using Stdio, Monitor, Probate, Console, Environment, System)
+:   Exit =
   // Probe every socket file: a connectable one is live; one that refuses (a crashed or
   // killed server that never cleaned up) is a stale leftover, so delete it. Then attach
   // to the lone live server, list several, or — when none survive — start a fresh one.
@@ -382,16 +447,20 @@ private def connectSocket()(using Stdio, Monitor, Probate, Console, Environment,
 
   socketPaths(socketDirectory).each: path =>
     if connectDomain(DomainSocket(path)) { _ => () }.absent
-    then safely(jnf.Files.deleteIfExists(jnf.Path.of(path.s)))
+    then
+      recover:
+        case _: PathError | _: IoError => ()
+      . protect:
+        path.decode[Path on Linux].wipe()
     else live += path
 
   live.to(List) match
     case Nil =>
       Out.println(t"flame: starting a REPL server…")
-      launchServer()(converse(_)).or(failedToLaunch)
+      launchServer()(converse(join)(_)).or(failedToLaunch)
 
     case path :: Nil =>
-      connectDomain(DomainSocket(path))(converse(_)).or(unreachableSocket(path))
+      connectDomain(DomainSocket(path))(converse(join)(_)).or(unreachableSocket(path))
 
     case paths =>
       Out.println(t"flame: several REPL servers are running:")
@@ -399,12 +468,30 @@ private def connectSocket()(using Stdio, Monitor, Probate, Console, Environment,
       paths.each: path =>
         Out.println(t"  $path")
 
-      Out.println(t"flame: stop all but one, or use a TCP server with 'flame <port>'")
+      Out.println(t"flame: stop all but one, or connect to a specific one with 'flame --host localhost'")
       Exit.Fail(7)
+
+// Connects the terminal REPL to a flame server on another host over TCP (`flame --host HOST
+// [--port N]`, reaching a server started with `flame listen`), optionally joining a named session
+// with `-s`/`--session`. The transport differs from `connectSocket` (a TCP endpoint rather than a
+// local UNIX domain socket), but the conversation — the `converse`/`runRepl` loop — is identical, so
+// a remote session behaves exactly like a local one.
+private def connectRemote(host: Optional[Text], portNumber: Int, join: Optional[Text])
+    (using Stdio, Monitor, Probate, Console, Environment, System)
+:   Exit =
+  host.lay(missingHost): hostText =>
+    safely(urticose.Port[Tcp](portNumber)).lay(invalidPort(portNumber)): port =>
+      recover:
+        case HostnameError(_, _) => invalidHost(hostText)
+      . protect:
+          val endpoint: Endpoint[TcpPort] = hostText.decode[Hostname] via port
+          connect(endpoint)(converse(join)(_)).or(unreachableRemote(hostText, portNumber))
 
 // The read/edit/print loop. The server's reply is printed verbatim. Ctrl+C/Ctrl+D
 // dismiss the line editor (`DismissError`) and end the session.
-private def converse(duplex: Duplex)(using Stdio, Monitor, Probate, Console, Environment): Exit =
+private def converse(join: Optional[Text])(duplex: Duplex)
+    (using Stdio, Monitor, Probate, Console, Environment)
+:   Exit =
   // The kitty keyboard protocol (applied by `interactive`) makes the terminal report
   // Shift+Enter distinctly, so the editor can submit on it.
   import terminalFeatures.kittyKeyboardFeature
@@ -422,7 +509,7 @@ private def converse(duplex: Duplex)(using Stdio, Monitor, Probate, Console, Env
 
   . protect:
       interactive: terminal ?=>
-        runRepl(duplex, state, pending, nextId, submits, completions)
+        runRepl(duplex, state, pending, nextId, submits, completions, join)
         Exit.Ok
 
 // One REPL input line is an inline block at the bottom of the console — a bordered,
@@ -438,7 +525,8 @@ private def runRepl
     pending:     TrieMap[Int, Int],
     nextId:      juc.atomic.AtomicInteger,
     submits:     juc.LinkedBlockingQueue[Repl.Reply],
-    completions: juc.LinkedBlockingQueue[List[Repl.CompletionItem]] )
+    completions: juc.LinkedBlockingQueue[List[Repl.CompletionItem]],
+    join:        Optional[Text] )
   ( using terminal: Terminal, monitor: Monitor )
 :   Unit =
 
@@ -449,6 +537,10 @@ private def runRepl
   // even starts (the server sends nothing until it receives a message).
   lazy val chunks: Iterator[Data] = duplex.stream.iterator
   @volatile var live = true
+
+  // Replies to session queries/switches (the server only sends a `Session` reply in answer to a
+  // `Session` request, so this queue is drained 1:1 by whoever sent the request).
+  val sessionReplies: juc.LinkedBlockingQueue[Repl.Reply.Session] = juc.LinkedBlockingQueue()
 
   // Inline autosuggestion ("ghost text"): on each edit we ask the server (with a non-zero
   // id, to distinguish from a Tab completion's id 0) for completions at the cursor; the
@@ -463,6 +555,18 @@ private def runRepl
   // the current value arrives, the predicate falls back to a cheap bracket check.
   @volatile var incompleteFor: Optional[(Text, Boolean)] = Unset
   val incompletePending: TrieMap[Int, Text] = TrieMap()
+
+  // Async mode (`/set async`): a submission whose result is not ready within the server's grace window
+  // is answered with a `Pending` placeholder; the real reply arrives out-of-band later, carrying the
+  // submission's id. `asyncPending` holds ids awaiting a fill; `asyncEntries` maps an id to its
+  // placeholder transcript entry so the fill updates it in place; `asyncResults` stashes a fill that
+  // races ahead of the entry being recorded (essentially impossible — a fill is at least a grace window
+  // away — but cheap to handle). A fill mutates the entry's `result`, sets `asyncReplay`, and posts a
+  // `Redraw`, which replays the transcript with the filled result in the placeholder's position.
+  val asyncPending: TrieMap[Int, Unit]            = TrieMap()
+  val asyncEntries: TrieMap[Int, TranscriptEntry] = TrieMap()
+  val asyncResults: TrieMap[Int, Text]            = TrieMap()
+  @volatile var asyncReplay: Boolean              = false
 
   // What Enter does depends on how much has been typed:
   //  - a SINGLE line submits as soon as it is a COMPLETE (not incomplete-prefix) statement or
@@ -513,8 +617,42 @@ private def runRepl
             ghostReply = (forValue, items)
             terminal.events.put(TerminalInfo.Redraw)
 
+        case reply: Repl.Reply.Session =>
+          sessionReplies.put(reply)
+
+        // The placeholder ack for an async submission: note its id, then unblock the waiting submit
+        // (which shows the "evaluating" panel). The real reply follows later with the same id.
+        case reply @ Repl.Reply.Pending(id) =>
+          asyncPending(id) = ()
+          submits.put(reply)
+
+        // An out-of-band fill for an async submission (id previously seen via `Pending`): update the
+        // matching transcript entry — or stash the text if the entry isn't recorded yet — and replay.
+        case reply if asyncPending.contains(replyId(reply)) =>
+          val id = replyId(reply)
+          asyncPending.remove(id)
+          val text = replyText(reply)
+
+          asyncEntries.remove(id) match
+            case Some(entry) => entry.result = text
+            case None        => asyncResults(id) = text
+
+          asyncReplay = true
+          terminal.events.put(TerminalInfo.Redraw)
+
         case reply =>
           submits.put(reply)
+
+  // Start this connection's session: join the one named by `-s`/`--session` if it exists, otherwise
+  // let the server assign a fresh animal name. Show the resulting session, noting when a requested
+  // name was not found (the server then started a new one instead).
+  val joinName: Text = join.or(t"")
+  duplex.send(Stream(framed(encode(Repl.Request.Session(nextId.getAndIncrement, joinName)))))
+
+  safely(sessionReplies.take().nn).let: reply =>
+    if joinName != t"" && reply.name != joinName
+    then Out.println(Repl.messages.joinFailed(joinName, reply.name))
+    else Out.println(Repl.messages.session(reply.name))
 
   val events = terminal.eventIterator()
   var running = true
@@ -675,14 +813,38 @@ private def runRepl
           case TerminalInfo.Redraw =>
             // The settle after a resize: lay the whole session out afresh from the top, then draw
             // the (reset) editor immediately below it. Otherwise it is a tokenize repaint.
-            if resizeReplay then
+            if resizeReplay || asyncReplay then
               resizeReplay = false
+              asyncReplay = false
               replay()
               root.reset()
               frame()
             else
               tokens = state.record(editor.value, editor.value)._2
               frame()
+
+          // `/session <name>` completes against the server's live session list (queried fresh here).
+          case Keypress.Tab if editor.value.starts(t"/session ") =>
+            duplex.send(Stream(framed(encode(Repl.Request.Session(nextId.getAndIncrement, t"")))))
+            val names:   List[Text] = safely(sessionReplies.take().nn).lay(Nil)(_.names)
+            val partial: Text       = editor.value.skip(t"/session ".length)
+            val matches: List[Text] = names.filter(_.starts(partial)).map { name => t"/session $name" }
+
+            matches match
+              case Nil => ()
+
+              case one :: Nil =>
+                editor = LineEditor(one, one.length, editor.mode)
+                candidates = Nil
+
+              case several =>
+                val prefix = longestCommonPrefix(several)
+                if prefix.length > editor.value.length
+                then editor = LineEditor(prefix, prefix.length, editor.mode)
+                candidates = several.map { name => Repl.CompletionItem(name, t"command", t"") }
+
+            refresh()
+            frame()
 
           case Keypress.Tab =>
             val (advanced, shown) = completeAt(editor, duplex, completions)
@@ -738,6 +900,20 @@ private def runRepl
             submitted = tight
             editing = false
 
+          // Auto-indent a CONTINUED line (a submitting Enter is caught above): when the cursor is at
+          // the end of the current line — nothing to its right, so the newline isn't splitting text —
+          // start the new line with the same leading whitespace as the line being left. An Enter in the
+          // middle of text falls through to the plain split below.
+          case Keypress.Enter
+              if { val rest = editor.value.skip(editor.position); rest == t"" || rest.starts(t"\n") } =>
+            val before: Text = editor.value.keep(editor.position)
+            val indent: Text = leadingWhitespace(before.cut(t"\n").last)
+            val value:  Text = t"$before\n$indent${editor.value.skip(editor.position)}"
+            editor = LineEditor(value, editor.position + 1 + indent.length, editor.mode)
+            candidates = Nil
+            refresh()
+            frame()
+
           case keypress: Keypress =>
             editor = editor(keypress)
             candidates = Nil
@@ -765,10 +941,13 @@ private def runRepl
       histIdx = history.length
       draft = t""
 
-      // Server-side commands go through `Submit` like ordinary input; the engine recognises
-      // them and replies with a confirmation message. `/disconnect` and `/quit` are the only
-      // client-only commands.
-      def serverCommand(name: Text): Boolean = line == name || line.starts(t"$name ")
+      // Server-side commands go through `Submit` like ordinary input; the engine recognises them
+      // (`Repl.isCommand`) and replies with a confirmation message. `/disconnect`, `/quit`, `/clear`
+      // and `/session` are the client-/connection-only commands, handled below before that check.
+
+      // Set to the submission's id when the server answered with an async `Pending` placeholder, so the
+      // transcript entry below is filed for the reader to fill when the real reply arrives.
+      var asyncId: Optional[Int] = Unset
 
       // The text shown below the box — the result, error, or command message. Captured (rather
       // than printed straight to `Out`) so the identical rendering is reused when the transcript
@@ -789,19 +968,53 @@ private def runRepl
           transcript.clear()
           Out.print(t"\e[2J\e[3J\e[H")
           t""
-        else if line.starts(t"/") && !serverCommand(t"/set") && !serverCommand(t"/unimport")
-            && !serverCommand(t"/context") && !serverCommand(t"/tasty") && !serverCommand(t"/bytecode") then
-          t"flame: unknown command: $line\n"
+        else if line == t"/session" || line.starts(t"/session ") then
+          // Switch this connection to another session (server-side, per connection) — or, with no
+          // argument, report the current session and the ones available.
+          val name = line.skip(t"/session".length).trim
+          duplex.send(Stream(framed(encode(Repl.Request.Session(nextId.getAndIncrement, name)))))
+          safely(sessionReplies.take().nn).lay(t"flame: no response from the server\n"): reply =>
+            if name == t"" then t"${Repl.messages.sessionList(reply.name, reply.names)}\n"
+            else if reply.name == name then t"${Repl.messages.switched(reply.name)}\n"
+            else t"${Repl.messages.noSession(name)}\n"
+        else if line.starts(t"/") && !Repl.isCommand(line) then
+          t"${Repl.messages.unknownCommand(line)}\n"
         else
-          duplex.send(Stream(framed(encode(Repl.Request.Submit(0, line)))))
-          replyText(submits.take().nn)
+          // A fresh id per submission so an async placeholder and its later out-of-band fill correlate
+          // (submits are serialized — we block on the first reply before the next line — so first-reply
+          // FIFO holds; only the async fills, routed by id, are concurrent).
+          val sid = nextId.getAndIncrement
+          duplex.send(Stream(framed(encode(Repl.Request.Submit(sid, line)))))
+          submits.take().nn match
+            case Repl.Reply.Pending(_) =>
+              // Async mode: the result isn't ready. Record the id so the transcript entry is filed for
+              // the reader to fill, and show a faint "evaluating" panel meanwhile.
+              asyncId = sid
+              t"\e[2m⋯ evaluating…\e[22m\n"
+
+            case reply =>
+              replyText(reply)
 
       if result != t"" then Out.print(result)
 
       // Keep the line so a resize can re-render the whole session from the top: the box redraws
       // from `tokens` (reflowing to the new width) and the result is reprinted verbatim. `/clear`
-      // is the exception — it just wiped the session, so it must not re-seed the transcript.
-      if line != t"/clear" then transcript += TranscriptEntry(line, tokens, result)
+      // is the exception — it just wiped the session, so it must not re-seed the transcript. An async
+      // submission files its entry under `asyncId` so the out-of-band fill can update it in place (and
+      // applies a fill that raced ahead of this point).
+      if line != t"/clear" then
+        val entry = TranscriptEntry(line, tokens, result, asyncId.or(0))
+        transcript += entry
+
+        asyncId.let: sid =>
+          asyncResults.remove(sid) match
+            case Some(text) =>
+              entry.result = text
+              asyncReplay = true
+              terminal.events.put(TerminalInfo.Redraw)
+
+            case None =>
+              asyncEntries(sid) = entry
 
   // The loop has exited (Ctrl+D/C, Escape, /quit, or a closed stream): stop the reader.
   live = false
@@ -844,10 +1057,13 @@ private def replPane
 
     rank(box, list)
 
-// One replayable line of the session: the source `text` (to compute the box's wrapped height at
-// any terminal width), the highlight `tokens` (to redraw the box), and the `result` text printed
-// below it. See `runRepl`'s `transcript`/`replay`.
-private case class TranscriptEntry(text: Text, tokens: List[Repl.Token], result: Text)
+// One replayable line of the session: the source `text` (to compute the box's wrapped height at any
+// terminal width), the highlight `tokens` (to redraw the box), and the `result` text printed below it
+// (see `runRepl`'s `transcript`/`replay`). `result` is a `var` and `id` identifies the submission so an
+// async fill (arriving out-of-band after a `Pending` placeholder) can update the result in place; `id`
+// is 0 for synchronous entries, which never need locating.
+private case class TranscriptEntry
+   (text: Text, tokens: List[Repl.Token], var result: Text, id: Int = 0)
 
 // A static (non-interactive) editor box for transcript replay: the same rounded border and
 // 1-column inner padding as `replPane`'s box, showing the highlighted line, but with no caret,
@@ -915,6 +1131,21 @@ private def replyText(reply: Repl.Reply): Text = reply match
   case Repl.Reply.Failed(_, message)               => t"$message\n"
   case Repl.Reply.Tokenized(_, _, _)               => t""
   case Repl.Reply.Completed(_, _)                  => t""
+  case Repl.Reply.Session(_, _, _)                 => t""
+  case Repl.Reply.Pending(_)                       => t""
+
+// The request id every reply echoes — used to correlate an out-of-band async fill with the submission
+// (its `Pending` placeholder) it completes. (The enum's cases share the field but not an accessor.)
+private def replyId(reply: Repl.Reply): Int = reply match
+  case Repl.Reply.Tokenized(id, _, _)         => id
+  case Repl.Reply.Completed(id, _)            => id
+  case Repl.Reply.Ran(id, _, _, _, _, _, _)   => id
+  case Repl.Reply.Rejected(id, _, _)          => id
+  case Repl.Reply.Threw(id, _, _, _)          => id
+  case Repl.Reply.Crashed(id, _, _)           => id
+  case Repl.Reply.Failed(id, _)               => id
+  case Repl.Reply.Session(id, _, _)           => id
+  case Repl.Reply.Pending(id)                 => id
 
 // The completion candidates as a compact, HEADER-LESS list — one Teletype line each: a kind glyph,
 // the name, then the type signature (subdued, truncated to fit). The kind (replacing the old `kind`
@@ -1066,11 +1297,31 @@ private def accentOf(accent: Text): Accent =
 private def colourful(tokens: List[Repl.Token]): Teletype =
   import harlequin.syntaxHighlighting.tokenTeletypeable
 
-  tokens.map: token =>
-    val coloured: Teletype = harlequin.Token(token.text, accentOf(token.accent)).teletype
-    if token.role.let(_ == t"binding").or(false) then e"$Italic($coloured)" else coloured
+  val text: Text = tokens.map(_.text).join
 
-  . join
+  // A `/`-command line is a REPL command, not Scala, so it is highlighted specially rather than
+  // through the Harlequin accents: the command word itself keeps the keyword colour, and its
+  // parameters (everything after the first space) are shown in a fainter, more-yellow colour, to set
+  // them apart from the command.
+  if text.starts(t"/") then
+    val split: Int = text.s.indexOf(' ') match
+      case -1 => text.length
+      case n  => n
+
+    val command: Teletype = e"${palette.scalaKeyword}(${text.keep(split)})"
+    val params:  Text     = text.skip(split)
+
+    if params == t"" then command else e"$command$Faint(${commandParameter}($params))"
+  else
+    tokens.map: token =>
+      val coloured: Teletype = harlequin.Token(token.text, accentOf(token.accent)).teletype
+      if token.role.let(_ == t"binding").or(false) then e"$Italic($coloured)" else coloured
+
+    . join
+
+// The fainter, more-yellow colour used for the parameters of a `/`-command (see `colourful`),
+// dimmed further by `Faint` so the command word reads as the emphasis and its arguments recede.
+private val commandParameter: Color in Srgb = hex(0xd8a657)  // a muted yellow
 
 // ── Live-highlight heuristic ────────────────────────────────────────────────
 // A single-character edit and the "kind" of a character, for guessing accents
@@ -1234,6 +1485,7 @@ private class LiveState:
 private val slashCommands: List[(Text, Text)] =
   Repl.slashCommands ++ List
     ( t"/clear"      -> t"clear the screen and forget the session history",
+      t"/session"    -> t"switch to another session (or list them)",
       t"/disconnect" -> t"leave the session, keeping the server running",
       t"/quit"       -> t"stop the server and quit" )
 
@@ -1273,6 +1525,12 @@ private def longestCommonPrefix(names: List[Text]): Text = names match
 // with every bracket closed. Open brackets continue the input onto a new line.
 // Whether `text`'s last line — the text after its final newline — is blank. This is the "leave a
 // blank line at the end" trigger that submits a multi-line entry.
+// The leading run of spaces/tabs of `line` — the indentation copied onto an auto-indented new line.
+private def leadingWhitespace(line: Text): Text =
+  var i = 0
+  while i < line.s.length && { val c = line.s.charAt(i); c == ' ' || c == '\t' } do i += 1
+  line.keep(i)
+
 private def blankLastLine(text: Text): Boolean =
   val string:  String = text.s
   val newline: Int    = string.lastIndexOf('\n')
