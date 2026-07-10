@@ -81,11 +81,11 @@ object ReplModuleCompiler:
     ( using System )
   :   List[Text] =
 
-    val messages = scala.collection.mutable.ListBuffer[Text]()
+    var messages: List[Text] = Nil
 
     object reporter extends Reporter, UniqueMessagePositions, HideNonSensicalMessages:
       def doReport(diagnostic: Diagnostic)(using Context): Unit =
-        messages += diagnostic.toString.tt
+        messages = messages :+ diagnostic.toString.tt
 
     object driver extends dtd.Driver:
       val currentContext =
@@ -96,7 +96,7 @@ object ReplModuleCompiler:
       def run(): List[Text] =
         given Context = currentContext.fresh.setReporter(reporter)
         ReplModuleCompiler().newRun.compileUnits(ModuleUnit(moduleName.s, pickled) :: Nil)
-        messages.to(List)
+        messages
 
     driver.run()
 

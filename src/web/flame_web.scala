@@ -9,7 +9,6 @@ import perihelion.given
 import doms.html.whatwg.*
 import Control.*
 
-import anticipation.abstractables.durationAbstractable
 import charEncoders.utf8Encoder
 import classloaders.threadContextClassloader
 import formatting.compactJsonFormatting
@@ -633,11 +632,28 @@ val replScript: Text = t"""
     // submission was, even though the editor has moved on.
     if (msg.kind === "pending") {
       var ph = document.createElement("div");
-      ph.className = "pending";
       ph.setAttribute("data-id", msg.seq);
-      ph.textContent = "⋯ evaluating…";
+      // A span the streamed stdout accumulates into, then a faint "evaluating" spinner after it.
+      var out = document.createElement("span");
+      out.className = "stream-out";
+      var spin = document.createElement("span");
+      spin.className = "pending";
+      spin.textContent = "⋯ evaluating…";
+      ph.appendChild(out);
+      ph.appendChild(spin);
       log.appendChild(ph);
       log.scrollIntoView(false);
+      return;
+    }
+    // A streamed stdout chunk (async mode): append it to the matching placeholder's output span, so it
+    // shows as it is produced. The final "async" reply then re-renders the block in full.
+    if (msg.kind === "output") {
+      var ptarget = log.querySelector('[data-id="' + msg.seq + '"]');
+      if (ptarget) {
+        var os = ptarget.querySelector(".stream-out");
+        if (os) os.textContent += msg.output;
+        log.scrollIntoView(false);
+      }
       return;
     }
     if (msg.kind === "async") {
@@ -745,6 +761,11 @@ private def resultReply(seq: Int, reply: Repl.Reply): WebReply = reply match
 private def asyncReply(seq: Int, reply: Repl.Reply): WebReply =
   resultReply(seq, reply).copy(kind = t"async")
 
+// A streamed chunk of an async submission's stdout, correlated by `seq`; the browser appends its
+// `output` to the matching placeholder as it arrives (the final `async` reply then re-renders in full).
+private def outputReply(seq: Int, chunk: Text): WebReply =
+  WebReply(t"output", seq, t"", t"", chunk, t"", Nil)
+
 // Serves the web REPL on `port`, blocking until the process is interrupted. The embedded
 // engine's compile classpath comes from the supplied `Classloader`, so each caller passes
 // the loader matching how it was launched: the standalone `web` main uses the
@@ -764,7 +785,7 @@ def serveHttp(port: Int, quit: Promise[Unit])(using Monitor, System, Probate, Cl
   // compares: a different token means it reached a fresh process (e.g. after a restart),
   // whose `repl` has none of the previous session's definitions, imports, or settings —
   // so the client can warn that the session was lost.
-  val instance: Text = java.util.UUID.randomUUID.nn.toString.nn.tt
+  val instance: Text = Uuid().text
 
   // Translate one JSON request from the browser into a JSON reply, dispatched on this connection's
   // CURRENT session (`current`): `tokenize` (the fast, compiler-free lexer) is stateless; `submit`/
@@ -781,6 +802,7 @@ def serveHttp(port: Int, quit: Promise[Unit])(using Monitor, System, Probate, Cl
           WebReply
            ( t"tokens", request.seq, t"", t"", t"", t"", webTokens(Repl.tokenize(request.code)), Nil,
              Repl.incomplete(request.code) )
+          . json.show
 
         case t"submit" =>
           val code = request.code
@@ -788,39 +810,37 @@ def serveHttp(port: Int, quit: Promise[Unit])(using Monitor, System, Probate, Cl
             val name = code.skip(t"/session".length).trim
             val message: Text =
               if name == t"" then Repl.messages.sessionList(current.get.nn, sessions.names)
-              else if sessions.session(name).let(_ => true).or(false) then
+              else if sessions.session(name).present then
                 current.set(name)
                 Repl.messages.switched(name)
               else Repl.messages.noSession(name)
 
-            WebReply(t"result", request.seq, t"", t"", message, t"", Nil)
+            WebReply(t"result", request.seq, t"", t"", message, t"", Nil).json.show
 
           // An unrecognised `/`-command gets the same message as the CLI, rather than being compiled
           // as Scala (`Repl.isCommand` and the message text are shared with the CLI, via core).
           else if code.starts(t"/") && !Repl.isCommand(code) then
-            WebReply(t"result", request.seq, t"", t"", Repl.messages.unknownCommand(code), t"", Nil)
+            WebReply(t"result", request.seq, t"", t"", Repl.messages.unknownCommand(code), t"", Nil).json.show
           else
-            session.lay(WebReply(t"error", request.seq, t"", t"", t"", t"flame: no active session", Nil)): repl =>
-              if !repl.asyncEnabled then resultReply(request.seq, repl.react(request.seq, code))
+            session.lay
+             (WebReply(t"error", request.seq, t"", t"", t"", t"flame: no active session", Nil).json.show): repl =>
+              if !repl.asyncEnabled then resultReply(request.seq, repl.react(request.seq, code)).json.show
               else
-                // Async mode: run the submission on a worker. If it finishes within the grace window,
-                // reply with the full result inline; otherwise acknowledge with a `pending` placeholder
-                // now and `push` the real reply (tagged `async`, correlated by `seq`) when it completes.
-                val promise: Promise[Repl.Reply] = Promise()
+                // Async mode: acknowledge with `pending` IMMEDIATELY (pushed directly, so it is sent
+                // before any streamed output), then run on a worker — streaming stdout as `output`
+                // messages as it appears — and push the final result (tagged `async`) when done.
+                // Returns `t""` so the handler sends nothing more itself.
+                push(WebReply(t"pending", request.seq, t"", t"", t"", t"", Nil).json.show)
 
                 async:
-                  promise.offer:
-                    safely(repl.react(request.seq, code)).or
-                     (Repl.Reply.Failed(request.seq, t"the submission could not be processed"))
+                  val reply: Repl.Reply =
+                    safely
+                     (repl.react(request.seq, code, chunk => push(outputReply(request.seq, chunk).json.show)))
+                    . or(Repl.Reply.Failed(request.seq, t"the submission could not be processed"))
 
-                promise.attend(Sessions.graceMillis)
+                  push(asyncReply(request.seq, reply).json.show)
 
-                promise().let(resultReply(request.seq, _)).or:
-                  async:
-                    promise.attend()
-                    promise().let { reply => push(asyncReply(request.seq, reply).json.show) }
-
-                  WebReply(t"pending", request.seq, t"", t"", t"", t"", Nil)
+                t""
 
         case t"complete" =>
           if request.code.starts(t"/session ") then
@@ -828,15 +848,15 @@ def serveHttp(port: Int, quit: Promise[Unit])(using Monitor, System, Probate, Cl
             val items = sessions.names.filter(_.starts(partial)).map: name =>
               WebCompletion(t"/session $name", t"command", t"")
 
-            WebReply(t"completions", request.seq, t"", t"", t"", t"", Nil, items)
+            WebReply(t"completions", request.seq, t"", t"", t"", t"", Nil, items).json.show
           else
             val completions = session.lay(Nil)(_.completionsAt(request.code, request.offset))
-            WebReply(t"completions", request.seq, t"", t"", t"", t"", Nil, webCompletions(completions))
+            WebReply(t"completions", request.seq, t"", t"", t"", t"", Nil, webCompletions(completions)).json.show
 
         case t"ping" =>
           // The client's keep-alive heartbeat; the reply is ignored, but answering keeps
           // both directions active so the connection never crosses the idle timeout.
-          WebReply(t"pong", request.seq, t"", t"", t"", t"", Nil)
+          WebReply(t"pong", request.seq, t"", t"", t"", t"", Nil).json.show
 
         case t"hello" =>
           // Sent on every (re)connect; the instance token lets the client tell a resumed connection
@@ -845,11 +865,12 @@ def serveHttp(port: Int, quit: Promise[Unit])(using Monitor, System, Probate, Cl
           WebReply
            ( t"hello", request.seq, instance, t"", Repl.messages.session(current.get.nn), t"", Nil,
              name = current.get.nn )
+          . json.show
 
         case _ =>
-          WebReply(t"error", request.seq, t"", t"", t"", t"flame: unknown request", Nil)
+          WebReply(t"error", request.seq, t"", t"", t"", t"flame: unknown request", Nil).json.show
 
-    . lay(t"")(_.json.show)
+    . or(t"")
 
   val service = SocketServer(port).handle:
     request.target match
@@ -870,7 +891,10 @@ def serveHttp(port: Int, quit: Promise[Unit])(using Monitor, System, Probate, Cl
 
               message match
                 case perihelion.Message.Text(payload) =>
-                  Reply(perihelion.Message.Text(respondJson(current, push, payload)), ())
+                  // `t""` means `respondJson` already pushed everything itself (an async submit) — send
+                  // nothing more.
+                  val reply: Text = respondJson(current, push, payload)
+                  if reply == t"" then Continue(()) else Reply(perihelion.Message.Text(reply), ())
 
                 case perihelion.Message.Binary(_) => Continue(())
 

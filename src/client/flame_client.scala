@@ -69,6 +69,23 @@ val Listen = Subcommand("listen", "serve the terminal REPL over TCP, for remote 
 val Port = Flag[Int]("port", false, List('p'), "a TCP port — the web front-end, or a remote REPL server")
 val Host = Flag[Text]("host", false, List('H'), "connect to a flame REPL server running on this host")
 val Session = Flag[Text]("session", false, List('s'), "join an existing REPL session by name")
+val SetOpt = Flag[List[Text]]("set", true, Nil, "compiler settings to enable on startup (space-separated)")
+val LanguageOpt = Flag[List[Text]]("language", true, Nil, "language features to enable on startup (space-separated)")
+
+// Reads a repeatable settings flag, offering the `/set`/`/language` feature names of `kind` as
+// tab-completions for its value. The `Interpretable`/`Discoverable` givens are scoped to this read so
+// the two flags' different suggestion lists don't clash.
+private def settingValues(flag: Flag of List[Text], kind: Repl.Kind)(using Cli, Interpreter): List[Text] =
+  given (List[Text]) is Interpretable = _.map(_())
+  given (List[Text]) is Discoverable =
+    _ => Repl.settings.filter(_.kind == kind).map { setting => Suggestion(setting.name) }
+  flag().or(Nil)
+
+// The `/set`/`/language` commands to run on startup, from `--set`/`--language` (compiler settings
+// applied first, so `--set experimental` unlocks any experimental `--language` features).
+private def initialSettings(using Cli, Interpreter): List[Text] =
+  settingValues(SetOpt, Repl.Kind.Set).map { name => t"/set $name" }
+  ::: settingValues(LanguageOpt, Repl.Kind.Language).map { name => t"/language $name" }
 
 // The default TCP port for `flame listen` (a remote-reachable REPL server) and for `flame --host`
 // when no `--port` is given. Arbitrary, but stable so the two ends agree without configuration.
@@ -121,28 +138,32 @@ def repl(): Unit = externalize:
         execute(keyTest(kitty = false))
 
       // `flame` — the terminal REPL (connects to, or starts, a background socket server). Bare `flame`
-      // starts a new session; `flame -s NAME` / `flame --session=NAME` joins an existing one (the
-      // `Session()` flag read handles both forms). The flag tokens are matched explicitly rather than
-      // reading `Session()` in the catch-all, so reading it never suppresses the subcommand suggestions
-      // (`serve`/`install`) offered when completing the bare `flame` first word.
+      // starts a new session.
       case Nil =>
-        execute(connectSocket(Session()))
+        execute(connectSocket(Session(), Nil))
 
-      case Argument(head) :: _ if head == t"-s" || head.starts(t"--session") =>
-        execute(connectSocket(Session()))
+      // `flame -<flag>…` — the terminal REPL with options: `-s NAME` joins a session, `--host HOST`
+      // (with optional `--port`) connects to a remote server (`flame listen`), and `--set`/`--language`
+      // enable settings on startup. This case fires only when the first token is a FLAG (`head` begins
+      // with `-`), so it reads the flags there rather than in the catch-all — a flag read in a
+      // completion-visible catch-all would suppress the subcommand suggestions for the bare first word,
+      // whereas here the subcommands are already ruled out (the word starts with `-`), and their
+      // completions (`--set`/`--language` values etc.) are exactly what should be offered.
+      case Argument(head) :: _ if head.starts(t"-") =>
+        val settings: List[Text] = initialSettings
 
-      // `flame --host HOST [--port N] [-s NAME]` — connect the terminal REPL to a flame server on
-      // another host over TCP (as started by `flame listen`), rather than the local UNIX-socket
-      // server. As with `-s`, the flag tokens are matched explicitly so reading the flags never
-      // suppresses the subcommand suggestions offered when completing the bare `flame` first word.
-      case Argument(head) :: _ if head == t"-H" || head.starts(t"--host") =>
-        val port: Int =
-          recover:
-            case NumberError(_, _, _) => defaultPort
-          . protect:
-              Port().or(defaultPort)
+        Host() match
+          case host: Text =>
+            val port: Int =
+              recover:
+                case NumberError(_, _, _) => defaultPort
+              . protect:
+                  Port().or(defaultPort)
 
-        execute(connectRemote(Host(), port, Session()))
+            execute(connectRemote(host, port, Session(), settings))
+
+          case _ =>
+            execute(connectSocket(Session(), settings))
 
       case _ =>
         execute(Exit.Fail(1))
@@ -437,7 +458,7 @@ private def socketPaths(directory: Text): List[Text] =
 // Connects to a per-process UNIX domain socket. With no server running, launches one
 // in the background and attaches to it (so `flame` alone is a self-contained REPL,
 // reconnectable later); with exactly one, connects to it; with several, lists them.
-private def connectSocket(join: Optional[Text])
+private def connectSocket(join: Optional[Text], initial: List[Text])
     (using Stdio, Monitor, Probate, Console, Environment, System)
 :   Exit =
   // Probe every socket file: a connectable one is live; one that refuses (a crashed or
@@ -457,10 +478,10 @@ private def connectSocket(join: Optional[Text])
   live.to(List) match
     case Nil =>
       Out.println(t"flame: starting a REPL server…")
-      launchServer()(converse(join)(_)).or(failedToLaunch)
+      launchServer()(converse(join, initial)(_)).or(failedToLaunch)
 
     case path :: Nil =>
-      connectDomain(DomainSocket(path))(converse(join)(_)).or(unreachableSocket(path))
+      connectDomain(DomainSocket(path))(converse(join, initial)(_)).or(unreachableSocket(path))
 
     case paths =>
       Out.println(t"flame: several REPL servers are running:")
@@ -476,7 +497,7 @@ private def connectSocket(join: Optional[Text])
 // with `-s`/`--session`. The transport differs from `connectSocket` (a TCP endpoint rather than a
 // local UNIX domain socket), but the conversation — the `converse`/`runRepl` loop — is identical, so
 // a remote session behaves exactly like a local one.
-private def connectRemote(host: Optional[Text], portNumber: Int, join: Optional[Text])
+private def connectRemote(host: Optional[Text], portNumber: Int, join: Optional[Text], initial: List[Text])
     (using Stdio, Monitor, Probate, Console, Environment, System)
 :   Exit =
   host.lay(missingHost): hostText =>
@@ -485,11 +506,11 @@ private def connectRemote(host: Optional[Text], portNumber: Int, join: Optional[
         case HostnameError(_, _) => invalidHost(hostText)
       . protect:
           val endpoint: Endpoint[TcpPort] = hostText.decode[Hostname] via port
-          connect(endpoint)(converse(join)(_)).or(unreachableRemote(hostText, portNumber))
+          connect(endpoint)(converse(join, initial)(_)).or(unreachableRemote(hostText, portNumber))
 
 // The read/edit/print loop. The server's reply is printed verbatim. Ctrl+C/Ctrl+D
 // dismiss the line editor (`DismissError`) and end the session.
-private def converse(join: Optional[Text])(duplex: Duplex)
+private def converse(join: Optional[Text], initial: List[Text])(duplex: Duplex)
     (using Stdio, Monitor, Probate, Console, Environment)
 :   Exit =
   // The kitty keyboard protocol (applied by `interactive`) makes the terminal report
@@ -509,7 +530,7 @@ private def converse(join: Optional[Text])(duplex: Duplex)
 
   . protect:
       interactive: terminal ?=>
-        runRepl(duplex, state, pending, nextId, submits, completions, join)
+        runRepl(duplex, state, pending, nextId, submits, completions, join, initial)
         Exit.Ok
 
 // One REPL input line is an inline block at the bottom of the console — a bordered,
@@ -526,7 +547,8 @@ private def runRepl
     nextId:      juc.atomic.AtomicInteger,
     submits:     juc.LinkedBlockingQueue[Repl.Reply],
     completions: juc.LinkedBlockingQueue[List[Repl.CompletionItem]],
-    join:        Optional[Text] )
+    join:        Optional[Text],
+    initial:     List[Text] )
   ( using terminal: Terminal, monitor: Monitor )
 :   Unit =
 
@@ -566,7 +588,15 @@ private def runRepl
   val asyncPending: TrieMap[Int, Unit]            = TrieMap()
   val asyncEntries: TrieMap[Int, TranscriptEntry] = TrieMap()
   val asyncResults: TrieMap[Int, Text]            = TrieMap()
+  // Stdout streamed (async mode) for an in-flight submission, accumulated as `Output` chunks arrive so
+  // it shows live under the "evaluating" panel; only the (single) reader appends, so `Text` is safe.
+  val asyncOutput:  TrieMap[Int, Text]            = TrieMap()
   @volatile var asyncReplay: Boolean              = false
+
+  // The live display for a still-running async submission: its stdout streamed so far, then a faint
+  // "evaluating" line. Replaced by the full result once the final reply arrives.
+  def evaluating(id: Int): Text =
+    t"${asyncOutput.getOrElse(id, t"")}\e[2m⋯ evaluating…\e[22m\n"
 
   // What Enter does depends on how much has been typed:
   //  - a SINGLE line submits as soon as it is a COMPLETE (not incomplete-prefix) statement or
@@ -626,11 +656,23 @@ private def runRepl
           asyncPending(id) = ()
           submits.put(reply)
 
+        // A streamed chunk of an async run's stdout: accumulate it and, if the transcript entry is
+        // recorded, refresh its live display and replay so the output appears as it is produced. (If
+        // the entry isn't recorded yet, the submit loop applies the accumulated output when it files it.)
+        case Repl.Reply.Output(id, chunk) =>
+          asyncOutput(id) = asyncOutput.getOrElse(id, t"") + chunk
+
+          asyncEntries.get(id).foreach: entry =>
+            entry.result = evaluating(id)
+            asyncReplay = true
+            terminal.events.put(TerminalInfo.Redraw)
+
         // An out-of-band fill for an async submission (id previously seen via `Pending`): update the
         // matching transcript entry — or stash the text if the entry isn't recorded yet — and replay.
         case reply if asyncPending.contains(replyId(reply)) =>
           val id = replyId(reply)
           asyncPending.remove(id)
+          asyncOutput.remove(id)
           val text = replyText(reply)
 
           asyncEntries.remove(id) match
@@ -653,6 +695,13 @@ private def runRepl
     if joinName != t"" && reply.name != joinName
     then Out.println(Repl.messages.joinFailed(joinName, reply.name))
     else Out.println(Repl.messages.session(reply.name))
+
+  // Apply the startup settings from `--set`/`--language` by submitting each as a command to the
+  // session, printing its confirmation (`flame: X enabled`) below the banner. Synchronous — async mode
+  // is off at startup — so each reply lands on `submits` in order.
+  initial.each: command =>
+    duplex.send(Stream(framed(encode(Repl.Request.Submit(nextId.getAndIncrement, command)))))
+    safely(submits.take().nn).let { reply => Out.print(replyText(reply)) }
 
   val events = terminal.eventIterator()
   var running = true
@@ -888,13 +937,17 @@ private def runRepl
 
           case event if editor.submitsOn(event) =>
             // A multi-line entry submitted by leaving a blank line at the end drops that blank line,
-            // so the frozen box, the transcript and what is sent to the server all render tight. When
-            // it strips something, re-highlight and repaint so `finish` freezes the tight box.
+            // so the frozen box, the transcript and what is sent to the server all render tight. TRIM
+            // the existing (correctly highlighted) `tokens` to the stripped length rather than
+            // re-highlighting via `refresh()` — stripping a whole line is not a single-char edit, so the
+            // live-highlight heuristic would fall back to one un-coloured token and the frozen box would
+            // lose its syntax colours. Then repaint so `finish` freezes the tight, still-coloured box.
             val tight: Text = stripTrailingBlank(editor.value)
             if tight != editor.value then
               editor = LineEditor(tight, tight.length, editor.mode)
               candidates = Nil
-              refresh()
+              tokens = trimTokens(tokens, tight.length)
+              lastValue = tight
               frame()
 
             submitted = tight
@@ -988,9 +1041,10 @@ private def runRepl
           submits.take().nn match
             case Repl.Reply.Pending(_) =>
               // Async mode: the result isn't ready. Record the id so the transcript entry is filed for
-              // the reader to fill, and show a faint "evaluating" panel meanwhile.
+              // the reader to stream stdout into and finally fill; show its live panel (any output
+              // already streamed, then a faint "evaluating" line) meanwhile.
               asyncId = sid
-              t"\e[2m⋯ evaluating…\e[22m\n"
+              evaluating(sid)
 
             case reply =>
               replyText(reply)
@@ -1009,12 +1063,19 @@ private def runRepl
         asyncId.let: sid =>
           asyncResults.remove(sid) match
             case Some(text) =>
+              // The final reply already arrived — apply it; no need to register for streaming.
               entry.result = text
               asyncReplay = true
               terminal.events.put(TerminalInfo.Redraw)
 
             case None =>
+              // Register so the reader can stream stdout into this entry and finally fill it; apply any
+              // output that streamed in before this point.
               asyncEntries(sid) = entry
+              if asyncOutput.contains(sid) then
+                entry.result = evaluating(sid)
+                asyncReplay = true
+                terminal.events.put(TerminalInfo.Redraw)
 
   // The loop has exited (Ctrl+D/C, Escape, /quit, or a closed stream): stop the reader.
   live = false
@@ -1133,6 +1194,7 @@ private def replyText(reply: Repl.Reply): Text = reply match
   case Repl.Reply.Completed(_, _)                  => t""
   case Repl.Reply.Session(_, _, _)                 => t""
   case Repl.Reply.Pending(_)                       => t""
+  case Repl.Reply.Output(_, _)                     => t""
 
 // The request id every reply echoes — used to correlate an out-of-band async fill with the submission
 // (its `Pending` placeholder) it completes. (The enum's cases share the field but not an accessor.)
@@ -1146,6 +1208,7 @@ private def replyId(reply: Repl.Reply): Int = reply match
   case Repl.Reply.Failed(id, _)               => id
   case Repl.Reply.Session(id, _, _)           => id
   case Repl.Reply.Pending(id)                 => id
+  case Repl.Reply.Output(id, _)               => id
 
 // The completion candidates as a compact, HEADER-LESS list — one Teletype line each: a kind glyph,
 // the name, then the type signature (subdued, truncated to fit). The kind (replacing the old `kind`
@@ -1180,11 +1243,13 @@ private def completionTable(items: List[Repl.CompletionItem], width: Int): List[
 
     e"${colour}($glyph) ${colour}($padded) ${palette.scalaComment}($sig)"
 
-// A `/`-command line whose ARGUMENT is completed as ordinary Scala by the server (which strips the
-// command prefix), rather than locally against the command list — the editor's token-based insertion
-// keeps the command prefix intact. Currently `/tasty <expr>` and `/bytecode <code>`.
+// A `/`-command line whose ARGUMENT the SERVER completes (as opposed to the client completing the
+// command name locally against `slashCommands`): `/tasty`/`/bytecode` complete their argument as
+// ordinary Scala; `/language` completes its argument against the session's available features (which
+// depend on whether `experimental` is on, so only the server knows them). All three insert at the
+// identifier boundary, keeping the command prefix — hence the shared treatment here and in the ghost.
 private def completesAsScala(value: Text): Boolean =
-  value.starts(t"/tasty ") || value.starts(t"/bytecode ")
+  value.starts(t"/tasty ") || value.starts(t"/bytecode ") || value.starts(t"/language ")
 
 // On Tab, complete: a `/`-command line completes locally against `slashCommands`;
 // otherwise the server is asked and we block for the reply. A unique candidate is
@@ -1275,17 +1340,17 @@ private given palette: ScalaSyntaxPalette = new Palette:
   def margin:           Color in Srgb = hex(0x111111)  // editor.gutter.background
 
 // Maps a Harlequin accent name (as carried on the wire) back to its `Accent`.
-private def accentOf(accent: Text): Accent =
-  if accent == t"keyword"       then Accent.Keyword
-  else if accent == t"modifier" then Accent.Modifier
-  else if accent == t"typal"    then Accent.Typal
-  else if accent == t"string"   then Accent.String
-  else if accent == t"number"   then Accent.Number
-  else if accent == t"symbol"   then Accent.Symbol
-  else if accent == t"parens"   then Accent.Parens
-  else if accent == t"error"    then Accent.Error
-  else if accent == t"unparsed" then Accent.Unparsed
-  else Accent.Term
+private def accentOf(accent: Text): Accent = accent match
+  case t"keyword"  => Accent.Keyword
+  case t"modifier" => Accent.Modifier
+  case t"typal"    => Accent.Typal
+  case t"string"   => Accent.String
+  case t"number"   => Accent.Number
+  case t"symbol"   => Accent.Symbol
+  case t"parens"   => Accent.Parens
+  case t"error"    => Accent.Error
+  case t"unparsed" => Accent.Unparsed
+  case _           => Accent.Term
 
 // Reconstructs the source line from the highlight tokens, colouring each through the palette via
 // Harlequin's syntax-highlighting renderer — and italicising a NEWLY-INTRODUCED identifier. The
@@ -1498,7 +1563,6 @@ private def insertCompletion(editor: LineEditor, name: Text): LineEditor =
 
   LineEditor(t"$prefix$name$suffix", start + name.length, editor.mode)
 
-// The offset at which the identifier ending at the cursor begins.
 private def identifierStart(editor: LineEditor): Int =
   val before: String = editor.value.keep(editor.position).s
   var start:  Int    = before.length
@@ -1507,13 +1571,10 @@ private def identifierStart(editor: LineEditor): Int =
 
   start
 
-// The length of the partial identifier the user has typed up to the cursor.
 private def partialLength(editor: LineEditor): Int = editor.position - identifierStart(editor)
 
-private def isIdentifierChar(char: Char): Boolean =
-  jl.Character.isLetterOrDigit(char) || char == '_'
+private def isIdentifierChar(char: Char): Boolean = char.isLetterOrDigit || char == '_'
 
-// The longest prefix shared by every name (empty if there are none).
 private def longestCommonPrefix(names: List[Text]): Text = names match
   case Nil => t""
 
@@ -1521,44 +1582,45 @@ private def longestCommonPrefix(names: List[Text]): Text = names match
     tail.foldLeft(head): (prefix, name) =>
       prefix.keep(commonPrefix(prefix, name))
 
-// Whether the editor content is "complete" enough to submit on Enter: non-empty
-// with every bracket closed. Open brackets continue the input onto a new line.
-// Whether `text`'s last line — the text after its final newline — is blank. This is the "leave a
-// blank line at the end" trigger that submits a multi-line entry.
 // The leading run of spaces/tabs of `line` — the indentation copied onto an auto-indented new line.
 private def leadingWhitespace(line: Text): Text =
-  var i = 0
-  while i < line.s.length && { val c = line.s.charAt(i); c == ' ' || c == '\t' } do i += 1
-  line.keep(i)
+  line.s.takeWhile { char => char == ' ' || char == '\t' }.nn.tt
 
+// Whether `text`'s last line — the text after its final newline — is blank. This is the "leave a
+// blank line at the end" trigger that submits a multi-line entry.
 private def blankLastLine(text: Text): Boolean =
-  val string:  String = text.s
-  val newline: Int    = string.lastIndexOf('\n')
-  newline >= 0 && string.substring(newline + 1).nn.trim.nn.isEmpty
+  text.contains(t"\n") && text.cut(t"\n").last.trim == t""
 
 // Drops a single trailing blank line (the final newline and any whitespace-only last line), so a
 // multi-line entry submitted by leaving a blank line renders tight everywhere it is shown or stored.
 // Text with no trailing blank line is returned unchanged.
 private def stripTrailingBlank(text: Text): Text =
-  val string:  String = text.s
-  val newline: Int    = string.lastIndexOf('\n')
-  if newline >= 0 && string.substring(newline + 1).nn.trim.nn.isEmpty then string.substring(0, newline).nn.tt
-  else text
+  if blankLastLine(text) then text.keep(text.s.lastIndexOf('\n')) else text
 
+// Keeps the first `length` characters' worth of `tokens`, preserving each kept token's accent/role so
+// the highlighting survives — used to drop the stripped trailing blank line from a multi-line
+// submission's highlight without re-tokenizing (which would lose the colours). The token straddling the
+// cut is truncated to its kept prefix; tokens past the cut are dropped.
+private def trimTokens(tokens: List[Repl.Token], length: Int): List[Repl.Token] =
+  var remaining = length
+  tokens.flatMap: token =>
+    if remaining <= 0 then Nil
+    else if token.text.length <= remaining then
+      remaining -= token.text.length
+      List(token)
+    else
+      val kept = token.text.keep(remaining)
+      remaining = 0
+      List(token.copy(text = kept))
+
+// Non-empty with every bracket closed; open brackets continue the input onto a new line.
 private def balanced(text: Text): Boolean =
-  val string: String = text.s
-  var depth:  Int    = 0
-  var index:  Int    = 0
+  val depth: Int = text.s.foldLeft(0):
+    case (depth, '(' | '[' | '{') => depth + 1
+    case (depth, ')' | ']' | '}') => depth - 1
+    case (depth, _)               => depth
 
-  while index < string.length do
-    string.charAt(index) match
-      case '(' | '[' | '{' => depth += 1
-      case ')' | ']' | '}' => depth -= 1
-      case _               => ()
-
-    index += 1
-
-  string.length > 0 && depth <= 0
+  text.s.length > 0 && depth <= 0
 
 // A local, cheap heuristic for whether a SINGLE line reads as a complete statement/expression —
 // used to decide Enter's behaviour before (or instead of) the server's authoritative parser verdict
@@ -1576,7 +1638,7 @@ private def endsWithContinuation(text: Text): Boolean =
   if trimmed.isEmpty then true else
     val last:     Char    = trimmed.charAt(trimmed.length - 1)
     val operator: Boolean = "+-*/%<>=&|^.:,@".indexOf(last.toInt) >= 0
-    val lastWord: Text    = trimmed.split("\\s+").nn.last.nn.tt
+    val lastWord: Text    = trimmed.drop(trimmed.lastIndexWhere(_.isWhitespace) + 1).nn.tt
     operator || continuationKeywords.contains(lastWord)
 
 private def singleLineComplete(text: Text): Boolean =
@@ -1590,19 +1652,12 @@ private def encode(request: Repl.Request): Data = unsafely(request.bintel)
 // Prefixes BinTEL body bytes with a 4-byte big-endian length, the on-wire frame the
 // server reads with `DataInputStream.readInt` + `readFully`.
 private def framed(data: Data): Data =
-  val length: Int      = data.length
-  val out:    Array[Byte] = new Array[Byte](4 + length)
-  out(0) = (length >>> 24).toByte
-  out(1) = (length >>> 16).toByte
-  out(2) = (length >>> 8).toByte
-  out(3) = length.toByte
-  var i = 0
+  val length: Int = data.length
 
-  while i < length do
-    out(4 + i) = data(i)
-    i += 1
+  val header: Data =
+    IArray[Byte]((length >>> 24).toByte, (length >>> 16).toByte, (length >>> 8).toByte, length.toByte)
 
-  out.immutable(using Unsafe)
+  header ++ data
 
 // Reassembles length-prefixed frames from the (chunk-at-a-time) socket stream, keeping
 // a buffer across calls so a frame split over chunks — or several frames in one chunk —

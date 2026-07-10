@@ -9,7 +9,7 @@ import scalalib.*
 
 object settings:
   val scalaVersion = "3.8.4"
-  val soundnessVersion = "0.62.0"
+  val soundnessVersion = "0.63.0"
 
   val scalaOptions = Seq(
     "-experimental",

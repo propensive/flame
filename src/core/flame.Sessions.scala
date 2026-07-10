@@ -21,8 +21,6 @@ import java.io as ji
 import java.net as jn
 import java.nio.channels as jnc
 
-import scala.collection.concurrent.TrieMap
-
 import ambience.*
 import anthology.*
 import anticipation.*
@@ -40,7 +38,6 @@ import turbulence.*
 import urticose.*
 import vacuous.*
 
-import anticipation.abstractables.durationAbstractable
 import classloaders.threadContextClassloader
 import hieroglyph.charDecoders.utf8Decoder
 import hieroglyph.textSanitizers.skipSanitizer
@@ -51,12 +48,6 @@ import hieroglyph.textSanitizers.skipSanitizer
 // wraps the per-session engine (`Repl`); the socket protocol (`serve`/`converse`/`respond`) used to
 // live on `Repl` itself, back when there was exactly one shared session.
 object Sessions:
-  // In async mode (`/set async`), how long the server waits for a submission's result before falling
-  // back to a `Pending` placeholder (the real reply then follows out-of-band). Short enough that a
-  // slow computation's placeholder appears promptly, long enough that a quick result skips the
-  // placeholder entirely. Milliseconds.
-  val graceMillis: Long = 250L
-
   // The animal names sessions are drawn from — read from Nomenclature's classpath resource, with a
   // small hard-coded fallback should the resource be unreadable.
   private val fallback: List[Text] =
@@ -74,18 +65,18 @@ class Sessions[version <: Scalac.Versions]
   ( render: Repl.Rendering = Repl.Rendering.Inspect )
   ( using scalac: Scalac[version], classloader: Classloader, temporary: TemporaryDirectory ):
 
-  private val registry: TrieMap[Text, Repl[version]] = TrieMap()
-  private val lock:     Mutex                        = Mutex()
-  private val quit:     Promise[Unit]                = Promise()
+  private var registry: Map[Text, Repl[version]] = Map()
+  private val lock:     Mutex                    = Mutex()
+  private val quit:     Promise[Unit]            = Promise()
 
   // Fulfilled when a connected client sends a `Quit` request; the server host `attend`s it to block
   // until then and shut down cleanly.
   def awaitQuit(): Unit = quit.attend()
 
   // Every session's name, sorted — for the startup display and `/session` tab-completion.
-  def names: List[Text] = registry.keys.to(List).sorted
+  def names: List[Text] = lock(registry.keys.to(List).sorted)
 
-  def session(name: Text): Optional[Repl[version]] = registry.get(name).getOrElse(Unset)
+  def session(name: Text): Optional[Repl[version]] = lock(registry.get(name).optional)
 
   // Registers a fresh session under a random animal name not already in use (falling back to a
   // numbered suffix in the astronomically-unlikely event every animal is taken), and returns the name.
@@ -100,7 +91,7 @@ class Sessions[version <: Scalac.Versions]
           while registry.contains(t"$base$n") do n += 1
           t"$base$n"
 
-      registry(name) = Repl.make[version](Repl.Prelude.empty, render)
+      registry = registry.updated(name, Repl.make[version](Repl.Prelude.empty, render))
       name
 
   // Serializes a `Reply` to BinTEL body bytes; a valid reply always type-assigns, so this is total.
@@ -188,24 +179,20 @@ class Sessions[version <: Scalac.Versions]
           session(currentName).lay(encode(Repl.Reply.Failed(id, t"no active session"))): repl =>
             if !repl.asyncEnabled then encode(repl.react(id, code))
             else
-              // Async mode: run the submission on a worker. If it finishes within the grace window,
-              // reply with the full result inline (no placeholder); otherwise acknowledge with a
-              // `Pending` now and push the real reply out-of-band via `send` once the run completes.
-              val promise: Promise[Repl.Reply] = Promise()
+              // Async mode: acknowledge with `Pending` IMMEDIATELY (sent directly, so it is written
+              // before any streamed output), then run on a worker — streaming the run's stdout as
+              // `Output` chunks as it appears — and push the final reply when it completes. `respond`
+              // returns `Unset` because it has already sent everything itself.
+              send(encode(Repl.Reply.Pending(id)))
 
               async:
-                promise.offer:
-                  safely(repl.react(id, code)).or
+                val reply: Repl.Reply =
+                  safely(repl.react(id, code, chunk => send(encode(Repl.Reply.Output(id, chunk))))).or
                    (Repl.Reply.Failed(id, t"the submission could not be processed"))
 
-              promise.attend(Sessions.graceMillis)
+                send(encode(reply))
 
-              promise().let(encode(_)).or:
-                async:
-                  promise.attend()
-                  promise().let { reply => send(encode(reply)) }
-
-                encode(Repl.Reply.Pending(id))
+              Unset
 
         case Repl.Request.Complete(id, code, offset) =>
           session(currentName).lay(encode(Repl.Reply.Completed(id, Nil))): repl =>
@@ -214,7 +201,7 @@ class Sessions[version <: Scalac.Versions]
         case Repl.Request.Session(id, name) =>
           // Empty name only reports; a known name switches. Always reply `Session` with the (possibly
           // unchanged) current session — the client detects a failed switch by the name not matching.
-          if name != t"" && session(name).let(_ => true).or(false) then current = name
+          if name != t"" && session(name).present then current = name
           encode(Repl.Reply.Session(id, currentName, names))
 
         case Repl.Request.Quit(_) =>
