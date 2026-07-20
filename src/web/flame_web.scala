@@ -774,7 +774,7 @@ private def outputReply(seq: Int, chunk: Text): WebReply =
 // Blocks until `quit` is fulfilled (the CLI completes it on Ctrl+C; the standalone `web`
 // main passes one that is never fulfilled and relies on the JVM's own signal handling).
 def serveHttp(port: Int, quit: Promise[Unit])(using Monitor, System, Probate, Classloader): Unit =
-  given Scalac[3.8] = Scalac(Nil)
+  given Scalac[3.8, Universe.Classfile] = Scalac(Nil)
 
   // Multiple named sessions — each browser connection auto-starts a fresh randomly-named session and
   // may `/session`-switch to any other. Result values render as HTML (via `flame.HtmlRender`'s
@@ -802,7 +802,7 @@ def serveHttp(port: Int, quit: Promise[Unit])(using Monitor, System, Probate, Cl
           WebReply
            ( t"tokens", request.seq, t"", t"", t"", t"", webTokens(Repl.tokenize(request.code)), Nil,
              Repl.incomplete(request.code) )
-          . json.show
+          . in[Json].show
 
         case t"submit" =>
           val code = request.code
@@ -815,30 +815,30 @@ def serveHttp(port: Int, quit: Promise[Unit])(using Monitor, System, Probate, Cl
                 Repl.messages.switched(name)
               else Repl.messages.noSession(name)
 
-            WebReply(t"result", request.seq, t"", t"", message, t"", Nil).json.show
+            WebReply(t"result", request.seq, t"", t"", message, t"", Nil).in[Json].show
 
           // An unrecognised `/`-command gets the same message as the CLI, rather than being compiled
           // as Scala (`Repl.isCommand` and the message text are shared with the CLI, via core).
           else if code.starts(t"/") && !Repl.isCommand(code) then
-            WebReply(t"result", request.seq, t"", t"", Repl.messages.unknownCommand(code), t"", Nil).json.show
+            WebReply(t"result", request.seq, t"", t"", Repl.messages.unknownCommand(code), t"", Nil).in[Json].show
           else
             session.lay
-             (WebReply(t"error", request.seq, t"", t"", t"", t"flame: no active session", Nil).json.show): repl =>
-              if !repl.asyncEnabled then resultReply(request.seq, repl.react(request.seq, code)).json.show
+             (WebReply(t"error", request.seq, t"", t"", t"", t"flame: no active session", Nil).in[Json].show): repl =>
+              if !repl.asyncEnabled then resultReply(request.seq, repl.react(request.seq, code)).in[Json].show
               else
                 // Async mode: acknowledge with `pending` IMMEDIATELY (pushed directly, so it is sent
                 // before any streamed output), then run on a worker — streaming stdout as `output`
                 // messages as it appears — and push the final result (tagged `async`) when done.
                 // Returns `t""` so the handler sends nothing more itself.
-                push(WebReply(t"pending", request.seq, t"", t"", t"", t"", Nil).json.show)
+                push(WebReply(t"pending", request.seq, t"", t"", t"", t"", Nil).in[Json].show)
 
                 async:
                   val reply: Repl.Reply =
                     safely
-                     (repl.react(request.seq, code, chunk => push(outputReply(request.seq, chunk).json.show)))
+                     (repl.react(request.seq, code, chunk => push(outputReply(request.seq, chunk).in[Json].show)))
                     . or(Repl.Reply.Failed(request.seq, t"the submission could not be processed"))
 
-                  push(asyncReply(request.seq, reply).json.show)
+                  push(asyncReply(request.seq, reply).in[Json].show)
 
                 t""
 
@@ -848,15 +848,15 @@ def serveHttp(port: Int, quit: Promise[Unit])(using Monitor, System, Probate, Cl
             val items = sessions.names.filter(_.starts(partial)).map: name =>
               WebCompletion(t"/session $name", t"command", t"")
 
-            WebReply(t"completions", request.seq, t"", t"", t"", t"", Nil, items).json.show
+            WebReply(t"completions", request.seq, t"", t"", t"", t"", Nil, items).in[Json].show
           else
             val completions = session.lay(Nil)(_.completionsAt(request.code, request.offset))
-            WebReply(t"completions", request.seq, t"", t"", t"", t"", Nil, webCompletions(completions)).json.show
+            WebReply(t"completions", request.seq, t"", t"", t"", t"", Nil, webCompletions(completions)).in[Json].show
 
         case t"ping" =>
           // The client's keep-alive heartbeat; the reply is ignored, but answering keeps
           // both directions active so the connection never crosses the idle timeout.
-          WebReply(t"pong", request.seq, t"", t"", t"", t"", Nil).json.show
+          WebReply(t"pong", request.seq, t"", t"", t"", t"", Nil).in[Json].show
 
         case t"hello" =>
           // Sent on every (re)connect; the instance token lets the client tell a resumed connection
@@ -865,30 +865,47 @@ def serveHttp(port: Int, quit: Promise[Unit])(using Monitor, System, Probate, Cl
           WebReply
            ( t"hello", request.seq, instance, t"", Repl.messages.session(current.get.nn), t"", Nil,
              name = current.get.nn )
-          . json.show
+          . in[Json].show
 
         case _ =>
-          WebReply(t"error", request.seq, t"", t"", t"", t"flame: unknown request", Nil).json.show
+          WebReply(t"error", request.seq, t"", t"", t"", t"flame: unknown request", Nil).in[Json].show
 
     . or(t"")
 
   val service = SocketServer(port).handle:
     request.target match
       case t"/" | t"/index.html" =>
-        Http.Response(ReplPage())
+        // Serve the page as an EAGERLY-rendered `text/html` body (`Html.show` is synchronous) rather
+        // than via the Archetype's synthesised `Servable`, whose body is a lazy async text-stream
+        // producer (`document.source[Text]`, capturing a Monitor) that deadlocks under soundness's
+        // native HTTP/2 server (#1626) — the response headers never even start. The page is small, so
+        // a fixed body (with a known length) is strictly better here anyway.
+        val page: Text = t"<!DOCTYPE html>${ReplPage().html.show}"
+        Http.Ok
+         ( List(Http.Header(t"content-type", t"text/html; charset=utf-8")),
+           Http.Body.Fixed(page.in[Data]) )
 
       case t"/socket" =>
         // Per-connection: a fresh session, switchable with `/session`.
         val current: juca.AtomicReference[Text] = juca.AtomicReference(sessions.create())
 
         Http.Response:
-          // Bind the socket to a `lazy val` so the handler can reach `ws.channel` (only dereferenced
-          // when a message arrives, by which point `ws` is initialised) to push async results out-of-
-          // band. `push` sends one Text frame — wire-identical to a normal reply.
-          lazy val ws: perihelion.Websocket[perihelion.Message, Unit] =
-            webSocket(): (message: perihelion.Message) =>
-              def push(text: Text): Unit = ws.channel.send(perihelion.Message.Text(text))
+          // The handler pushes async results out-of-band through the connection's channel, which
+          // is only known once the `Websocket` is constructed — so it is delivered through this
+          // holder, set immediately below, before any message can arrive. (A `lazy val ws`
+          // self-reference expressed the same thing before capture checking, which now rejects a
+          // handler capturing the value it constructs.) `push` sends one Text frame —
+          // wire-identical to a normal reply.
+          val channelHolder: juca.AtomicReference[perihelion.Channel | Null] =
+            juca.AtomicReference()
 
+          def push(text: Text): Unit =
+            Optional(channelHolder.get).let(_.send(perihelion.Message.Text(text)))
+
+          // The handler is vouched pure (Soundness's codec-thunk seal idiom): it captures only
+          // this connection's locals, which live exactly as long as the Websocket itself.
+          val handler: perihelion.Message -> Control[Unit] =
+            caps.unsafe.unsafeAssumePure: (message: perihelion.Message) =>
               message match
                 case perihelion.Message.Text(payload) =>
                   // `t""` means `respondJson` already pushed everything itself (an async submit) — send
@@ -898,7 +915,30 @@ def serveHttp(port: Int, quit: Promise[Unit])(using Monitor, System, Probate, Cl
 
                 case perihelion.Message.Binary(_) => Continue(())
 
-          ws
+          // Declared with a PURE inner arrow so the adaptation to `Websocket`'s handler
+          // parameter mints no fresh capture on the result (which could not flow into the
+          // parameter's own root). The `Websocket` is constructed directly rather than through
+          // the `webSocket` wrapper: forwarding the wrapper's own (impure-arrowed) `handle`
+          // parameter to the constructor re-mints exactly that fresh capture, so the inline
+          // wrapper cannot currently be called with any handler under capture checking. The
+          // identity `decode` is what the wrapper generates for a raw `Message` handler.
+          val handle: (state: Unit) ?=> perihelion.Message -> Control[Unit] = handler
+
+          // `summon[Http.Request]` resolves to the ambient `HttpConnection`, which carries the
+          // connection's `request`/`respond` capabilities; the `Websocket` constructor wants a pure
+          // `Http.Request` (it reads only the handshake headers and body). Seal it — the connection
+          // outlives the websocket it upgrades to — so the capture does not block construction.
+          val request: Http.Request = caps.unsafe.unsafeAssumePure(summon[Http.Request])
+
+          val ws =
+            perihelion.Websocket(request, (), (message: perihelion.Message) => message, handle)
+
+          channelHolder.set(ws.channel)
+
+          // The websocket captures this connection's handler and the ambient Monitor, both of
+          // which outlive it; the cast discards the tracked captures so it can serve as the
+          // (pure-typed) response body.
+          ws.asInstanceOf[perihelion.Websocket[perihelion.Message, Unit]]
 
       case _ =>
         Http.Response(Http.NotFound)(t"not found")

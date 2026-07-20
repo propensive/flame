@@ -8,7 +8,20 @@ import mill.*
 import scalalib.*
 
 object settings:
-  val scalaVersion = "3.8.4"
+  // The locally-built Scala compiler from the propensive/scala fork — the same toolchain
+  // Soundness itself builds with since capture checking was enabled throughout (#1498).
+  // Soundness's TASTy is produced by this compiler, so flame must compile with it too.
+  // `SOUNDNESS_SCALA_VERSION`/`SOUNDNESS_SCALA_HOME` switch toolchains together, exactly as
+  // in the Soundness build.
+  val scalaVersion = sys.env.getOrElse("SOUNDNESS_SCALA_VERSION", "3.9.0-RC1-propensive")
+  // The propensive/proscala release the toolchain jars are downloaded from (unless a local
+  // `SOUNDNESS_SCALA_HOME` is set), exactly as in the Soundness build. `3.9.0-RC1-p3` ships jars
+  // built as the `scalaVersion` coordinate `3.9.0-RC1-propensive`.
+  val scalaRelease = sys.env.getOrElse("SOUNDNESS_SCALA_RELEASE", "3.9.0-RC1-p3")
+  // Empty by default → download `scalaRelease`. Set to a local `make`-built `release` directory
+  // to use its `release/lib` jars directly (fork-developer mode).
+  val scalaHome = sys.env.getOrElse("SOUNDNESS_SCALA_HOME", "")
+
   val soundnessVersion = "0.63.0"
 
   val scalaOptions = Seq(
@@ -33,7 +46,11 @@ object settings:
     "-language:experimental.saferExceptions",
     "-language:experimental.strictEqualityPatternMatching",
     "-language:experimental.subCases",
-    "-language:experimental.multiSpreads"
+    "-language:experimental.multiSpreads",
+    // Capture checking, as enabled throughout Soundness (its `settings.cc`): the language
+    // flag is equivalent to a per-file `import language.experimental.captureChecking`.
+    "-Ycc-new",
+    "-language:experimental.captureChecking"
   )
 
   // Flame's sources are written for the proscenium predef (the soundness house
@@ -80,10 +97,141 @@ object settings:
     mvn"dev.soundness:perihelion-core:$soundnessVersion",
     mvn"dev.soundness:graffiti-core:$soundnessVersion")
 
+// Exposes the fork compiler's `release/lib` jars (from a local build via `settings.scalaHome`, or
+// downloaded from the `settings.scalaRelease` GitHub release) as a Maven-layout repository,
+// generated on demand into the task's own dest: the unversioned jars are copied to versioned
+// coordinates with minimal POMs. Ported (JVM artifacts only) from the Soundness build, whose
+// published TASTy this toolchain produced.
+object toolchain extends Module:
+  // Downloads and extracts the `settings.scalaRelease` tarball from propensive/proscala into a
+  // *shared* cache dir outside the Mill `out/` tree — the same cache the Soundness build uses, so
+  // a release fetched by either build is reused by the other. Each release is a single
+  // `proscala-<tag>.tar.gz` asset carrying a `lib/` directory of jars, extracted here into
+  // `<tag>/lib`. A `.complete` sentinel makes a fully-populated cache a no-op — no network, no
+  // GitHub API call. Returns the `lib` dir.
+  def downloadRelease(tag: String): os.Path =
+    val root = os.home / ".cache" / "soundness" / "proscala" / tag
+    val lib = root / "lib"
+    val sentinel = lib / ".complete"
+    if os.exists(sentinel) then lib else
+      os.makeDir.all(root)
+      val api = s"https://api.github.com/repos/propensive/proscala/releases/tags/$tag"
+      val json = ujson.read(os.proc("curl", "-fsSL", api).call().out.text())
+      val asset = json("assets").arr.find(_("name").str.endsWith(".tar.gz")).getOrElse:
+        throw new Exception(s"no .tar.gz asset on proscala release $tag")
+      val name = asset("name").str
+      val url = asset("browser_download_url").str
+      val tarball = root / name
+      if !os.exists(tarball) then
+        os.proc("curl", "-fsSL", "-o", tarball.toString, url).call()
+      // Verify against the published digest when the API supplies one ("sha256:<hex>").
+      asset.obj.get("digest").flatMap(_.strOpt).foreach: digest =>
+        if digest.startsWith("sha256:") then
+          val md = java.security.MessageDigest.getInstance("SHA-256")
+          val hex = md.digest(os.read.bytes(tarball)).map("%02x".format(_)).mkString
+          if hex != digest.stripPrefix("sha256:") then
+            os.remove(tarball)
+            throw new Exception(s"checksum mismatch for $name (expected $digest, got sha256:$hex)")
+      // The tarball carries a `lib/` prefix, so extracting into `<tag>` lands the jars at
+      // `<tag>/lib/*.jar`. Clear any partial extract first (we only get here without the sentinel).
+      os.remove.all(lib)
+      os.proc("tar", "-xzf", tarball.toString, "-C", root.toString).call()
+      os.remove(tarball) // reclaim ~43 MB; the sentinel guards against re-fetching
+      os.write(sentinel, "")
+      lib
+
+  // Content-fingerprints the fork's jars so a rebuilt or re-released compiler regenerates the
+  // repository. `SOUNDNESS_SCALA_HOME` (if set) points at a local `release`; otherwise the
+  // `settings.scalaRelease` assets are downloaded and cached.
+  def distribution: T[PathRef] = Task.Input:
+    if settings.scalaHome.nonEmpty then PathRef(os.Path(settings.scalaHome) / "lib")
+    else PathRef(downloadRelease(settings.scalaRelease))
+
+  def repo: T[PathRef] = Task:
+    val lib = distribution().path
+    val v = settings.scalaVersion
+    val sl = "org.scala-lang"
+
+    // (group, artifactId, jar filename in release/lib, dependencies as (group, id, version))
+    val artifacts = Seq(
+      (sl, "scala-library", "scala-library.jar", Seq()),
+      (sl, "scala3-library_3", "scala3-library.jar", Seq((sl, "scala-library", v))),
+      (sl, "scala3-interfaces", "scala3-interfaces.jar", Seq()),
+      (sl, "tasty-core_3", "tasty-core.jar", Seq((sl, "scala-library", v))),
+      (sl, "scala3-compiler_3", "scala3-compiler.jar", Seq(
+        (sl, "scala3-interfaces", v),
+        (sl, "tasty-core_3", v),
+        (sl, "scala3-library_3", v),
+        ("org.scala-lang.modules", "scala-asm", "9.9.0-scala-1"),
+        ("org.scala-sbt", "compiler-interface", "1.12.0"),
+        ("org.scala-sbt", "util-interface", "1.11.5"))),
+      (sl, "scala3-repl_3", "scala3-repl.jar", Seq(
+        (sl, "scala3-compiler_3", v),
+        ("org.jline", "jline-reader", "4.0.14"),
+        ("org.jline", "jline-terminal", "4.0.14"),
+        ("org.jline", "jline-terminal-jni", "4.0.14"),
+        ("io.get-coursier", "interface", "1.0.29-M4"),
+        ("org.virtuslab", "using_directives", "1.1.4"),
+        ("com.lihaoyi", "pprint_3", "0.9.3"))),
+      (sl, "scala3-sbt-bridge", "scala3-sbt-bridge.jar", Seq(
+        (sl, "scala3-compiler_3", v),
+        (sl, "scala3-repl_3", v))),
+      (sl, "scala3-staging_3", "scala3-staging.jar", Seq((sl, "scala3-compiler_3", v))),
+      (sl, "scala3-tasty-inspector_3", "scala3-tasty-inspector.jar", Seq(
+        (sl, "scala3-compiler_3", v))))
+
+    artifacts.map: (group, id, jar, dependencies) =>
+      val dir = Task.dest / os.SubPath(group.replace('.', '/')) / id / v
+      os.makeDir.all(dir)
+      os.copy(lib / jar, dir / s"$id-$v.jar", replaceExisting = true)
+
+      val deps = dependencies.map: (dGroup, dId, dVersion) =>
+        s"<dependency><groupId>$dGroup</groupId><artifactId>$dId</artifactId>" +
+          s"<version>$dVersion</version></dependency>"
+      . mkString
+
+      os.write.over(dir / s"$id-$v.pom",
+        s"""<?xml version="1.0" encoding="UTF-8"?>
+           |<project xmlns="http://maven.apache.org/POM/4.0.0">
+           |  <modelVersion>4.0.0</modelVersion>
+           |  <groupId>$group</groupId>
+           |  <artifactId>$id</artifactId>
+           |  <version>$v</version>
+           |  <dependencies>$deps</dependencies>
+           |</project>
+           |""".stripMargin)
+
+    PathRef(Task.dest)
+
+// Routes a Scala module through the fork toolchain: the repository view above for all coursier
+// resolutions, plus direct (content-hashed) paths for the two hot artifacts — the compiler
+// classpath and the compiled sbt bridge — so a rebuilt compiler is picked up without any
+// version-string ceremony.
+trait Toolchain extends ScalaModule:
+  override def repositories: T[Seq[String]] = Task:
+    super.repositories() :+ s"file://${toolchain.repo().path}"
+
+  override def scalaCompilerClasspath: T[Seq[PathRef]] = Task:
+    // The fork-built jars come from the repository view because Zinc locates the standard
+    // library within this classpath BY FILENAME (`scala-library-<version>*.jar`), and the
+    // distribution's own filenames are unversioned. The compiler's own third-party runtime
+    // dependencies (scala-asm for bytecode, the sbt compiler/util interfaces for the bridge) are
+    // not shipped in the release, so they are resolved from the ordinary repositories.
+    val versioned = os.walk(toolchain.repo().path).filter(_.ext == "jar").map(PathRef(_))
+    val thirdParty = defaultResolver().classpath(Seq(
+      mvn"org.scala-lang.modules:scala-asm:9.9.0-scala-1",
+      mvn"org.scala-sbt:compiler-interface:1.12.0",
+      mvn"org.scala-sbt:util-interface:1.11.5"))
+
+    versioned ++ thirdParty
+
+  override def scalaCompilerBridge: T[Option[PathRef]] = Task:
+    Some(PathRef(toolchain.distribution().path / "scala3-sbt-bridge.jar"))
+
 trait Project extends Module:
   def moduleDir = super.moduleDir / os.up / "src"
 
-trait Component(dependencies: ScalaModule*) extends ScalaModule:
+trait Component(dependencies: ScalaModule*) extends Toolchain:
   override def scalaVersion = settings.scalaVersion
   override def scalacOptions = settings.scalaOptions ++ settings.predef
   def moduleId: String = moduleDir.last

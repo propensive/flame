@@ -48,6 +48,12 @@ import hieroglyph.textSanitizers.skipSanitizer
 // wraps the per-session engine (`Repl`); the socket protocol (`serve`/`converse`/`respond`) used to
 // live on `Repl` itself, back when there was exactly one shared session.
 object Sessions:
+  // Vouches that `value`'s tracked captures do not outlive their scope, discarding its capture
+  // set (Soundness's codec-thunk seal idiom, rep/DECISIONS.md). The explicitly
+  // capture-polymorphic parameter (`value^`) stops a pure expected type propagating into the
+  // type argument, which would instead demand purity of the argument itself.
+  private def vouchPure[value](value: value^): value = caps.unsafe.unsafeAssumePure(value)
+
   // The animal names sessions are drawn from — read from Nomenclature's classpath resource, with a
   // small hard-coded fallback should the resource be unreadable.
   private val fallback: List[Text] =
@@ -63,7 +69,8 @@ object Sessions:
 
 class Sessions[version <: Scalac.Versions]
   ( render: Repl.Rendering = Repl.Rendering.Inspect )
-  ( using scalac: Scalac[version], classloader: Classloader, temporary: TemporaryDirectory ):
+  ( using scalac: Scalac[version, Universe.Classfile], classloader: Classloader,
+    temporary: TemporaryDirectory ):
 
   private var registry: Map[Text, Repl[version]] = Map()
   private val lock:     Mutex                    = Mutex()
@@ -71,7 +78,7 @@ class Sessions[version <: Scalac.Versions]
 
   // Fulfilled when a connected client sends a `Quit` request; the server host `attend`s it to block
   // until then and shut down cleanly.
-  def awaitQuit(): Unit = quit.attend()
+  def awaitQuit()(using Monitor): Unit = quit.attend()
 
   // Every session's name, sorted — for the startup display and `/session` tab-completion.
   def names: List[Text] = lock(registry.keys.to(List).sorted)
@@ -98,18 +105,48 @@ class Sessions[version <: Scalac.Versions]
   private def encode(reply: Repl.Reply): Data = unsafely(reply.bintel)
 
   // Starts a TCP server on `port`; each connection is an interactive session over its own current
-  // session. Returns a handle whose `stop()` shuts the server down.
+  // session. Returns a handle whose `stop()` shuts the server down. Coaxial's `listen` is now a
+  // scoped loan (`listen(lambda)(block)`) that closes the service when its block returns, and it
+  // hands the lambda a kernel-stream `Duplex` rather than a stream-bearing `Connection` — neither
+  // fits this "bind now, return a stoppable handle, block elsewhere on `awaitQuit`" shape. So the
+  // TCP path binds a raw `ServerSocket` directly (exactly as the domain-socket path below binds a
+  // raw NIO channel), keeping the byte-framed protocol wire-identical to the coaxial client.
   def serve(port: Port over Tcp)(using Monitor, System, Probate)
-  :   SocketService logs CompileEvent raises BindError raises StreamError =
+  :   SocketService logs CompileEvent raises BindError =
+    val server: jn.ServerSocket =
+      try jn.ServerSocket(port.number)
+      catch case _: ji.IOException => abort(BindError(BindError.Reason.PortInUse))
 
-    port.listen: socket =>
-      converse(socket.getInputStream.nn, socket.getOutputStream.nn)
-      Data()
+    @volatile var listening: Boolean = true
+
+    val task = async:
+      while listening do
+        safely:
+          val client: jn.Socket = server.accept().nn
+
+          // Fire-and-forget: the fresh task handle is discarded (and the block yields `()`), so the
+          // connection's `client` capability is confined to this per-accept task and never leaks
+          // into the enclosing accept loop's capture set.
+          async:
+            try converse(client.getInputStream.nn, client.getOutputStream.nn)
+            finally safely(client.close())
+
+          ()
+
+    // Vouched pure: the stop closure captures the accept task, whose capabilities outlive the
+    // service (the caller `stop()`s it inside the same `supervise` scope).
+    Sessions.vouchPure:
+      SocketService: () =>
+        listening = false
+        safely(server.close())
+        safely(task.await())
+        ()
 
   // Serves over a UNIX domain socket at `socketPath`. Coaxial's domain-socket `Connection` does not
   // expose its streams for the bidirectional, asynchronously-written protocol this needs, so the
   // accept loop runs directly over an NIO channel.
-  def serve(socketPath: Text)(using Monitor, System, Probate): SocketService logs CompileEvent =
+  def serve(socketPath: Text)(using Monitor, System, Probate)
+  :   SocketService logs CompileEvent =
     val address: jn.UnixDomainSocketAddress = jn.UnixDomainSocketAddress.of(socketPath.s).nn
 
     val channel: jnc.ServerSocketChannel =
@@ -127,14 +164,20 @@ class Sessions[version <: Scalac.Versions]
           val input  = jnc.Channels.newInputStream(client).nn
           val output = jnc.Channels.newOutputStream(client).nn
 
+          // Fire-and-forget (as above): discard the task handle so `client` stays confined.
           async:
             try converse(input, output) finally safely(client.close())
 
-    new SocketService:
-      def stop(): Unit =
+          ()
+
+    // Vouched pure: the stop closure captures the accept task, whose capabilities outlive the
+    // service (the caller `stop()`s it inside the same `supervise` scope).
+    Sessions.vouchPure:
+      SocketService: () =>
         listening = false
         safely(channel.close())
         safely(task.await())
+        ()
 
   private def converse(input: ji.InputStream, output: ji.OutputStream)
     ( using Monitor, System, Probate )
@@ -169,7 +212,7 @@ class Sessions[version <: Scalac.Versions]
     // `submit`/`complete` run on `current`'s `Repl`; `session` switches/reports sessions; `quit`
     // stops the whole server (all sessions). `Unset` means no reply is sent.
     def respond(message: Data): Optional[Data] =
-      safely[Exception](Bintel.read[Repl.Request](message)).lay
+      safely(Bintel.read[Repl.Request](message)).lay
        (encode(Repl.Reply.Failed(0, t"the request could not be parsed"))):
 
         case Repl.Request.Tokenize(id, code) =>

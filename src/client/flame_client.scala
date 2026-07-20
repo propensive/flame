@@ -45,10 +45,14 @@ import soundness.*
 import escapade.Faint
 import escapade.Italic
 import iridescence.WebColors
+// `soundness.*` also re-exports an unrelated `Signal` (embarcadero's workload-grant signal), so the
+// POSIX terminal `Signal` (whose `.Int` is SIGINT) is named explicitly to resolve the clash.
+import profanity.Signal
 
 import backstops.silentBackstop
 import classloaders.threadContextClassloader
 import executives.completions
+import filesystemBackends.virtualMachine
 import filesystemOptions.createNonexistentParents.enabled
 import filesystemOptions.deleteRecursively.disabled
 import filesystemOptions.overwritePreexisting.disabled
@@ -58,6 +62,7 @@ import internetAccess.online
 import interpreters.posixInterpreter
 import logging.silentLogging
 import probates.cancelProbate
+import socketBackends.virtualMachine
 import supervisors.globalSupervisor
 import systems.javaSystem
 import temporaryDirectories.systemTemporaryDirectory
@@ -71,6 +76,32 @@ val Host = Flag[Text]("host", false, List('H'), "connect to a flame REPL server 
 val Session = Flag[Text]("session", false, List('s'), "join an existing REPL session by name")
 val SetOpt = Flag[List[Text]]("set", true, Nil, "compiler settings to enable on startup (space-separated)")
 val LanguageOpt = Flag[List[Text]]("language", true, Nil, "language features to enable on startup (space-separated)")
+
+// Exoskeleton's derived `Int is Interpretable` decodes through a `Decodable[Int]` that captures its
+// `Tactic[NumberError]`; under capture checking that impure instance cannot satisfy `Flag.apply`'s
+// pure `Interpretable` requirement. This local, pure interpreter parses the argument with `safely`,
+// yielding `Unset` for an absent or non-numeric value — so a `Port().or(default)` read falls back
+// exactly as the old `recover`/`protect` on `NumberError` did, without a tracked capability.
+given (Int is Interpretable) = new Interpretable:
+  type Self = Int
+  def interpret(arguments: List[Argument]): Optional[Int] =
+    arguments.prim.lay(Unset): value =>
+      safely(value().as[Int])
+
+// `execute` runs its block with an ambient `Invocation`/`DaemonService` whose derived capabilities
+// (`Stdio`, `Console`, `Environment`) are tracked; flame's command bodies take them as pure `using`
+// parameters. Seal all three once here — they outlive the command they drive — so every command body
+// type-checks under capture checking without a per-site cast. The capabilities are threaded through
+// `body`'s context-function type so they resolve to the sealed givens below (not the capturing ones
+// at the call site). Replaces a bare `execute(body)` at each dispatch arm.
+private inline def command
+   (inline body: (erased Effectful) ?=> (Stdio, Console, Environment) ?=> Exit)(using Cli)
+:   Execution =
+  execute:
+    given Stdio = caps.unsafe.unsafeAssumePure(summon[Invocation].stdio)
+    given Console = caps.unsafe.unsafeAssumePure(summon[Console])
+    given Environment = caps.unsafe.unsafeAssumePure(summon[Invocation].environment)
+    body
 
 // Reads a repeatable settings flag, offering the `/set`/`/language` feature names of `kind` as
 // tab-completions for its value. The `Interpretable`/`Discoverable` givens are scoped to this read so
@@ -95,52 +126,32 @@ val defaultPort: Int = 4319
 def repl(): Unit = externalize:
   cli:
     arguments match
-      // `flame serve [--port N | -p N]` — the web front-end (default port 8080). `WebPort()`
-      // registers the flag (so it is offered in tab-completion) and reads its value; decoding the
-      // `Int` needs a `Tactic[NumberError]`, so `recover` supplies one and falls back to 8080 for
-      // an absent or non-numeric value.
+      // `flame serve [--port N | -p N]` — the web front-end (default port 8080). `Port()` registers
+      // the flag (so it is offered in tab-completion) and reads its value; the pure `Int`
+      // interpreter above yields `Unset` for an absent or non-numeric value, so `.or(8080)` falls back.
       case Serve() :: _ =>
-        val port: Int =
-          recover:
-            case NumberError(_, _, _) => 8080
-          . protect:
-              Port().or(8080)
-
-        execute(httpServe(port))
+        command(httpServe(Port().or(8080)))
 
       // `flame install` — install this command's tab-completions into the user's shell.
       case Install() :: _ =>
-        execute(installCompletions())
+        command(installCompletions())
 
       // `flame listen [--port N | -p N]` — a REPL server bound to a TCP port (not a per-process UNIX
       // socket), so a `flame --host` client on another machine can reach its sessions. Defaults to
       // `defaultPort`; a non-numeric `--port` also falls back to it.
       case Listen() :: _ =>
-        val port: Int =
-          recover:
-            case NumberError(_, _, _) => defaultPort
-          . protect:
-              Port().or(defaultPort)
-
-        execute(serve(port))
+        command(serve(Port().or(defaultPort)))
 
       // Internal: the per-process UNIX-socket REPL server that `connectSocket`/`launchServer`
       // spawns in the background (see `launchServer`). Not a user-facing command — `serve` now
       // serves the web front-end — so it uses a distinct argument the launcher passes itself.
       case Argument("serve-socket") :: Nil =>
-        execute(serveSocket())
-
-      // TEMPORARY keyboard-diagnostic mode: print each keypress instead of editing.
-      case Argument("keys") :: Argument("kitty") :: Nil =>
-        execute(keyTest(kitty = true))
-
-      case Argument("keys") :: Nil =>
-        execute(keyTest(kitty = false))
+        command(serveSocket())
 
       // `flame` — the terminal REPL (connects to, or starts, a background socket server). Bare `flame`
       // starts a new session.
       case Nil =>
-        execute(connectSocket(Session(), Nil))
+        command(connectSocket(Session(), Nil))
 
       // `flame -<flag>…` — the terminal REPL with options: `-s NAME` joins a session, `--host HOST`
       // (with optional `--port`) connects to a remote server (`flame listen`), and `--set`/`--language`
@@ -154,23 +165,17 @@ def repl(): Unit = externalize:
 
         Host() match
           case host: Text =>
-            val port: Int =
-              recover:
-                case NumberError(_, _, _) => defaultPort
-              . protect:
-                  Port().or(defaultPort)
-
-            execute(connectRemote(host, port, Session(), settings))
+            command(connectRemote(host, Port().or(defaultPort), Session(), settings))
 
           case _ =>
-            execute(connectSocket(Session(), settings))
+            command(connectSocket(Session(), settings))
 
       case _ =>
-        execute(Exit.Fail(1))
+        command(Exit.Fail(1))
 
 // Runs a REPL server on the given TCP port and blocks until interrupted.
 private def serve(portNumber: Int)(using Stdio, Monitor, Probate, System): Exit =
-  given Scalac[3.8] = Scalac(Nil)
+  given Scalac[3.8, Universe.Classfile] = Scalac(Nil)
   given Classloader = serverClassloader
 
   safely(urticose.Port[Tcp](portNumber)).lay(invalidPort(portNumber)): port =>
@@ -237,7 +242,9 @@ private def installCompletions()(using stdio: Stdio, service: DaemonService[?])(
   import errorDiagnostics.stackTracesDiagnostics
   import workingDirectories.javaWorkingDirectory
 
-  given Entrypoint = service
+  // The `DaemonService` (which extends `Entrypoint`) carries the daemon's tracked capabilities; seal
+  // it to the pure `Entrypoint` the completions installer wants — it outlives this one call.
+  given Entrypoint = caps.unsafe.unsafeAssumePure(service)
 
   recover:
     case error: InstallError =>
@@ -261,7 +268,7 @@ private def socketFile: Text = t"$socketDirectory/${ProcessHandle.current.nn.pid
 // Runs a REPL server on a per-process UNIX domain socket (used when no port is
 // given) and blocks until quit, unlinking the socket file on the way out.
 private def serveSocket()(using Stdio, Monitor, Probate, System): Exit =
-  given Scalac[3.8] = Scalac(Nil)
+  given Scalac[3.8, Universe.Classfile] = Scalac(Nil)
   given Classloader = serverClassloader
 
   val socketPath: Text = socketFile
@@ -272,7 +279,7 @@ private def serveSocket()(using Stdio, Monitor, Probate, System): Exit =
     recover:
       case _: PathError | _: IoError => ()
     . protect:
-      socketPath.decode[Path on Linux].wipe()
+      socketPath.as[Path on Linux].wipe()
       ()
 
   jl.Runtime.getRuntime.nn.addShutdownHook(jl.Thread(removeSocket))
@@ -285,9 +292,9 @@ private def serveSocket()(using Stdio, Monitor, Probate, System): Exit =
     recover:
       case _: PathError | _: IoError => ()
     . protect:
-      val directory = socketDirectory.decode[Path on Linux]
+      val directory = socketDirectory.as[Path on Linux]
       if !directory.exists() then directory.create[Directory]()
-      socketPath.decode[Path on Linux].wipe()
+      socketPath.as[Path on Linux].wipe()
 
     val sessions = Sessions()
     val service  = sessions.serve(socketPath)
@@ -298,7 +305,7 @@ private def serveSocket()(using Stdio, Monitor, Probate, System): Exit =
     recover:
       case _: PathError | _: IoError => ()
     . protect:
-      socketPath.decode[Path on Linux].wipe()
+      socketPath.as[Path on Linux].wipe()
 
     Exit.Ok
   catch case error: Throwable =>
@@ -334,8 +341,11 @@ private def serverClassloader(using System): Classloader =
       val tmpDir: Path on Linux = temporaryDirectory/Uuid()
       tmpDir.create[Directory]()
       val link: Path on Linux = unsafely(tmpDir/t"flame.jar")
-      executable.decode[Path on Linux].symlinkTo(link)
-      val url: jn.URL = link.javaFile.toURI.nn.toURL.nn
+      executable.as[Path on Linux].symlinkTo(link)
+      // `.javaFile`/`.javaPath` are re-exported into `soundness` from both galilei-core and
+      // galilei-jvm (an orphan-given clash), so the extension search is ambiguous; build the
+      // `java.io.File` from the path's encoded text instead.
+      val url: jn.URL = ji.File(link.encode.s).toURI.nn.toURL.nn
 
       val executablePath: Text = ji.File(executable.s).getCanonicalPath.nn.tt
       val bootstrapUrls: List[jn.URL] = threadContextClassloader.java match
@@ -365,8 +375,13 @@ private def unreachableRemote(host: Text, portNumber: Int)(using Stdio): Exit =
   Exit.Fail(3)
 
 // Runs `body` over a fresh TCP connection to `endpoint` — always closing it afterwards —
-// or returns `Unset` if the connection is refused.
+// or returns `Unset` if the connection is refused. `Connectable.tcpEndpoint` is honestly tracked
+// (`^{online, caps.any}`), and its `caps.any` cannot flow into the fresh capture variable the
+// `duplex` loan introduces. The loan confines the connection to `body`, so a pure connectable is
+// sound here: seal it for this call. (The domain-socket connectable carries no `caps.any`, so
+// `connectDomain` needs no such seal.)
 private def connect[result](endpoint: Endpoint[TcpPort])(body: Duplex => result): Optional[result] =
+  given (Endpoint[TcpPort] is Connectable) = caps.unsafe.unsafeAssumePure(Connectable.tcpEndpoint)
   try endpoint.duplex(body) catch case _: ji.IOException => Unset
 
 // As `connect`, but over a UNIX domain socket.
@@ -453,7 +468,7 @@ private def socketPaths(directory: Text): List[Text] =
   recover:
     case _: PathError => Nil
   . protect:
-    directory.decode[Path on Linux].children.map(_.encode).filter(_.ends(t".sock")).to(List)
+    directory.as[Path on Linux].children.map(_.encode).filter(_.ends(t".sock")).to(List)
 
 // Connects to a per-process UNIX domain socket. With no server running, launches one
 // in the background and attaches to it (so `flame` alone is a self-contained REPL,
@@ -472,7 +487,7 @@ private def connectSocket(join: Optional[Text], initial: List[Text])
       recover:
         case _: PathError | _: IoError => ()
       . protect:
-        path.decode[Path on Linux].wipe()
+        path.as[Path on Linux].wipe()
     else live += path
 
   live.to(List) match
@@ -505,7 +520,7 @@ private def connectRemote(host: Optional[Text], portNumber: Int, join: Optional[
       recover:
         case HostnameError(_, _) => invalidHost(hostText)
       . protect:
-          val endpoint: Endpoint[TcpPort] = hostText.decode[Hostname] via port
+          val endpoint: Endpoint[TcpPort] = hostText.as[Hostname] via port
           connect(endpoint)(converse(join, initial)(_)).or(unreachableRemote(hostText, portNumber))
 
 // The read/edit/print loop. The server's reply is printed verbatim. Ctrl+C/Ctrl+D
@@ -554,10 +569,11 @@ private def runRepl
 
   given Stdio = terminal.stdio
 
-  // `duplex.stream` blocks on its first socket read, so force the iterator lazily —
+  // `duplex.source` blocks on its first socket read, so force the iterator lazily —
   // only once a request has been sent — otherwise it would deadlock before the editor
-  // even starts (the server sends nothing until it receives a message).
-  lazy val chunks: Iterator[Data] = duplex.stream.iterator
+  // even starts (the server sends nothing until it receives a message). `toLazyList` is
+  // zephyrine's legacy view of the kernel read stream: one materialized chunk per refill.
+  lazy val chunks: Iterator[Data] = duplex.source.toLazyList.iterator
   @volatile var live = true
 
   // Replies to session queries/switches (the server only sends a `Session` reply in answer to a
@@ -627,15 +643,15 @@ private def runRepl
   // awaits, or the `completions` the Tab handler blocks on.
   async:
     // Construct the reader here, not on the main thread: forcing `chunks`
-    // (`duplex.stream.iterator`) blocks until the first byte arrives, and the main
+    // (`duplex.source.toLazyList.iterator`) blocks until the first byte arrives, and the main
     // thread must stay free to render the editor and drive the event loop.
-    val frames: FrameReader = FrameReader(chunks)
+    val frames: FrameReader = new FrameReader(chunks)
 
     while live do
       val data: Optional[Data] = frames.next()
 
       if data.absent then live = false
-      else safely[Exception](Bintel.read[Repl.Reply](data.vouch)).let:
+      else safely(Bintel.read[Repl.Reply](data.vouch)).let:
         case Repl.Reply.Tokenized(id, highlight, incomplete) =>
           pending.remove(id).foreach(state.reconcile(_, highlight))
           incompletePending.remove(id).foreach { value => incompleteFor = (value, incomplete) }
@@ -689,7 +705,7 @@ private def runRepl
   // let the server assign a fresh animal name. Show the resulting session, noting when a requested
   // name was not found (the server then started a new one instead).
   val joinName: Text = join.or(t"")
-  duplex.send(Stream(framed(encode(Repl.Request.Session(nextId.getAndIncrement, joinName)))))
+  duplex.send(zephyrine.Stream(framed(encode(Repl.Request.Session(nextId.getAndIncrement, joinName)))))
 
   safely(sessionReplies.take().nn).let: reply =>
     if joinName != t"" && reply.name != joinName
@@ -700,7 +716,7 @@ private def runRepl
   // session, printing its confirmation (`flame: X enabled`) below the banner. Synchronous — async mode
   // is off at startup — so each reply lands on `submits` in order.
   initial.each: command =>
-    duplex.send(Stream(framed(encode(Repl.Request.Submit(nextId.getAndIncrement, command)))))
+    duplex.send(zephyrine.Stream(framed(encode(Repl.Request.Submit(nextId.getAndIncrement, command)))))
     safely(submits.take().nn).let { reply => Out.print(replyText(reply)) }
 
   val events = terminal.eventIterator()
@@ -777,14 +793,14 @@ private def runRepl
         val id = nextId.getAndIncrement
         pending(id) = version
         incompletePending(id) = editor.value
-        duplex.send(Stream(framed(encode(Repl.Request.Tokenize(id, editor.value)))))
+        duplex.send(zephyrine.Stream(framed(encode(Repl.Request.Tokenize(id, editor.value)))))
 
         // Ask for the inline suggestion too, but only with the cursor at the end of the
         // line (where the ghost is shown).
         if editor.position == editor.value.length then
           val gid = nextId.getAndIncrement
           ghostPending(gid) = editor.value
-          duplex.send(Stream(framed(encode(Repl.Request.Complete(gid, editor.value, editor.position)))))
+          duplex.send(zephyrine.Stream(framed(encode(Repl.Request.Complete(gid, editor.value, editor.position)))))
 
     // The inline suggestion for the current line: the remainder of a unique completion, or
     // the common stem of several (then "..."), shown only with the cursor at the line's end
@@ -874,7 +890,7 @@ private def runRepl
 
           // `/session <name>` completes against the server's live session list (queried fresh here).
           case Keypress.Tab if editor.value.starts(t"/session ") =>
-            duplex.send(Stream(framed(encode(Repl.Request.Session(nextId.getAndIncrement, t"")))))
+            duplex.send(zephyrine.Stream(framed(encode(Repl.Request.Session(nextId.getAndIncrement, t"")))))
             val names:   List[Text] = safely(sessionReplies.take().nn).lay(Nil)(_.names)
             val partial: Text       = editor.value.skip(t"/session ".length)
             val matches: List[Text] = names.filter(_.starts(partial)).map { name => t"/session $name" }
@@ -1011,7 +1027,7 @@ private def runRepl
           running = false
           t""
         else if line == t"/quit" then
-          duplex.send(Stream(framed(encode(Repl.Request.Quit(0)))))
+          duplex.send(zephyrine.Stream(framed(encode(Repl.Request.Quit(0)))))
           running = false
           t""
         else if line == t"/clear" then
@@ -1025,7 +1041,7 @@ private def runRepl
           // Switch this connection to another session (server-side, per connection) — or, with no
           // argument, report the current session and the ones available.
           val name = line.skip(t"/session".length).trim
-          duplex.send(Stream(framed(encode(Repl.Request.Session(nextId.getAndIncrement, name)))))
+          duplex.send(zephyrine.Stream(framed(encode(Repl.Request.Session(nextId.getAndIncrement, name)))))
           safely(sessionReplies.take().nn).lay(t"flame: no response from the server\n"): reply =>
             if name == t"" then t"${Repl.messages.sessionList(reply.name, reply.names)}\n"
             else if reply.name == name then t"${Repl.messages.switched(reply.name)}\n"
@@ -1037,7 +1053,7 @@ private def runRepl
           // (submits are serialized — we block on the first reply before the next line — so first-reply
           // FIFO holds; only the async fills, routed by id, are concurrent).
           val sid = nextId.getAndIncrement
-          duplex.send(Stream(framed(encode(Repl.Request.Submit(sid, line)))))
+          duplex.send(zephyrine.Stream(framed(encode(Repl.Request.Submit(sid, line)))))
           submits.take().nn match
             case Repl.Reply.Pending(_) =>
               // Async mode: the result isn't ready. Record the id so the transcript entry is filed for
@@ -1283,7 +1299,7 @@ private def completeAt
         (advanced, items)
   else
     val request = encode(Repl.Request.Complete(0, editor.value, editor.position))
-    duplex.send(Stream(framed(request)))
+    duplex.send(zephyrine.Stream(framed(request)))
 
     val candidates: List[Repl.CompletionItem] = completions.take().nn
 

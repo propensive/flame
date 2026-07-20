@@ -56,7 +56,7 @@ import hellenism.*
 object ReplMacro:
   def bound[version <: Scalac.Versions: Type]
     ( body:        Expr[Unit],
-      scalac:      Expr[Scalac[version]],
+      scalac:      Expr[Scalac[version, Universe.Classfile]],
       classloader: Expr[Classloader],
       temporary:   Expr[TemporaryDirectory] )
     ( using Quotes )
@@ -230,13 +230,17 @@ object ReplMacro:
         $ {
             // Wraps a `Object => Unit` assignment as a Java `Consumer`; `accept`'s
             // parameter is typed `Object | Null` so the override matches under
-            // explicit-nulls (and collapses to `Object` without it).
+            // explicit-nulls (and collapses to `Object` without it). The assignment lambda is
+            // spliced DIRECTLY into `accept` (not bound to an intermediate `val` first): the
+            // lambda itself captures nothing capture-checking tracks — a host `var` is plain
+            // state, not a capability — but a `val` of the impure function type `Object => Unit`
+            // would be tracked, and the anonymous class capturing it could not then serve as the
+            // (pure) `Consumer` the Java-side `ReplBridge` registry expects.
             def consumer(assign: Expr[Object => Unit]): Expr[ju.function.Consumer[Object]] =
               ' {
-                  val function = $assign
-
                   new ju.function.Consumer[Object]:
-                    def accept(value: Object | Null): Unit = function(value.asInstanceOf[Object])
+                    def accept(value: Object | Null): Unit =
+                      $assign(value.asInstanceOf[Object])
                 }
 
             // Each binding's value is registered live, keyed by session and name.
@@ -273,7 +277,8 @@ object ReplMacro:
                 List(put, putSetter)
               else
                 // A block-local `var`: REPL-local mutable storage shared by the
-                // supplier and the consumer.
+                // supplier and the consumer. The assignment lambda is built inline (not bound
+                // to a `val` of the tracked function type) for the same reason as in `consumer`.
                 val cellPut: Expr[Unit] =
                   ' {
                       val cell: Array[Object] = new Array[Object](1)
@@ -283,9 +288,10 @@ object ReplMacro:
                         new ju.function.Supplier[Object]:
                           def get(): Object = cell(0)
 
-                      val assign: Object => Unit = cell(0) = _
                       ReplBridge.putSupplier(repl.session, ${Expr(bind.name)}, supply)
-                      ReplBridge.putSetter(repl.session, ${Expr(bind.name)}, ${consumer('assign)})
+
+                      ReplBridge.putSetter(repl.session, ${Expr(bind.name)},
+                        ${consumer('{ (value: Object) => cell(0) = value })})
                     }
 
                 List(cellPut)

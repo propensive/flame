@@ -39,6 +39,7 @@ import _root_.java.nio.channels as jnc
 import soundness.*
 
 import classloaders.threadContextClassloader
+import filesystemBackends.virtualMachine
 import filesystemOptions.createNonexistentParents.enabled
 import filesystemOptions.overwritePreexisting.disabled
 import interfaces.paths.pathOnLinux
@@ -81,7 +82,7 @@ private def exchange(socket: jn.Socket, request: Repl.Request): Repl.Reply =
 object ReplFixture:
   var greeting: String = "hello"
 
-  def session(using Scalac[3.8], Classloader, TemporaryDirectory, Monitor, System, Probate)
+  def session(using Scalac[3.8, Universe.Classfile], Classloader, TemporaryDirectory, Monitor, System, Probate)
   :   (Repl.Outcome, Repl.Outcome) =
     val repl = Repl[3.8]:
       def size: Int = greeting.length
@@ -93,7 +94,7 @@ object ReplFixture:
 object Tests extends Suite(m"Flame Tests"):
   def run(): Unit =
     suite(m"REPL tests"):
-      given Scalac[3.8] = Scalac(Nil)
+      given Scalac[3.8, Universe.Classfile] = Scalac(Nil)
 
       test(m"a definition is visible on a later line"):
         supervise:
@@ -404,7 +405,7 @@ object Tests extends Suite(m"Flame Tests"):
           case _ => false
 
     suite(m"REPL binding tests"):
-      given Scalac[3.8] = Scalac(Nil)
+      given Scalac[3.8, Universe.Classfile] = Scalac(Nil)
 
       test(m"captured values and a lifted definition are usable in the REPL"):
         supervise:
@@ -446,7 +447,7 @@ object Tests extends Suite(m"Flame Tests"):
           case _                         => false
 
     suite(m"REPL result rendering"):
-      given Scalac[3.8] = Scalac(Nil)
+      given Scalac[3.8, Universe.Classfile] = Scalac(Nil)
 
       test(m"an expression's value is rendered via Inspectable"):
         supervise:
@@ -493,7 +494,7 @@ object Tests extends Suite(m"Flame Tests"):
       . assert(_.contains(t"\n"))
 
     suite(m"REPL TCP server"):
-      given Scalac[3.8] = Scalac(Nil)
+      given Scalac[3.8, Universe.Classfile] = Scalac(Nil)
 
       test(m"a reply carries the value, type and highlighting"):
         supervise:
@@ -522,8 +523,9 @@ object Tests extends Suite(m"Flame Tests"):
           try
             send(socket, Repl.Request.Quit(0))
 
-            // Wait (bounded) for the quit signal rather than blocking forever.
-            val runnable: Runnable = () => sessions.awaitQuit()
+            // Wait (bounded) for the quit signal rather than blocking forever. `awaitQuit` now takes
+            // a `Monitor`, which the lambda captures; seal it so it can serve as a plain `Runnable`.
+            val runnable: Runnable = caps.unsafe.unsafeAssumePure(() => sessions.awaitQuit())
             val waiter = Thread(runnable)
             waiter.start()
             waiter.join(5000L)
@@ -603,7 +605,7 @@ object Tests extends Suite(m"Flame Tests"):
           case _                              => false
 
     suite(m"REPL block captures outside references"):
-      given Scalac[3.8] = Scalac(Nil)
+      given Scalac[3.8, Universe.Classfile] = Scalac(Nil)
 
       test(m"a lifted def can reference a value from the enclosing scope"):
         supervise:

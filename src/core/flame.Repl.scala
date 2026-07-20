@@ -47,6 +47,7 @@ import dotty.tools.dotc.util.SourceFile as DottySourceFile
 import ambience.*
 import anthology.*
 import anticipation.*
+import aperture.*
 import coaxial.*
 import contingency.*
 import denominative.*
@@ -64,6 +65,7 @@ import serpentine.*
 import stratiform.*
 import vacuous.*
 
+import filesystemBackends.virtualMachine
 import filesystemOptions.createNonexistentParents.enabled
 import filesystemOptions.overwritePreexisting.disabled
 import interfaces.paths.pathOnLinux
@@ -105,6 +107,35 @@ object Repl:
     case Rejected(notices: List[Notice])
     case Crashed(notices: List[Notice], error: StackTrace)
 
+  // Process-wide capture of Java-side `System.out`. `System.out` is a single global, so with
+  // concurrent runs (async mode runs each line off the compiler mutex) we cannot redirect and
+  // restore it per run, as the old per-run `setOut`/restore did — two overlapping runs would
+  // clobber each other's saved stream. Instead we install ONE `System.out` (lazily, once for the
+  // whole JVM) that dispatches each write to the running thread's current capture stream — set by
+  // `capture` around a run — falling back to the real stdout for threads with none. Scala-side
+  // `println` is already thread-local via `scala.Console.withOut`, so this only covers Java prints.
+  object CapturedOut:
+    private val current: ThreadLocal[ji.OutputStream] = ThreadLocal()
+
+    private lazy val installed: Unit =
+      val real: ji.OutputStream = jl.System.out.nn
+      val dispatch: ji.OutputStream = new ji.OutputStream:
+        private def target: ji.OutputStream = Optional(current.get).or(real)
+        def write(byte: Int): Unit = target.write(byte)
+        override def write(bytes: Array[Byte] | Null, off: Int, len: Int): Unit =
+          target.write(bytes, off, len)
+        override def flush(): Unit = target.flush()
+
+      jl.System.setOut(ji.PrintStream(dispatch, true, "UTF-8"))
+
+    // Routes this thread's Java-side `System.out` to `stream` for the duration of `body`, then
+    // restores whatever it was before (nested captures are honoured, though runs never nest).
+    def capture[result](stream: ji.OutputStream)(body: => result): result =
+      installed
+      val previous: ji.OutputStream | Null = current.get
+      current.set(stream)
+      try body finally current.set(previous)
+
   // One syntax-highlighting token of the submitted line. `accent` is the lowercased Harlequin
   // accent (a COLOUR category — `keyword`, `term`, `typal`, …); `role` is `binding`/`usage` for
   // a term or type (a styling policy may e.g. italicise bindings); `tpe` is the token's
@@ -116,15 +147,33 @@ object Repl:
   // to text here so the reply serializes simply.
   case class CompletionItem(name: Text, kind: Text, signature: Text)
 
-  // A `Reply` variant carries a `List` of these leaf products, so its Decodable
-  // derivation graph (sum → variant → `List` → product) overflows inline derivation
-  // under the REPL's minimal predef. Anchoring the leaves with explicit derived
-  // instances keeps the graph shallow enough to resolve.
-  given tokenDecodable: Tactic[TelError] => Token is Tel.Decodable =
-    Tel.DecodableDerivation.derived
+  // The wire types' codecs, anchored PURE and tactic-free. Anchoring (rather than deriving
+  // inline at each use) keeps the derivation graph shallow enough to resolve under the REPL's
+  // minimal predef; purity is required by `Bintel.read`'s context bound AND by the by-name
+  // thunks through which the derivation summons each field's codec — which an anchor
+  // parameterized by a (capturing) Tactic cannot supply. So each anchor imports
+  // `strategies.throwUnsafely` (an UNSCOPED static tactic, exempt from capture tracking) as
+  // its ambient tactic (for the primitives, whose declared types name their tactic's capture,
+  // the instance is instead laundered with `unsafeAssumePure` under an `unsafely`-minted
+  // tactic); a decode failure then throws rather than raises. Every flame decode site wraps
+  // `Bintel.read` in `safely[Exception]`, which catches the throw, so a malformed frame still
+  // yields `Unset` exactly as before.
+  given textTelDecodable: Text is Tel.Decodable =
+    unsafely(caps.unsafe.unsafeAssumePure(Tel.textDecodable))
 
-  given completionItemDecodable: Tactic[TelError] => CompletionItem is Tel.Decodable =
-    Tel.DecodableDerivation.derived
+  given intTelDecodable: Int is Tel.Decodable =
+    unsafely(caps.unsafe.unsafeAssumePure(Tel.intDecodable))
+
+  given booleanTelDecodable: Boolean is Tel.Decodable =
+    unsafely(caps.unsafe.unsafeAssumePure(Tel.booleanDecodable))
+
+  given tokenDecodable: Token is Tel.Decodable =
+    import strategies.throwUnsafely
+    Tel.DecodableDerivation.derived[Token]
+
+  given completionItemDecodable: CompletionItem is Tel.Decodable =
+    import strategies.throwUnsafely
+    Tel.DecodableDerivation.derived[CompletionItem]
 
   // A request from a connected client. `id` is echoed in the reply so the client
   // can re-associate replies that arrive out of order (a fast `tokenize` may
@@ -163,10 +212,22 @@ object Repl:
     // startup display and `/session` tab-completion).
     case Session(id: Int, name: Text, names: List[Text])
 
+  // Pure anchors for the top-level wire enums, on the same footing as the leaf codecs above, so
+  // `Bintel.read[Request]`/`[Reply]` (whose context bound requires a pure instance) resolves.
+  // `throwUnsafely` also covers the `VariantError` a sum derivation raises on an unrecognised
+  // variant keyword.
+  given requestDecodable: Request is Tel.Decodable =
+    import strategies.throwUnsafely
+    Tel.DecodableDerivation.derived[Request]
+
+  given replyDecodable: Reply is Tel.Decodable =
+    import strategies.throwUnsafely
+    Tel.DecodableDerivation.derived[Reply]
+
   // Highlights `code` with Harlequin's typechecked pipeline (the compiler
   // resolves symbols, so accents are accurate and each token carries its type).
   // Needs the session's `Scalac` and compile classpath; used for `submit`.
-  def highlight(code: Text)(using Scalac[?], LocalClasspath): List[Token] =
+  def highlight(code: Text)(using Scalac[?, ?], LocalClasspath): List[Token] =
     import highlighting.typecheckedScala
     project(Scala.highlight(code))
 
@@ -228,7 +289,7 @@ object Repl:
   // as `val __completion = <code>` so a bare expression is valid to complete against. The
   // caret is shifted past the whole prefix. Each candidate's `Syntax` signature is rendered
   // to text for the wire.
-  def complete(context: List[Text], code: Text, offset: Int)(using Scalac[?], LocalClasspath)
+  def complete(context: List[Text], code: Text, offset: Int)(using Scalac[?, ?], LocalClasspath)
   :   List[CompletionItem] =
     import highlighting.typecheckedScala
 
@@ -605,7 +666,7 @@ object Repl:
   // `Syntax`. The context (the session's imports and prior wrapper objects) is prepended so
   // the type resolves even for expressions that use session definitions. Only meaningful for
   // expression lines (statements have no value).
-  def resultType(context: List[Text], code: Text)(using Scalac[?], LocalClasspath): Optional[Syntax] =
+  def resultType(context: List[Text], code: Text)(using Scalac[?, ?], LocalClasspath): Optional[Syntax] =
     import highlighting.typecheckedScala
     val contextLines: Text = context.map { line => t"$line\n" }.join
     val tokens = Scala.highlight(t"${contextLines}val __result = $code").lines.to(List).flatten
@@ -636,7 +697,7 @@ object Repl:
   // taken if it's a keyword or already resolves in the session scope (a prior binding or an
   // imported name) — reusing it would shadow, or make two same-scope wildcard imports ambiguous
   // on a later line. Resolution is checked by asking the compiler to complete the bare name.
-  def freeName(base: Text, context: List[Text])(using Scalac[?], LocalClasspath): Text =
+  def freeName(base: Text, context: List[Text])(using Scalac[?, ?], LocalClasspath): Text =
     def taken(candidate: Text): Boolean =
       allKeywords.contains(candidate)
       || complete(context, candidate, candidate.length).exists(_.name == candidate)
@@ -768,7 +829,7 @@ object Repl:
   // A `def`'s displayed signature: its header, plus the inferred return type when the source omits
   // one (`def f(a: Int) = a` → `def f(a: Int): Int`). Inference typechecks the def applied to `???`s;
   // if that fails (an unusual signature), the header is shown without a return type.
-  def defSignature(line: Text, name: Text, context: List[Text])(using Scalac[?], LocalClasspath): Text =
+  def defSignature(line: Text, name: Text, context: List[Text])(using Scalac[?, ?], LocalClasspath): Text =
     val header: Text = defHeader(line)
     if annotatesReturnType(header) then header else
       val probe: Text = t"{ $line\n${defApplication(header, name)} }"
@@ -797,13 +858,13 @@ object Repl:
 
   def make[version <: Scalac.Versions]
     ( prelude: Repl.Prelude, render: Repl.Rendering = Repl.Rendering.Inspect )
-    ( using Scalac[version], Classloader, TemporaryDirectory )
+    ( using Scalac[version, Universe.Classfile], Classloader, TemporaryDirectory )
   :   Repl[version] =
 
     new Repl[version](prelude = prelude, render = render)
 
   inline def apply[version <: Scalac.Versions](inline body: Unit = ())
-    ( using scalac: Scalac[version], classloader: Classloader, temporary: TemporaryDirectory )
+    ( using scalac: Scalac[version, Universe.Classfile], classloader: Classloader, temporary: TemporaryDirectory )
   :   Repl[version] =
 
     ${ReplMacro.bound[version]('body, 'scalac, 'classloader, 'temporary)}
@@ -812,7 +873,7 @@ class Repl[version <: Scalac.Versions]
   ( layout:  Repl.Layout    = Repl.Layout.Standard(),
     prelude: Repl.Prelude   = Repl.Prelude.empty,
     render:  Repl.Rendering = Repl.Rendering.Inspect )
-  ( using scalac: Scalac[version], classloader: Classloader, temporary: TemporaryDirectory ):
+  ( using scalac: Scalac[version, Universe.Classfile], classloader: Classloader, temporary: TemporaryDirectory ):
 
   import Repl.Outcome
   import Repl.Kind
@@ -853,11 +914,6 @@ class Repl[version <: Scalac.Versions]
   private var asyncMode: Boolean = false
   def asyncEnabled: Boolean = asyncMode
 
-  // The sink a run's stdout is streamed to as it appears (async mode), set by `react` around the run
-  // (under `mutex`, so only one run ever uses it at a time) and reset afterwards. `_ => ()` means no
-  // streaming — the output is still captured and returned in the reply as usual.
-  private var outputSink: Text => Unit = _ => ()
-
   private val out: Path on Linux = unsafely(temporaryDirectory/Uuid())
   locally(unsafely(out.create[Directory]()))
 
@@ -875,14 +931,14 @@ class Repl[version <: Scalac.Versions]
       case classpath: LocalClasspath => classpath.entries
 
       case _ =>
-        unsafely(System.properties.java.`class`.path().decode[LocalClasspath]).entries)
+        unsafely(System.properties.java.`class`.path().as[LocalClasspath]).entries)
 
     LocalClasspath(entries*)
 
   // The compiler to use for the next line: the session's `Scalac` plus the flag of every setting the
   // user has switched on (`/set <name>`). `Scalac.Option` is contravariant in its version, so an
   // option built for this `version` is a valid extra flag for it.
-  private def effectiveScalac: Scalac[version] =
+  private def effectiveScalac: Scalac[version, Universe.Classfile] =
     val experimentalOn: Boolean = enabledSettings.contains(t"experimental")
 
     // An enabled experimental language feature is only APPLIED while `experimental` is on — so turning
@@ -894,15 +950,44 @@ class Repl[version <: Scalac.Versions]
         .filter { setting => !setting.experimental || experimentalOn }
         .map { setting => Scalac.Option[version](setting.flag) }
 
-    if extra.isEmpty then scalac else Scalac(scalac.options ::: extra)
+    // The wrapper objects are deliberately named `rs$line$N` (see `Layout.Standard.objectName`); the
+    // `$` is intentional (and `StackTraceRender` keys frame-trimming off it), so silence the compiler's
+    // "identifier should not contain `$`, which is reserved for internal compiler use" warning rather
+    // than let it surface in every submission's diagnostics.
+    val quiet: Scalac.Option[version] =
+      Scalac.Option[version](t"-Wconf:msg=reserved for internal compiler use:s")
 
-  // Compiles `code` as the next wrapper object and, on success, loads it (which
-  // runs its body). `rendered` is evaluated after a successful run to supply the
-  // `Outcome.Ran` value — `Unset` for statements, or the inspected result for an
-  // expression line.
-  private def compile(imports: List[Text], code: Text)(rendered: => Optional[Text])
+    Scalac(scalac.options ::: quiet :: extra)
+
+  // A line that has been COMPILED but not necessarily run. `compile` returns this so `react` can
+  // commit the (mutable, mutex-guarded) session state during compilation and then run the object
+  // load OUTSIDE the mutex: `Complete` is a line that produced its final `Outcome` already (a
+  // compile failure, or a `/`-command that runs nothing), while `Deferred` carries the object load
+  // as a thunk that `react` executes off the mutex — so an independent later line can compile and
+  // run while this one is still executing. A later line that DEPENDS on this one blocks naturally on
+  // the JVM's per-class initialization lock the first time it touches this line's wrapper object.
+  private enum Built:
+    case Complete(outcome: Outcome)
+    case Deferred(run: () => Outcome)
+
+  // Post-processes a built line's eventual `Outcome.Ran` (leaving failures untouched), preserving
+  // the deferred-run structure so the transformation runs off the mutex with the load.
+  private def mapRan(built: Built^)(map: Outcome.Ran -> Outcome): Built^{built} = built match
+    case Built.Deferred(run) =>
+      Built.Deferred: () =>
+        run() match
+          case ran: Outcome.Ran => map(ran)
+          case other            => other
+
+    case complete => complete
+
+  // Compiles `code` as the next wrapper object and, on success, returns a `Deferred` whose thunk
+  // loads it (running its body) — off the mutex. `rendered` is evaluated after a successful run to
+  // supply the `Outcome.Ran` value — `Unset` for statements, or the inspected result for an
+  // expression line. `onOutput` receives each chunk of the run's stdout as it appears (async mode).
+  private def compile(imports: List[Text], code: Text, onOutput: Text => Unit)(rendered: => Optional[Text])
       (using Monitor, System, Probate)
-  :   Outcome logs CompileEvent raises CompilerError raises AsyncError =
+  :   (Built^{onOutput, this, rendered}) logs CompileEvent raises CompilerError raises AsyncError =
 
     val name:    Text = layout.objectName(index)
     val source:  Text = layout.wrap(index, history, imports, code)
@@ -912,64 +997,59 @@ class Repl[version <: Scalac.Versions]
 
     outcome match
       case CompileResult.Crash(trace) =>
-        Outcome.Crashed(notices, trace)
+        Built.Complete(Outcome.Crashed(notices, trace))
 
       case CompileResult.Failure =>
-        Outcome.Rejected(notices)
+        Built.Complete(Outcome.Rejected(notices))
 
       case CompileResult.Success =>
         index += 1
         history = history :+ name
 
-        // Capture whatever the user's code prints to stdout. Scala's `println`
-        // writes to `scala.Console.out` (a thread-local), while Java code writes
-        // to `System.out` (process-global), so redirect both. `System.out` is
-        // process-global, but this runs under `submit`'s `mutex`, so only one run
-        // ever redirects it at a time, and the window is just the run itself.
-        //
-        // `captured` also TEES to `outputSink`: on each flush (an auto-flushing `PrintStream` flushes
-        // after every write/`println`) the newly-captured bytes are decoded and handed to the sink, so
-        // async mode can stream stdout as it appears. The full text is still returned in `output`.
-        val captured: ji.ByteArrayOutputStream = ji.ByteArrayOutputStream()
-        val sink:     Text => Unit             = outputSink
+        Built.Deferred: () =>
+          // Capture whatever the user's code prints to stdout. Scala's `println` writes to
+          // `scala.Console.out` (a thread-local, set by `withOut`), while Java code writes to the
+          // process-global `System.out` (routed to this thread by `CapturedOut.capture`). Both
+          // land in `captured`, which also TEES to `onOutput`: on each flush (an auto-flushing
+          // `PrintStream` flushes after every write/`println`) the newly-captured bytes are decoded
+          // and handed to the sink, so async mode can stream stdout as it appears. The full text is
+          // still returned in `output`.
+          val captured: ji.ByteArrayOutputStream = ji.ByteArrayOutputStream()
 
-        val teeing: ji.OutputStream = new ji.OutputStream:
-          private var streamed: Int = 0
-          def write(byte: Int): Unit = captured.write(byte)
-          override def write(bytes: Array[Byte] | Null, off: Int, len: Int): Unit =
-            captured.write(bytes, off, len)
+          // Captures `onOutput` (impure), so its type is left to infer rather than pinned pure.
+          val teeing = new ji.OutputStream:
+            private var streamed: Int = 0
+            def write(byte: Int): Unit = captured.write(byte)
+            override def write(bytes: Array[Byte] | Null, off: Int, len: Int): Unit =
+              captured.write(bytes, off, len)
 
-          override def flush(): Unit =
-            val all: Array[Byte] = captured.toByteArray.nn
-            if all.length > streamed then
-              val chunk = String(all, streamed, all.length - streamed, "UTF-8").tt
-              streamed = all.length
-              safely(sink(chunk))
+            override def flush(): Unit =
+              val all: Array[Byte] = captured.toByteArray.nn
+              if all.length > streamed then
+                val chunk = String(all, streamed, all.length - streamed, "UTF-8").tt
+                streamed = all.length
+                safely(onOutput(chunk))
 
-        val stream:   ji.PrintStream = ji.PrintStream(teeing, true, "UTF-8")
-        val previous: ji.PrintStream = jl.System.out.nn
-        jl.System.setOut(stream)
+          val stream: ji.PrintStream = ji.PrintStream(teeing, true, "UTF-8")
 
-        def output: Text =
-          stream.flush()
-          captured.toString("UTF-8").nn.tt
+          def output: Text =
+            stream.flush()
+            captured.toString("UTF-8").nn.tt
 
-        try
-          // Seed accessors read their session from this thread-local.
-          ReplBridge.setCurrentSession(session)
-          scala.Console.withOut(stream)(loader.on(t"$name$$"))
-          Outcome.Ran(notices, rendered, output)
-        catch
-          case error: ExceptionInInitializerError =>
-            Outcome.Threw(notices, Optional(error.getCause).or(error), output)
+          try
+            // Seed accessors read their session from this thread-local.
+            ReplBridge.setCurrentSession(session)
+            Repl.CapturedOut.capture(stream)(scala.Console.withOut(stream)(loader.on(t"$name$$")))
+            Outcome.Ran(notices, rendered, output)
+          catch
+            case error: ExceptionInInitializerError =>
+              Outcome.Threw(notices, Optional(error.getCause).or(error), output)
 
-          // Running arbitrary user code can throw anything, including `Error`s
-          // (`LinkageError`, `StackOverflowError`, …), which must not escape and
-          // kill the session.
-          case error: Throwable =>
-            Outcome.Threw(notices, error, output)
-        finally
-          jl.System.setOut(previous)
+            // Running arbitrary user code can throw anything, including `Error`s
+            // (`LinkageError`, `StackOverflowError`, …), which must not escape and
+            // kill the session.
+            case error: Throwable =>
+              Outcome.Threw(notices, error, output)
 
   // The import statements a submitted line introduces — each `;`-or-newline segment that
   // begins with `import`, so any definition or expression sharing the line is left out
@@ -1049,12 +1129,12 @@ class Repl[version <: Scalac.Versions]
   // `/tasty <expr>` shows the rendered TASTy (typed AST) of an expression — e.g. `/tasty (x: Int) =>
   // x + 1` or `/tasty List(1, 2, 3).map(_ + 1)`. It compiles the probe above in the session scope;
   // the expression is only type-checked and reflected, never run. A blank argument prints usage.
-  private def tasty(line: Text)(using Monitor, System, Probate)
-  :   Outcome logs CompileEvent raises CompilerError raises AsyncError =
+  private def tasty(line: Text, onOutput: Text => Unit)(using Monitor, System, Probate)
+  :   (Built^{onOutput, this}) logs CompileEvent raises CompilerError raises AsyncError =
 
     val expr: Text = line.skip(t"/tasty".length).trim
-    if expr == t"" then Outcome.Ran(Nil, Unset, t"flame: usage: /tasty <expression>\n")
-    else compile(contextImports(line), tastyProbe(expr))(Unset)
+    if expr == t"" then Built.Complete(Outcome.Ran(Nil, Unset, t"flame: usage: /tasty <expression>\n"))
+    else compile(contextImports(line), tastyProbe(expr), onOutput)(Unset)
 
   // `/bytecode <code>` disassembles the JVM bytecode of an expression or definition — e.g. `/bytecode
   // def fib(n: Int): Int = if n < 2 then n else fib(n - 1) + fib(n - 2)`. Unlike `/tasty`, this is a
@@ -1065,8 +1145,7 @@ class Repl[version <: Scalac.Versions]
   // then compiled directly. The wrapper is neither run nor added to `history`, so it does not pollute
   // the session — only `index` advances, to keep the object name unique.
   private def bytecode(line: Text)(using Monitor, System, Probate)
-  :   Outcome logs CompileEvent raises CompilerError raises AsyncError =
-
+  :   Built logs CompileEvent raises CompilerError raises AsyncError = Built.Complete:
     val code: Text = line.skip(t"/bytecode".length).trim
     if code == t"" then Outcome.Ran(Nil, Unset, t"flame: usage: /bytecode <expression or definition>\n")
     else
@@ -1094,8 +1173,8 @@ class Repl[version <: Scalac.Versions]
         case CompileResult.Crash(trace) => Outcome.Crashed(notices, trace)
         case CompileResult.Failure      => Outcome.Rejected(notices)
 
-  private def evaluate(line: Text)(using Monitor, System, Probate)
-  :   Outcome logs CompileEvent raises CompilerError raises AsyncError =
+  private def evaluate(line: Text, onOutput: Text => Unit)(using Monitor, System, Probate)
+  :   (Built^{onOutput, this}) logs CompileEvent raises CompilerError raises AsyncError =
 
     given LocalClasspath = classpath
 
@@ -1123,63 +1202,67 @@ class Repl[version <: Scalac.Versions]
     // directly (`echoCode`) rather than re-bound.
     val code: Text = if echo then echoCode(name, key, line) else expressionCode(name, key, line)
 
-    val expression: Outcome = compile(contextImports(line), code):
+    val expression: Built^{onOutput, this} = compile(contextImports(line), code, onOutput):
       Optional(ReplBridge.fetch[String](session, key.s)).let(_.tt)
 
     expression match
-      case _: Outcome.Rejected =>
+      case Built.Complete(_: Outcome.Rejected) =>
         // The line is a definition or statement, not an expression. A `val`/`var`/`def` is displayed
         // like an auto-named expression (name/value/type, or a `def`'s signature); everything else
         // (imports, `given`/`class`/…, plain statements) keeps its prior no-output behaviour.
         Repl.definitionKind(line) match
-          case (t"val" | t"var", bound: Text) => valDefinition(line, bound, key, context)
+          case (t"val" | t"var", bound: Text) => valDefinition(line, bound, key, context, onOutput)
 
           case (t"def", defName: Text) =>
-            compile(contextImports(line), line)(Unset) match
-              case ran: Outcome.Ran => ran.copy(output = t"${Repl.defSignature(line, defName, context)}\n")
-              case other            => other
+            // The signature is computed now (under the mutex, where the compiler is in use); the
+            // run itself produces no output for a `def`.
+            val signature: Text = Repl.defSignature(line, defName, context)
+            mapRan(compile(contextImports(line), line, onOutput)(Unset)):
+              ran => ran.copy(output = t"$signature\n")
 
           case _ =>
-            val statement = compile(contextImports(line), line)(Unset)
-
-            // The line compiled as a statement; if it introduced imports, remember them so every
-            // later line re-establishes them, and confirm each imported clause on its own line.
-            statement match
-              case ran: Outcome.Ran =>
+            // The line compiled as a statement; if it introduced imports, remember them now (under
+            // the mutex) so every later line re-establishes them, and confirm each on its own line
+            // once the statement has run.
+            compile(contextImports(line), line, onOutput)(Unset) match
+              case deferred @ Built.Deferred(_) =>
                 val introduced: List[Text] = importsIn(line)
                 imports = (imports ::: introduced).distinct
 
-                if introduced.isEmpty then ran else
+                if introduced.isEmpty then deferred else
                   val confirmed: Text =
                     introduced.map { each => t"Imported ${importClause(each)}" }.join(t"", t"\n", t"\n")
 
-                  ran.copy(output = t"${ran.output}$confirmed")
+                  mapRan(deferred) { ran => ran.copy(output = t"${ran.output}$confirmed") }
 
-              case other => other
+              case complete => complete
 
-      case ran: Outcome.Ran =>
-        // An echoed identifier consumes no `resN` number — it introduced no new result.
+      case Built.Complete(other) =>
+        Built.Complete(other)
+
+      case deferred @ Built.Deferred(_) =>
+        // An echoed identifier consumes no `resN` number — it introduced no new result. The counter
+        // advances now (under the mutex, so a concurrent later line's naming sees it) on a
+        // successful compile, whether or not the run ultimately throws.
         if !echo then result += 1
 
-        // A bare EXPRESSION that evaluates to `Unit` shows only its side-effect output — no
-        // `resN = () : scala.Unit` noise. A `val`/`var` DEFINITION of `Unit` type is handled by
-        // `valDefinition`, which does NOT suppress, so its binding is still confirmed (`x = () :
-        // scala.Unit`), matching the Scala REPL's `val x: Unit = ()`.
-        val unit: Boolean = tpe.let(_ == t"scala.Unit").or(false) || ran.value.let(_ == t"()").or(false)
+        mapRan(deferred): ran =>
+          // A bare EXPRESSION that evaluates to `Unit` shows only its side-effect output — no
+          // `resN = () : scala.Unit` noise. A `val`/`var` DEFINITION of `Unit` type is handled by
+          // `valDefinition`, which does NOT suppress, so its binding is still confirmed (`x = () :
+          // scala.Unit`), matching the Scala REPL's `val x: Unit = ()`.
+          val unit: Boolean = tpe.let(_ == t"scala.Unit").or(false) || ran.value.let(_ == t"()").or(false)
 
-        if unit then ran.copy(value = Unset, name = Unset, tpe = Unset)
-        else ran.copy(name = name, tpe = tpe)
-
-      case other =>
-        other
+          if unit then ran.copy(value = Unset, name = Unset, tpe = Unset)
+          else ran.copy(name = name, tpe = tpe)
 
   // Displays a `val`/`var` definition like an auto-named expression: the definition is compiled (so
   // the binding persists in the session) with an appended inspection of its value, then shown as
   // `name = value : type`. A `lazy val` is NOT inspected — that would force it — so only its name and
   // type are shown. The type comes from typechecking `{ <definition>; <name> }` (never run).
-  private def valDefinition(line: Text, bound: Text, key: Text, context: List[Text])
+  private def valDefinition(line: Text, bound: Text, key: Text, context: List[Text], onOutput: Text => Unit)
       (using Monitor, System, Probate)
-  :   Outcome logs CompileEvent raises CompilerError raises AsyncError =
+  :   (Built^{onOutput, this}) logs CompileEvent raises CompilerError raises AsyncError =
 
     given LocalClasspath = classpath
 
@@ -1190,17 +1273,14 @@ class Repl[version <: Scalac.Versions]
       line.trim.cut(t" ").takeWhile { word => word != t"val" && word != t"var" }.contains(t"lazy")
 
     if lazyVal then
-      compile(contextImports(line), line)(Unset) match
-        case ran: Outcome.Ran => ran.copy(output = t"$bound${tpe.let { each => t": $each" }.or(t"")}\n")
-        case other            => other
+      mapRan(compile(contextImports(line), line, onOutput)(Unset)):
+        ran => ran.copy(output = t"$bound${tpe.let { each => t": $each" }.or(t"")}\n")
     else
       val inspected: Text = (line :: renderInto(bound, key)).join(t"\n")
 
-      compile(contextImports(line), inspected):
-        Optional(ReplBridge.fetch[String](session, key.s)).let(_.tt)
-      . match
-          case ran: Outcome.Ran => ran.copy(name = bound, tpe = tpe)
-          case other            => other
+      mapRan(compile(contextImports(line), inspected, onOutput):
+          Optional(ReplBridge.fetch[String](session, key.s)).let(_.tt)):
+        ran => ran.copy(name = bound, tpe = tpe)
 
   // The prelude's pickled definitions and binding accessors are recompiled once,
   // as the first object (`rs$line$0`), straight from TASTy — preserving the
@@ -1326,25 +1406,38 @@ class Repl[version <: Scalac.Versions]
       val listing = all.map { each => t"  import ${importClause(each)}" }.join(t"\n")
       Outcome.Ran(Nil, Unset, t"flame: imports in scope:\n$listing\n")
 
-  def interpret(line: Text)(using Monitor, System, Probate)
-  :   Outcome logs CompileEvent raises CompilerError raises AsyncError =
+  // Compiles `line` — committing session state (`index`, `history`, `imports`, `result`, seeding,
+  // settings) — and returns the run DEFERRED (`Built`), so `react` can hold the compiler mutex only
+  // for this phase and execute the object load off it. `onOutput` streams the run's stdout.
+  private def build(line: Text, onOutput: Text => Unit)(using Monitor, System, Probate)
+  :   (Built^{onOutput, this}) logs CompileEvent raises CompilerError raises AsyncError =
 
     // A submission can change the session scope (a new definition, import, or `/set`), so any
     // cached member lists may be stale; drop them.
     completionCache = Map()
 
-    def lineOutcome: Outcome =
-      if line.trim.starts(t"/unimport") then unimport(line.trim)
-      else if line.trim.starts(t"/set") then set(line.trim)
-      else if line.trim.starts(t"/language") then language(line.trim)
-      else if line.trim == t"/context" then showContext
-      else if line.trim.starts(t"/tasty") then tasty(line.trim)
+    def lineOutcome: Built^{onOutput, this} =
+      if line.trim.starts(t"/unimport") then Built.Complete(unimport(line.trim))
+      else if line.trim.starts(t"/set") then Built.Complete(set(line.trim))
+      else if line.trim.starts(t"/language") then Built.Complete(language(line.trim))
+      else if line.trim == t"/context" then Built.Complete(showContext)
+      else if line.trim.starts(t"/tasty") then tasty(line.trim, onOutput)
       else if line.trim.starts(t"/bytecode") then bytecode(line.trim)
-      else evaluate(line)
+      else evaluate(line, onOutput)
 
     ensureSeeded().lay(lineOutcome):
       case _: Outcome.Ran => lineOutcome
-      case failure        => failure
+      case failure        => Built.Complete(failure)
+
+  // Compiles AND runs `line` synchronously, returning its final `Outcome`. Used by in-process
+  // callers (and the test suite) that want the fused result; `react` instead splits the two phases
+  // to run off the mutex. Single-threaded callers need no mutex.
+  def interpret(line: Text)(using Monitor, System, Probate)
+  :   Outcome logs CompileEvent raises CompilerError raises AsyncError =
+
+    build(line, _ => ()) match
+      case Built.Complete(outcome) => outcome
+      case Built.Deferred(run)     => run()
 
   // Tab completions at character `offset` in `code`, from the typechecked engine, computed
   // under the compiler mutex (the shared compiler is not reentrant). Public so in-process
@@ -1422,12 +1515,13 @@ class Repl[version <: Scalac.Versions]
           case _ =>
             Repl.keywordCompletions(code, offset) ::: mutex(safely(Repl.complete(context, code, offset)).or(Nil))
 
-  // Typecheck-highlights, compiles, and runs `code`, returning a `Reply` with the
-  // highlighting, the result value, its rendered type, and any diagnostics. The whole
-  // body holds `mutex`, so concurrent submits serialize and never drive the
-  // non-reentrant compiler at once. Shared by the socket protocol (`submit`, which
-  // encodes the reply) and by in-process front-ends (e.g. the web server), which render
-  // the typed `Reply` directly.
+  // Typecheck-highlights, compiles, and runs `code`, returning a `Reply` with the highlighting, the
+  // result value, its rendered type, and any diagnostics. Only COMPILATION and the session-state
+  // updates hold `mutex` (the shared compiler is not reentrant and the state is mutable) — the
+  // object load is run OUTSIDE it, so an independent later submission can compile and run while this
+  // one is still executing. A later line that depends on this one blocks, on first use, on the JVM's
+  // class-initialization lock for this line's wrapper object. Shared by the socket protocol
+  // (`submit`, which encodes the reply) and by in-process front-ends (e.g. the web server).
   // `onOutput` (async mode) receives each chunk of the run's stdout as it appears, so a front-end can
   // stream it; the chunk is still captured and returned in the reply's `output` as usual.
   def react(id: Int, code: Text, onOutput: Text => Unit = _ => ())(using Monitor, System, Probate)
@@ -1435,29 +1529,28 @@ class Repl[version <: Scalac.Versions]
 
     given LocalClasspath = classpath
 
-    mutex:
-      outputSink = onOutput
-      try react0(id, code) finally outputSink = _ => ()
+    val tokens      = Repl.highlight(code)
+    val unprocessed = Repl.Reply.Failed(id, t"the input could not be processed")
 
-  private def react0(id: Int, code: Text)(using Monitor, System, Probate, LocalClasspath)
-  :   Repl.Reply logs CompileEvent =
+    // Compile under the mutex; run the deferred load off it.
+    val outcome: Optional[Outcome] = safely:
+      mutex(build(code, onOutput)) match
+        case Built.Complete(result) => result
+        case Built.Deferred(run)    => run()
 
-      val tokens      = Repl.highlight(code)
-      val unprocessed = Repl.Reply.Failed(id, t"the input could not be processed")
+    outcome.lay(unprocessed):
+      case Outcome.Ran(notices, value, output, name, tpe) =>
+        // `evaluate` has already chosen the binding name/type and suppressed the value of a bare
+        // `Unit` EXPRESSION (a `Unit` `val`/`var` definition keeps its binding, so it still shows).
+        Repl.Reply.Ran(id, value, output, tpe, name, notices.map(_.message).join(t"; "), tokens)
 
-      safely(interpret(code)).lay(unprocessed):
-        case Outcome.Ran(notices, value, output, name, tpe) =>
-          // `evaluate` has already chosen the binding name/type and suppressed the value of a bare
-          // `Unit` EXPRESSION (a `Unit` `val`/`var` definition keeps its binding, so it still shows).
-          Repl.Reply.Ran(id, value, output, tpe, name, notices.map(_.message).join(t"; "), tokens)
+      case Outcome.Rejected(notices) =>
+        Repl.Reply.Rejected(id, notices.map(_.message).join(t"; "), tokens)
 
-        case Outcome.Rejected(notices) =>
-          Repl.Reply.Rejected(id, notices.map(_.message).join(t"; "), tokens)
+      case Outcome.Threw(_, error, output) =>
+        // Render the exception's (trimmed) stack trace as a coloured teletype listing, rather than
+        // just its `toString`, so a thrown error surfaces where it came from.
+        Repl.Reply.Threw(id, output, StackTraceRender.render(error), tokens)
 
-        case Outcome.Threw(_, error, output) =>
-          // Render the exception's (trimmed) stack trace as a coloured teletype listing, rather than
-          // just its `toString`, so a thrown error surfaces where it came from.
-          Repl.Reply.Threw(id, output, StackTraceRender.render(error), tokens)
-
-        case Outcome.Crashed(notices, _) =>
-          Repl.Reply.Crashed(id, notices.map(_.message).join(t"; "), tokens)
+      case Outcome.Crashed(notices, _) =>
+        Repl.Reply.Crashed(id, notices.map(_.message).join(t"; "), tokens)
