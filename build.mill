@@ -6,6 +6,9 @@ package build
 
 import mill.*
 import scalalib.*
+// `PomSettings`, `License`, `Developer`, `VersionControl`, `PublishModule` — the Maven publishing
+// vocabulary, imported exactly as the Soundness build does (`scalalib.publish.*`).
+import publish.*
 
 object settings:
   // The locally-built Scala compiler from the propensive/scala fork — the same toolchain
@@ -23,6 +26,13 @@ object settings:
   val scalaHome = sys.env.getOrElse("SOUNDNESS_SCALA_HOME", "")
 
   val soundnessVersion = "0.63.0"
+
+  // The Maven Central version flame's OWN modules (`flame-core`, `flame-web`, `flame-client`) are
+  // published under, AND the version the `launcher` module resolves them at. Kept as a single value
+  // so the published coordinates and the launcher's dependency coordinates cannot drift apart:
+  // burdock externalizes a module only when the exact published jar bytes are on the launcher's
+  // classpath, so a mismatch would silently fall back to inlining. Override at release time.
+  val flameVersion = sys.env.getOrElse("FLAME_VERSION", "0.1.0")
 
   val scalaOptions = Seq(
     "-experimental",
@@ -231,37 +241,85 @@ trait Toolchain extends ScalaModule:
 trait Project extends Module:
   def moduleDir = super.moduleDir / os.up / "src"
 
-trait Component(dependencies: ScalaModule*) extends Toolchain:
+// Dependencies are typed `PublishModule*` (as in the Soundness build) so that `moduleDeps` can
+// return `Seq[PublishModule]` — the type `SonatypeCentralPublishModule` requires of the modules that
+// mix in `Publishing`. All of flame's inter-module dependencies (`core`, `web`) are published, so
+// this costs the unpublished modules (`launcher`, `test`) nothing.
+trait Component(dependencies: PublishModule*) extends Toolchain:
   override def scalaVersion = settings.scalaVersion
   override def scalacOptions = settings.scalaOptions ++ settings.predef
   def moduleId: String = moduleDir.last
-  def moduleDeps: Seq[ScalaModule] = dependencies
+  def moduleDeps: Seq[PublishModule] = dependencies
   def sources = Task.Sources(moduleDir)
 
+// Mixed into the library modules that are released to Maven Central (`core`, `web`, `client`) — the
+// modules the `launcher` then pulls back in as published coordinates. Every setting mirrors the
+// Soundness build (`soundness/build.mill`, `BaseScalaModule`): the same `dev.soundness` organization,
+// URL, Apache-2.0 licence, GitHub SCM and developer, plus the empty `-javadoc.jar` that satisfies
+// Central without generating real docs. `SonatypeCentralPublishModule` targets the Central Portal
+// (central.sonatype.com), driven by the standard `MILL_SONATYPE_*`/`MILL_PGP_*` env vars at release.
+// A module's `moduleDeps` that are themselves `Publishing` become POM `<dependency>` entries, so the
+// published `flame-client` correctly declares `flame-core`/`flame-web`.
+trait Publishing extends Toolchain, SonatypeCentralPublishModule:
+  def publishVersion = settings.flameVersion
+  def artifactSuffix = Task("")
+
+  def pomSettings = Task(PomSettings(
+    description = "flame",
+    organization = "dev.soundness",
+    url = "https://soundness.dev/",
+    licenses = Seq(License.`Apache-2.0`),
+    versionControl = VersionControl.github("propensive", "flame"),
+    developers = Seq(Developer("propensive", "Jon Pretty", "https://github.com/propensive"))))
+
+  override def docJar = Task:
+    val jar = Task.dest / "empty.jar"
+    val zos = new java.util.zip.ZipOutputStream(new java.io.FileOutputStream(jar.toIO))
+    zos.close()
+    PathRef(jar)
+
 object flame extends Project:
-  // The REPL engine. Depends on the Scala 3 compiler (it compiles user input) in
-  // addition to its published Soundness components.
-  object core extends Component():
+  // The REPL engine. Depends on the Scala 3 compiler (it compiles user input) in addition to its
+  // published Soundness components. Published to Maven Central as `dev.soundness:flame-core`.
+  object core extends Component(), Publishing:
     def mvnDeps =
       settings.coreDeps :+ mvn"org.scala-lang:scala3-compiler_3:${settings.scalaVersion}"
 
-  // The interactive client (`flame.repl`). Built as a plain assembly; the native,
-  // self-fetching launcher is produced afterwards by the Burdock repackager — see
-  // the `repackage` target in the Makefile.
-  // Depends on `web` too, so `flame --http` can launch the web front-end in-process; the
-  // web front-end's Soundness deps (scintillate, perihelion, graffiti) come transitively.
-  object client extends Component(core, web):
+  // The interactive client library (`flame.runClient` and its helpers). NO LONGER an assembled app:
+  // the `@main`/`externalize` entry point moved to the `launcher` module, so this is a plain library
+  // published to Maven Central as `dev.soundness:flame-client`. Depends on `core` and `web` (so
+  // `flame serve` can launch the web front-end in-process); those become `flame-core`/`flame-web`
+  // POM dependencies, and the web front-end's Soundness deps come transitively.
+  object client extends Component(core, web), Publishing:
     def mvnDeps = settings.clientDeps
-    def finalMainClass = "flame.repl"
-    // A clean zip (no executable shell preamble) so the Burdock repackager can
-    // read and rewrite the assembled JAR.
-    def prependShellScript = ""
 
-  // An alternative, web-based front-end (`flame.web`): serves a page and forwards REPL
-  // input/output over a WebSocket, driving the same `core` engine as the CLI client.
-  object web extends Component(core):
+  // An alternative, web-based front-end (`flame.web`): serves a page and forwards REPL input/output
+  // over a WebSocket, driving the same `core` engine as the CLI client. Published as
+  // `dev.soundness:flame-web`; still assembled directly by `make web`, hence `finalMainClass`.
+  object web extends Component(core), Publishing:
     def mvnDeps = settings.webDeps
     def finalMainClass = "flame.web"
+    def prependShellScript = ""
+
+  // The invocation point, ALONE in its own module (`src/launcher/flame_launcher.scala` — just the
+  // `@main def repl = externalize(runClient())`). It depends on `client`/`core`/`web` NOT as Mill
+  // `moduleDeps` but as PUBLISHED Maven coordinates, so coursier puts the byte-identical Central jars
+  // on the compile classpath that `externalize` hashes; the repackager then externalizes them into
+  // on-demand downloads instead of inlining. `flame-client`'s POM pulls `flame-core`/`flame-web` (and
+  // burdock, scala3-compiler, the soundness modules) transitively; burdock is also named explicitly
+  // because the `externalize` macro and the `soundness.repackage` main are compiled/run against it.
+  //
+  // NOTE: this module can only be built AFTER `flame-client` (and its siblings) are on Maven Central
+  // at `settings.flameVersion`, since coursier must resolve the real Central artifacts (a local
+  // `publishLocal` copy has different bytes and would be inlined, not externalized).
+  object launcher extends Component():
+    def mvnDeps = Seq(
+      mvn"dev.soundness:flame-client:${settings.flameVersion}",
+      mvn"dev.soundness:burdock-core:${settings.soundnessVersion}",
+      mvn"dev.soundness:burdock-boot:${settings.soundnessVersion}")
+    def finalMainClass = "flame.repl"
+    // A clean zip (no executable shell preamble) so the Burdock repackager can read and rewrite the
+    // assembled JAR.
     def prependShellScript = ""
 
   object test extends Component(core):

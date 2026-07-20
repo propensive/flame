@@ -122,8 +122,11 @@ private def initialSettings(using Cli, Interpreter): List[Text] =
 // when no `--port` is given. Arbitrary, but stable so the two ends agree without configuration.
 val defaultPort: Int = 4319
 
-@main
-def repl(): Unit = externalize:
+// The client's command dispatch. The `@main` entry point and burdock's `externalize` wrapper live
+// alone in the `launcher` module (`src/launcher/flame_launcher.scala`), which depends on this module
+// (and `core`/`web`) as PUBLISHED Maven artifacts — so `externalize` records their Central jar hashes
+// and the repackager turns them into on-demand `Burdock-Require` downloads instead of inlining them.
+def runClient(): Unit =
   cli:
     arguments match
       // `flame serve [--port N | -p N]` — the web front-end (default port 8080). `Port()` registers

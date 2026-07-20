@@ -6,18 +6,27 @@ project, and now depends on the published Soundness release.
 
 ## Modules
 
+`core`, `web` and `client` are published to Maven Central under `dev.soundness` (as
+`flame-core`, `flame-web`, `flame-client`), using the same publishing settings as Soundness.
+
 - **`core`** — the REPL engine. It drives the Scala 3 compiler to evaluate input, so it
   depends on `org.scala-lang:scala3-compiler_3` in addition to its Soundness components.
-- **`client`** — the interactive front-end, `flame.repl`. `flame serve <port>` runs a REPL
-  server; `flame <port>` (or bare `flame`, over a per-process UNIX socket) connects to one.
+- **`web`** — an alternative web front-end (`flame.web`), driving the same `core` engine.
+- **`client`** — the interactive front-end library: `flame.runClient` and its command dispatch.
+  `flame serve <port>` runs a REPL server; bare `flame` (over a per-process UNIX socket) connects.
+- **`launcher`** — the invocation point, alone in its own module: just
+  `@main def repl = externalize(runClient())`. It depends on `client`/`core`/`web` as **published
+  Maven Central coordinates**, so Burdock's `externalize` records their Central jar hashes and the
+  repackager turns them into on-demand downloads rather than inlining them (see below).
 - **`test`** — a [Probably](https://github.com/propensive/probably) test suite.
 
 ## Building
 
 ```sh
-mill flame.client.assembly   # plain assembly JAR
-make run                     # build and start the REPL
+make run                     # publish libs locally, build & start the REPL (no Central needed)
 make test                    # compile and run the test suite
+make release VERSION=X.Y.Z   # publish flame-core/-web/-client to Maven Central (signed)
+make flame                   # after a release: build the tiny self-fetching launcher
 ```
 
 ## Dependencies
@@ -30,22 +39,20 @@ under flame's `import soundness.*`.
 
 ## Native launcher (Burdock)
 
-The build produces a plain assembly; the native, self-fetching launcher is produced
-afterwards by [Burdock](https://soundness.dev/). The compile-time macro
-`burdock.Embed.dependencyHashes` (invoked in `src/client/flame.Package.scala`) records the
-build's dependency hashes as `META-INF/burdock.deps` and caches the dependency JARs under
-`~/.cache/burdock`. Running
+The `launcher` module's single source wraps the entry point in [Burdock](https://soundness.dev/)'s
+`externalize`, which at compile time records the SHA-256 of every jar on the launcher's classpath
+into `META-INF/burdock.deps` and caches the jars under `~/.cache/burdock`. Running
 
 ```sh
-make repackage
+make flame
 ```
 
-invokes `burdock.Bootstrapper`, which rewrites the JAR so published dependencies are fetched
-on demand and unpublished ones are inlined.
-
-> **Note:** the Burdock repackager currently raises a `ZipError` on a full Mill assembly JAR
-> (its zip layer has only been exercised against small jars). The build-side wiring is in
-> place; repackaging large assemblies needs a fix in Burdock itself.
+assembles the launcher and runs `soundness.repackage`, which rewrites the JAR so that every
+dependency whose exact bytes are resolvable on Maven Central (via deps.dev) — now including
+`flame-core`, `flame-web` and `flame-client` — becomes an on-demand `Burdock-Require` download,
+while unpublished ones (e.g. the forked `scala3-compiler`) are inlined from the cache. This is why
+the libraries must be **released to Central first**: burdock keys on the published jar bytes, so a
+locally-built or `publishLocal` copy would be inlined rather than externalized.
 
 ## License
 
