@@ -16,6 +16,11 @@ object settings:
   // Soundness's TASTy is produced by this compiler, so flame must compile with it too.
   // `SOUNDNESS_SCALA_VERSION`/`SOUNDNESS_SCALA_HOME` switch toolchains together, exactly as
   // in the Soundness build.
+  //
+  // NOTE: the fork is genuinely REQUIRED — the stock `3.9.0-RC1` compiler this fork is based on
+  // rejects flame's (and Soundness's) capture-checked code in its `cc` phase, and cannot read
+  // `mandible`/`hyperbole` TASTy. A standard-Scala build was attempted and abandoned for these
+  // reasons.
   val scalaVersion = sys.env.getOrElse("SOUNDNESS_SCALA_VERSION", "3.9.0-RC1-propensive")
   // The propensive/proscala release the toolchain jars are downloaded from (unless a local
   // `SOUNDNESS_SCALA_HOME` is set), exactly as in the Soundness build. `3.9.0-RC1-p3` ships jars
@@ -25,7 +30,7 @@ object settings:
   // to use its `release/lib` jars directly (fork-developer mode).
   val scalaHome = sys.env.getOrElse("SOUNDNESS_SCALA_HOME", "")
 
-  val soundnessVersion = "0.63.0"
+  val soundnessVersion = "0.64.0"
 
   // The Maven Central version flame's OWN modules (`flame-core`, `flame-web`, `flame-client`) are
   // published under, AND the version the `launcher` module resolves them at. Kept as a single value
