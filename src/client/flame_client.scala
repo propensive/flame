@@ -76,6 +76,7 @@ val Host = Flag[Text]("host", false, List('H'), "connect to a flame REPL server 
 val Session = Flag[Text]("session", false, List('s'), "join an existing REPL session by name")
 val SetOpt = Flag[List[Text]]("set", true, Nil, "compiler settings to enable on startup (space-separated)")
 val LanguageOpt = Flag[List[Text]]("language", true, Nil, "language features to enable on startup (space-separated)")
+val Basic = Flag[Unit]("basic", false, Nil, "run a minimal, in-process, synchronous line-based REPL")
 
 // Exoskeleton's derived `Int is Interpretable` decodes through a `Decodable[Int]` that captures its
 // `Tactic[NumberError]`; under capture checking that impure instance cannot satisfy `Flag.apply`'s
@@ -166,7 +167,11 @@ def runClient(): Unit =
       case Argument(head) :: _ if head.starts(t"-") =>
         val settings: List[Text] = initialSettings
 
-        Host() match
+        // `flame --basic` — a minimal, self-contained, in-process synchronous REPL (no socket
+        // server, no TUI). Checked before `--host`, so it never falls through to a remote/socket
+        // connection; it still honours `--set`/`--language` startup settings.
+        if Basic().present then command(basicRepl(settings))
+        else Host() match
           case host: Text =>
             command(connectRemote(host, Port().or(defaultPort), Session(), settings))
 
@@ -193,6 +198,77 @@ private def serve(portNumber: Int)(using Stdio, Monitor, Probate, System): Exit 
         sessions.awaitQuit()
         service.stop()
         Exit.Ok
+
+// `flame --basic`: a minimal, self-contained, synchronous, line-based REPL — no socket server, no
+// line editor, no completion, no async. It reads one line at a time from the (daemon-forwarded)
+// stdin, accumulating lines while the buffer is still a syntactically-incomplete prefix (so a
+// multi-line definition can be entered — the `| ` continuation prompt), then evaluates each complete
+// submission in-process with `Repl.react` (which is inherently synchronous) and prints the same
+// plain-text block the terminal front-end shows below a line (`replyText`). The engine renders in
+// `Rendering.Inspect` (teletype/text) mode by default. `--set`/`--language` startup settings are
+// applied first; `/quit` (or Ctrl+D / EOF) ends the session. `async` has no effect here (every
+// submission runs synchronously), so `/set async` is intercepted with a short notice.
+private def basicRepl(settings: List[Text])(using Stdio, Monitor, Probate, System, DaemonService[?]): Exit =
+  given Scalac[3.8, Universe.Classfile] = Scalac(Nil)
+  given Classloader = serverClassloader
+
+  val repl:   Repl[3.8]         = Repl.make[3.8](Repl.Prelude.empty)
+  val reader: ji.BufferedReader = ji.BufferedReader(ji.InputStreamReader(summon[Stdio].in, "UTF-8"))
+  var id:     Int              = 0
+  var buffer: Text             = t""
+
+  // `Out.print` writes through a non-auto-flushing `PrintStream`, so flush after a prompt to be sure
+  // it reaches the terminal before `readLine` blocks.
+  def prompt(text: Text): Unit =
+    Out.print(text)
+    summon[Stdio].out.flush()
+
+  def submit(code: Text): Unit =
+    id += 1
+    Out.print(replyText(repl.react(id, code)))
+
+  // Ask the Ethereal launcher for a COOKED (canonical) terminal for the whole session, so the
+  // terminal driver itself provides character echo and line editing (Backspace, kill-line, …) — the
+  // launcher otherwise raw-modes a terminal stdin to forward keypresses to an interactive TUI, which
+  // left `--basic` with no echo (Soundness #1648/#1651). A no-op for a pipe, and harmless against a
+  // launcher too old to offer the control channel (it just stays in raw mode as before).
+  summon[DaemonService[?]].cooked:
+    // Apply the `--set`/`--language` startup settings, so each confirmation prints before the first prompt.
+    settings.each(submit)
+    Out.println(Repl.messages.session(t"basic"))
+
+    var running: Boolean = true
+
+    while running do
+      prompt(if buffer == t"" then t"> " else t"| ")
+
+      Optional(reader.readLine()) match
+        case Unset =>
+          // EOF (Ctrl+D or a closed pipe): end the session on a fresh line.
+          Out.println()
+          running = false
+
+        case line: String =>
+          val text: Text = line.tt
+
+          if buffer == t"" && text.trim == t"/quit" then running = false
+          else if buffer == t"" && text.trim == t"/set async" then
+            Out.println(t"flame: async mode is not available in --basic")
+          else
+            val code: Text = if buffer == t"" then text else t"$buffer\n$text"
+
+            // A `/`-command (at the start of a submission) is a REPL command, not Scala, so it always
+            // submits — never run it through the Scala-incompleteness check (which would treat e.g.
+            // `/classpath` as an incomplete prefix). Otherwise keep accumulating while the code is an
+            // incomplete prefix; a complete line runs, and a malformed one also submits (surfacing its
+            // compiler error), matching the terminal front-end's Enter semantics.
+            val command: Boolean = buffer == t"" && text.starts(t"/")
+
+            if !command && Repl.incomplete(code) then buffer = code else
+              buffer = t""
+              submit(code)
+
+  Exit.Ok
 
 // Launches the web-based front-end (`flame.web`) on the given TCP port, blocking until
 // interrupted. It reuses `serverClassloader` — the same compile-classpath loader the
@@ -910,6 +986,31 @@ private def runRepl
                 if prefix.length > editor.value.length
                 then editor = LineEditor(prefix, prefix.length, editor.mode)
                 candidates = several.map { name => Repl.CompletionItem(name, t"command", t"") }
+
+            refresh()
+            frame()
+
+          // `/classload <path>` completes its argument against the server's filesystem (the engine lists
+          // the working directory). The candidates are whole `/classload <path>` lines — a path is not
+          // an identifier — so a pick replaces the whole line; a directory candidate ends in `/`, so a
+          // further Tab drills into it. Mirrors the `/session` handler, but the list comes from the
+          // server via an ordinary `Complete` request (id 0, drained on `completions`).
+          case Keypress.Tab if editor.value.starts(t"/classload ") =>
+            duplex.send(zephyrine.Stream(framed(encode(Repl.Request.Complete(0, editor.value, editor.position)))))
+            val cands: List[Repl.CompletionItem] = completions.take().nn
+
+            cands match
+              case Nil => ()
+
+              case one :: Nil =>
+                editor = LineEditor(one.name, one.name.length, editor.mode)
+                candidates = Nil
+
+              case several =>
+                val prefix = longestCommonPrefix(several.map(_.name))
+                if prefix.length > editor.value.length
+                then editor = LineEditor(prefix, prefix.length, editor.mode)
+                candidates = several
 
             refresh()
             frame()

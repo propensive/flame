@@ -34,6 +34,7 @@ package flame
 
 import java.io as ji
 import java.lang as jl
+import java.net as jn
 
 import scala.quoted.*
 
@@ -520,6 +521,37 @@ object Repl:
      . filter { setting => setting.name.starts(partial) }
      . map { setting => CompletionItem(setting.name, t"command", setting.description) }
 
+  // Filesystem tab-completions for `/classload <partial>`: the entries of the directory the partial
+  // points into whose names extend the partial's final segment. Each is returned as a WHOLE-LINE
+  // `/classload <path>` candidate — a path is not an identifier, so both front-ends replace the whole
+  // line (they already do so for a `/`-prefixed candidate) rather than splicing at an identifier
+  // boundary. A directory gets a trailing `/`, so a further Tab drills into it. A relative partial is
+  // resolved against the process working directory (`user.dir`); an absolute one against the
+  // filesystem root. Hidden entries appear only when the partial's final segment itself starts with `.`.
+  def classloadCompletions(partial: Text)(using System): List[CompletionItem] =
+    val cwd:     Text = safely(System.properties.user.dir()).or(t"/")
+    val slash:   Int  = partial.s.lastIndexOf('/')
+    val dirPart: Text   = if slash < 0 then t"" else partial.keep(slash + 1)
+    val prefix:  String = if slash < 0 then partial.s else partial.s.substring(slash + 1).nn
+
+    val baseDir: ji.File =
+      if partial.starts(t"/") then ji.File(if dirPart == t"" then "/" else dirPart.s)
+      else if dirPart == t"" then ji.File(cwd.s)
+      else ji.File(cwd.s, dirPart.s)
+
+    val children: List[ji.File] = Optional(baseDir.listFiles).lay(Nil): array =>
+      scala.collection.immutable.ArraySeq.unsafeWrapArray(array.nn).map(_.nn).to(List)
+
+    children
+     . filter { file => file.getName.nn.startsWith(prefix) }
+     . filter { file => prefix.startsWith(".") || !file.getName.nn.startsWith(".") }
+     . sortBy(_.getName.nn)
+     . map: file =>
+         val name:  Text    = file.getName.nn.tt
+         val isDir: Boolean = file.isDirectory
+         val label: Text    = t"$dirPart$name${if isDir then t"/" else t""}"
+         CompletionItem(t"/classload $label", if isDir then t"directory" else t"file", t"")
+
   // The `/`-commands the engine itself recognises, with help text. Front-ends offer these
   // as completions when a line begins with `/`; the CLI appends its own client-only
   // commands (`/disconnect`, `/quit`) to these. Every compiler setting contributes a
@@ -532,7 +564,9 @@ object Repl:
     ::: List
          ( t"/tasty"    -> t"show the rendered TASTy (typed AST) of an expression",
            t"/bytecode" -> t"show the JVM bytecode of an expression or definition",
-           t"/unimport" -> t"remove an earlier import from scope (by the tokens it was imported with)" )
+           t"/unimport" -> t"remove an earlier import from scope (by the tokens it was imported with)",
+           t"/classpath" -> t"show the current classpath",
+           t"/classload" -> t"add a JAR file or directory to the classpath" )
 
   def slashCompletions(prefix: Text): List[CompletionItem] =
     slashCommands.filter { (name, _) => name.starts(prefix) }.map: (name, help) =>
@@ -816,6 +850,11 @@ class Repl[version <: Scalac.Versions]
   // into `Repl.settings`), not the flags themselves.
   private var enabledSettings: Set[Text] = Set()
 
+  // JARs and directories the user has added with `/classload`. They are appended to every subsequent
+  // line's COMPILE classpath (`classpath`, so a later line can `import` from them) and pushed onto the
+  // RUN-time classloader's URLs (`replLoader`, so the loaded code can use them).
+  private var extraEntries: List[ClasspathEntry.Directory | ClasspathEntry.Jar] = Nil
+
   // Async mode (`/set async`): when on, a front-end evaluates each submission on a background worker,
   // acknowledging with a placeholder and delivering the real result out-of-band once it is ready, so a
   // slow computation never blocks the editor. A plain per-session boolean (not a compiler flag).
@@ -825,8 +864,21 @@ class Repl[version <: Scalac.Versions]
   private val out: Path on Linux = unsafely(temporaryDirectory/Uuid())
   locally(unsafely(out.create[Directory]()))
 
-  private lazy val loader: Classloader =
-    LocalClasspath((Classpath.Directory(out) :: Nil)*).classloader(classloader)
+  // The run-time classloader over `out` (where each line's wrapper `.class` files land) plus any JARs
+  // or directories added with `/classload`. It is a `URLClassLoader` SUBCLASS so `/classload` can
+  // append a URL through the protected `addURL` directly — no reflection and no `--add-opens`, and,
+  // crucially, the SAME loader instance keeps every already-loaded wrapper (and its session state)
+  // intact while making the new classes visible. The `findClass`-first `loadClass` mirrors hellenism's
+  // own delegating loader, so a freshly-compiled wrapper outranks a same-named class on the parent.
+  private class ReplLoader(parent: ClassLoader)
+  extends jn.URLClassLoader(Array[jn.URL | Null](ClasspathEntry.Directory(out.encode).javaUrl), parent):
+    override def loadClass(name: String | Null, resolve: Boolean): Class[?] | Null =
+      try findClass(name) catch case _: ClassNotFoundException => super.loadClass(name, resolve)
+
+    def append(url: jn.URL): Unit = addURL(url)
+
+  private lazy val replLoader: ReplLoader = ReplLoader(classloader.java)
+  private lazy val loader: Classloader = new Classloader(replLoader)
 
   // The compile classpath must come from the *same* loader the wrapper objects
   // are run against (`classloader`, below), not from `classloaders.threadContext`:
@@ -841,7 +893,9 @@ class Repl[version <: Scalac.Versions]
       case _ =>
         unsafely(System.properties.java.`class`.path().as[LocalClasspath]).entries)
 
-    LocalClasspath(entries*)
+    // The `/classload` entries come last, so the base classpath (the scala library, soundness, …)
+    // always resolves first and an added JAR only supplements it.
+    LocalClasspath((entries ::: extraEntries)*)
 
   // The compiler to use for the next line: the session's `Scalac` plus the flag of every setting the
   // user has switched on (`/set <name>`). `Scalac.Option` is contravariant in its version, so an
@@ -1305,6 +1359,56 @@ class Repl[version <: Scalac.Versions]
          val mark: Text = if enabledSettings.contains(setting.name) then t"on " else t"off"
          t"  [$mark] ${setting.name} — ${setting.description}"
 
+  // The path (or URL) text of a classpath entry, for the `/classpath` listing.
+  private def classpathEntryText(entry: ClasspathEntry): Text = entry match
+    case ClasspathEntry.Directory(path) => path
+    case ClasspathEntry.Jar(path)       => path
+    case ClasspathEntry.Url(url)        => url
+    case ClasspathEntry.JavaRuntime     => t"[java runtime]"
+
+  // `/classpath` lists every entry on the REPL's current classpath — the base classpath (the scala
+  // library, soundness, …) plus any JARs or directories added with `/classload`.
+  private def showClasspath(using System): Outcome =
+    val entries: List[Text] = classpath.entries.map(classpathEntryText)
+    val listing: Text = entries.map { each => t"  $each" }.join(t"\n")
+    Outcome.Ran(Nil, Unset, t"flame: classpath (${entries.length.toString.tt} entries):\n$listing\n")
+
+  // `/classload <file>` adds a JAR file or a directory to the classpath — for BOTH the compiler (so a
+  // later line can `import` from it and type-check against it) and the run-time classloader (so the
+  // loaded code can use it). A relative path is resolved against the process working directory (as its
+  // tab-completion offers), then canonicalised. A name ending in `.jar`/`.zip` is recorded as a JAR,
+  // anything else as a directory (the run-time URL is classified by the filesystem regardless, so the
+  // label is only cosmetic). Re-adding an entry is a no-op.
+  private def classload(line: Text)(using System): Outcome =
+    val arg: Text = line.trim.skip(t"/classload".length).trim
+
+    if arg == t"" then Outcome.Ran(Nil, Unset, t"flame: usage: /classload <jar-file-or-directory>\n")
+    else
+      // Resolve a relative path against the process working directory, then canonicalise (`.`/`..` and
+      // symlinks), so a bare `lib.jar` works — matching what `/classload` tab-completion offers — and
+      // `/classpath` shows a stable absolute path.
+      val cwd: Text = safely(System.properties.user.dir()).or(t"/")
+      val raw: Text = if arg.starts(t"/") then arg else t"$cwd/$arg"
+      val resolved: Text = safely(ji.File(raw.s).getCanonicalPath.nn.tt).or(raw)
+
+      safely(resolved.as[Path on Linux]).lay
+       (Outcome.Ran(Nil, Unset, t"flame: '$arg' is not a valid path\n")): path =>
+        if !path.exists() then
+          Outcome.Ran(Nil, Unset, t"flame: no such file or directory: ${path.encode}\n")
+        else
+          val entry: ClasspathEntry.Directory | ClasspathEntry.Jar =
+            if path.encode.ends(t".jar") || path.encode.ends(t".zip")
+            then ClasspathEntry.Jar(path.encode)
+            else ClasspathEntry.Directory(path.encode)
+
+          if extraEntries.contains(entry) then
+            Outcome.Ran(Nil, Unset, t"flame: already on the classpath: ${path.encode}\n")
+          else
+            extraEntries = extraEntries :+ entry
+            replLoader.append(entry.javaUrl)  // make it visible to already-running code too
+            completionCache = Map()           // the set of resolvable names has changed
+            Outcome.Ran(Nil, Unset, t"flame: added to the classpath: ${path.encode}\n")
+
   // `/context` lists every import currently in scope — the prelude's baseline imports plus the
   // ones the user has added — so the session's namespace can be inspected without changing it.
   private def showContext: Outcome =
@@ -1329,6 +1433,8 @@ class Repl[version <: Scalac.Versions]
       else if line.trim.starts(t"/set") then Built.Complete(set(line.trim))
       else if line.trim.starts(t"/language") then Built.Complete(language(line.trim))
       else if line.trim == t"/context" then Built.Complete(showContext)
+      else if line.trim.starts(t"/classpath") then Built.Complete(showClasspath)
+      else if line.trim.starts(t"/classload") then Built.Complete(classload(line.trim))
       else if line.trim.starts(t"/tasty") then tasty(line.trim, onOutput)
       else if line.trim.starts(t"/bytecode") then bytecode(line.trim)
       else evaluate(line, onOutput)
@@ -1372,6 +1478,12 @@ class Repl[version <: Scalac.Versions]
     else if code.starts(t"/language ") then
       val partial = code.keep(offset).cut(t" ").last
       Repl.languageCompletions(partial, enabledSettings.contains(t"experimental"))
+
+    // `/classload <partial>` completes its argument against the filesystem (see `classloadCompletions`).
+    // The partial is the path typed after the `/classload ` prefix, up to the cursor.
+    else if code.starts(t"/classload ") then
+      val partial = code.keep(offset).skip(t"/classload ".length.min(offset))
+      Repl.classloadCompletions(partial)
 
     else exprHead match
       case head: Text => scalaCompletions(code.skip(head.length), (offset - head.length).max(0))

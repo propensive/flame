@@ -141,6 +141,38 @@ object Tests extends Suite(m"Flame Tests"):
           case Repl.Outcome.Ran(_, _, output, _, _) => output.contains(t"no matching import")
           case _                              => false
 
+      test(m"/classpath lists the current classpath"):
+        supervise:
+          Repl().interpret(t"/classpath")
+      . assert:
+          case Repl.Outcome.Ran(_, _, output, _, _) => output.contains(t"classpath (")
+          case _                              => false
+
+      test(m"/classload reports a nonexistent path"):
+        supervise:
+          Repl().interpret(t"/classload /no/such/directory/lib.jar")
+      . assert:
+          case Repl.Outcome.Ran(_, _, output, _, _) => output.contains(t"no such file or directory")
+          case _                              => false
+
+      test(m"/classload adds an entry that /classpath then shows"):
+        supervise:
+          val repl = Repl()
+          repl.interpret(t"/classload /usr")
+          repl.interpret(t"/classpath")
+      . assert:
+          case Repl.Outcome.Ran(_, _, output, _, _) => output.contains(t"/usr")
+          case _                              => false
+
+      test(m"/classload tab-completion lists filesystem entries as whole-line candidates"):
+        supervise:
+          val partial: Text = t"/classload /"
+          Repl().completionsAt(partial, partial.length)
+      . assert: items =>
+          items.nonEmpty
+          && items.all(_.name.starts(t"/classload /"))  // whole-line `/classload <path>` candidates
+          && items.exists(_.name.ends(t"/"))            // at least one directory (e.g. /usr/, /bin/)
+
       test(m"a given declared on one line is in scope on a later line"):
         supervise:
           val repl = Repl()

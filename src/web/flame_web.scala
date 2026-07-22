@@ -46,6 +46,24 @@ case class WebReply
      incomplete:  Boolean = false,
      name:        Text = t"" )
 
+// The JSON REST API's request/response bodies (served alongside the browser UI and WebSocket — see
+// the `/api/…` routes in `serveHttp`). Flat case classes, so jacinta derives their JSON codecs
+// automatically, exactly as it does for `WebRequest`/`WebReply`.
+case class ApiEval(code: Text)                        // POST body for `/api/sessions/{name}/eval`
+case class ApiSessionsList(sessions: List[Text])      // GET  /api/sessions
+case class ApiSessionCreated(session: Text)           // POST /api/sessions
+case class ApiError(error: Text)                      // a 400/404 error body
+
+// An evaluation result: `status` is `"ran"` or `"error"`; the remaining fields mirror the plain-text
+// REPL result (`name = value : tpe`, plus captured stdout and any diagnostics), each empty when absent.
+case class ApiResult
+   ( status:      Text,
+     value:       Text = t"",
+     tpe:         Text = t"",
+     output:      Text = t"",
+     name:        Text = t"",
+     diagnostics: Text = t"" )
+
 // The browser-side editor and styling. No `$` (it would interpolate) and `\n` is written
 // `\\n` so the served script carries a real newline escape. Selects its two controls by
 // tag — the page has exactly one `<pre>` (the log) and one `<code>` (the editor).
@@ -766,6 +784,29 @@ private def asyncReply(seq: Int, reply: Repl.Reply): WebReply =
 private def outputReply(seq: Int, chunk: Text): WebReply =
   WebReply(t"output", seq, t"", t"", chunk, t"", Nil)
 
+// Maps a typed `Repl.Reply` (from `react`) to the flat JSON result the REST API returns. Unlike
+// `resultReply`, this carries no highlight tokens and the value is plain text (the API's sessions
+// render in `Rendering.Inspect`), so it is safe to serialize straight to JSON.
+private def apiResult(reply: Repl.Reply): ApiResult = reply match
+  case Repl.Reply.Ran(_, value, output, tpe, name, diagnostics, _) =>
+    ApiResult(t"ran", value.or(t""), tpe.or(t""), output, name.or(t""), diagnostics)
+
+  case Repl.Reply.Threw(_, output, diagnostics, _) =>
+    ApiResult(t"error", output = output, diagnostics = diagnostics)
+
+  case Repl.Reply.Rejected(_, diagnostics, _) => ApiResult(t"error", diagnostics = diagnostics)
+  case Repl.Reply.Crashed(_, diagnostics, _)  => ApiResult(t"error", diagnostics = diagnostics)
+  case Repl.Reply.Failed(_, message)          => ApiResult(t"error", diagnostics = message)
+  case _                                      => ApiResult(t"error")
+
+// The `Content-Type` for every JSON API response, and a helper that frames a JSON string as a
+// fixed-length body under a given status (`Http.Status` carries an `apply(headers, body)`).
+private val jsonHeaders: List[Http.Header] =
+  List(Http.Header(t"content-type", t"application/json; charset=utf-8"))
+
+private def jsonResponse(status: Http.Status, body: Text): Http.Response =
+  status(jsonHeaders, Http.Body.Fixed(body.in[Data]))
+
 // Serves the web REPL on `port`, blocking until the process is interrupted. The embedded
 // engine's compile classpath comes from the supplied `Classloader`, so each caller passes
 // the loader matching how it was launched: the standalone `web` main uses the
@@ -780,6 +821,11 @@ def serveHttp(port: Int, quit: Promise[Unit])(using Monitor, System, Probate, Cl
   // may `/session`-switch to any other. Result values render as HTML (via `flame.HtmlRender`'s
   // Renderable→Showable→toString cascade), unlike the CLI's teletype `Inspect` rendering.
   val sessions = Sessions(Repl.Rendering.Html)
+
+  // The JSON REST API's sessions are an INDEPENDENT registry, rendering results as plain text
+  // (`Rendering.Inspect`) rather than HTML — so an API caller gets a `value` field it can use, not
+  // browser markup. API session names and browser session names never collide (separate `Sessions`).
+  val apiSessions = Sessions(Repl.Rendering.Inspect)
 
   // A token unique to this server process. The client remembers it and, on reconnecting,
   // compares: a different token means it reached a fresh process (e.g. after a restart),
@@ -939,6 +985,34 @@ def serveHttp(port: Int, quit: Promise[Unit])(using Monitor, System, Probate, Cl
           // which outlive it; the cast discards the tracked captures so it can serve as the
           // (pure-typed) response body.
           ws.asInstanceOf[perihelion.Websocket[perihelion.Message, Unit]]
+
+      // ── JSON REST API ──────────────────────────────────────────────────────────────────────────
+      // A plain request/response HTTP API over an INDEPENDENT plain-text session registry
+      // (`apiSessions`), served alongside the browser UI and WebSocket. `POST /api/sessions` creates a
+      // session; `GET /api/sessions` lists them; `POST /api/sessions/{name}/eval` runs the JSON body's
+      // `code` on that session and returns the result as JSON. Routing is exact-string (like the arms
+      // above), so the `{name}` path segment is peeled off by stripping the fixed prefix and suffix.
+      case t"/api/sessions" if request.method == Http.Post =>
+        jsonResponse(Http.Ok, ApiSessionCreated(apiSessions.create()).in[Json].show)
+
+      case t"/api/sessions" if request.method == Http.Get =>
+        jsonResponse(Http.Ok, ApiSessionsList(apiSessions.names).in[Json].show)
+
+      case target if request.method == Http.Post
+                     && target.starts(t"/api/sessions/") && target.ends(t"/eval") =>
+        val name: Text = target.strip(t"/api/sessions/").strip(t"/eval", Rtl)
+
+        apiSessions.session(name).lay
+         (jsonResponse(Http.NotFound, ApiError(t"no session named '$name'").in[Json].show)): repl =>
+          // Read and parse the body as `{"code": "…"}`; a stream/parse failure yields `Unset` → 400.
+          // `react` is synchronous (async mode has no REST analogue), so evaluate directly with a
+          // fixed id.
+          safely(request.body().memoize.utf8.read[Json].as[ApiEval]) match
+            case eval: ApiEval =>
+              jsonResponse(Http.Ok, apiResult(repl.react(0, eval.code)).in[Json].show)
+
+            case _ =>
+              jsonResponse(Http.BadRequest, ApiError(t"the request body must be JSON: {\"code\": \"…\"}").in[Json].show)
 
       case _ =>
         Http.Response(Http.NotFound)(t"not found")
