@@ -1456,8 +1456,16 @@ class Repl[version <: Scalac.Versions]
   // Tab completions at character `offset` in `code`, from the typechecked engine, computed
   // under the compiler mutex (the shared compiler is not reentrant). Public so in-process
   // front-ends (the web server) can request completions directly, like `complete` does for
-  // the socket protocol.
+  // the socket protocol. A keyword candidate inserts a trailing SPACE — a keyword is almost
+  // always followed by more (`val `, `import `, `match `), so this saves a keystroke. It is
+  // applied HERE, at the front-end entry point, so `keywordCompletions` keeps returning the bare
+  // keyword names its direct callers (and tests) rely on.
   def completionsAt(code: Text, offset: Int)(using Monitor, System, Probate)
+  :   List[Repl.CompletionItem] logs CompileEvent =
+    completionItems(code, offset).map: item =>
+      if item.kind == t"keyword" then item.copy(name = t"${item.name} ") else item
+
+  private def completionItems(code: Text, offset: Int)(using Monitor, System, Probate)
   :   List[Repl.CompletionItem] logs CompileEvent =
 
     // `/unimport <tokens>` completes against the imports currently in scope, so the user can pick

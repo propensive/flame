@@ -173,6 +173,13 @@ object Tests extends Suite(m"Flame Tests"):
           && items.all(_.name.starts(t"/classload /"))  // whole-line `/classload <path>` candidates
           && items.exists(_.name.ends(t"/"))            // at least one directory (e.g. /usr/, /bin/)
 
+      test(m"a keyword tab-completion ends with a space"):
+        supervise:
+          Repl().completionsAt(t"va", 2)
+      . assert: items =>
+          val keywords = items.filter(_.kind == t"keyword")
+          keywords.exists(_.name == t"val ") && keywords.all(_.name.ends(t" "))
+
       test(m"a given declared on one line is in scope on a later line"):
         supervise:
           val repl = Repl()
