@@ -308,8 +308,12 @@ object Repl:
     val wrapped: Text = t"$prefix$code$suffix"
     val caret:   Int  = prefix.length + offset
 
+    // Harlequin now merges prophesy keyword completions into `completions` itself, but computed
+    // against the WRAPPED text (whose `val __completion = {` prefix skews the lexeme context).
+    // flame supplies keywords from the raw line via `keywordCompletions`, so harlequin's keyword
+    // items are dropped here — otherwise every keyword would be offered twice.
     Scala.highlight(wrapped, caret = caret.z).completions.lay(Nil): completions =>
-      completions.items.map: item =>
+      completions.items.filter(_.kind != prophesy.Completion.Kind.Keyword).map: item =>
         CompletionItem(item.name, item.kind.toString.tt, item.signature.qualified)
 
   private def identifierChar(char: Char): Boolean = char.isLetterOrDigit || char == '_'
@@ -331,62 +335,13 @@ object Repl:
     if start > 0 && code.s.charAt(start - 1) == '.' then (code.keep(start), prefix)
     else (Unset, prefix)
 
-  // Keyword completion (the Scala compiler offers none). A coarse classification of the
-  // cursor's syntactic position, derived from the tokens before it. Precise classification
-  // would be a full parser — Scala's grammar is context-sensitive — so this trades accuracy
-  // for a cheap approximation; its worst case is offering a keyword where it is not strictly
-  // valid (harmless — the user ignores it) or missing one (a keyword just isn't suggested).
-  // Scala 3 keywords only: `implicit` (superseded by `given`/`using`) and do-while `do`
-  // (dropped in Scala 3) are deliberately excluded, so they are never offered.
-  private val defKeywords: List[Text] =
-    List(t"val", t"var", t"def", t"lazy", t"given", t"type", t"import", t"export", t"class",
-         t"object", t"trait", t"enum", t"case", t"final", t"sealed", t"abstract", t"private",
-         t"protected", t"override", t"inline", t"transparent", t"opaque", t"open", t"extension")
-
-  private val exprKeywords: List[Text] =
-    List(t"new", t"if", t"for", t"while", t"try", t"throw", t"return", t"this", t"super",
-         t"true", t"false", t"null")
-
-  private val paramKeywords: List[Text] = List(t"using", t"inline", t"val", t"var")
-
-  // At a statement boundary either a definition or an expression may begin.
-  private val statementKeywords: List[Text] = defKeywords ++ exprKeywords
-
-  // Each modifier constrains what may follow it, so a curated follow-set is far more useful
-  // than the whole definition list — especially the soft modifiers.
-  private val modifierFollowers: Map[Text, List[Text]] =
-    Map
-     ( t"transparent" -> List(t"inline", t"trait"),
-       t"inline"      -> List(t"def", t"given", t"val"),
-       t"opaque"      -> List(t"type"),
-       t"open"        -> List(t"class"),
-       t"sealed"      -> List(t"trait", t"class", t"abstract"),
-       t"abstract"    -> List(t"class", t"override"),
-       t"final"       -> List(t"class", t"object", t"def", t"val", t"var", t"case"),
-       t"override"    -> List(t"def", t"val", t"var", t"type", t"given"),
-       t"lazy"        -> List(t"val"),
-       t"private"     -> List(t"val", t"var", t"def", t"lazy", t"given", t"type", t"class",
-                              t"object", t"trait", t"enum", t"final", t"sealed", t"override"),
-       t"protected"   -> List(t"val", t"var", t"def", t"lazy", t"given", t"type", t"class",
-                              t"object", t"trait", t"enum", t"final", t"sealed", t"override") )
-
-  // After any of these, an expression (a new operand) may begin.
-  private val exprTriggers: Set[Text] =
-    Set(t"=", t"(", t",", t"return", t"throw", t"if", t"while", t"else", t"do", t"yield",
-        t"then", t"<-", t"=>")
-
-  // `with` is valid only in a template header (`extends A with B`), NOT after a type ascription
-  // `:` (a compound `A with B` there is Scala-2 style, superseded by `A & B`).
-  private val withTriggers: Set[Text] = Set(t"extends", t"with", t"derives")
-
   // Keywords that make a following identifier a NAME/TYPE/PATH rather than a value, so it is not
   // an infix receiver (`val x`, `def f`, `import p`, `case P`, `new T`, …).
   private val infixExcluded: Set[Text] =
     Set(t"val", t"var", t"def", t"type", t"class", t"object", t"trait", t"enum", t"given",
         t"package", t"import", t"export", t"case", t"extension", t"new")
 
-  private val defKeywordSet: Set[Text] = Set(t"def", t"class", t"trait", t"enum", t"given", t"extension")
-  private val valueAccents:  Set[Text] = Set(t"term", t"number", t"string", t"typal")
+  private val valueAccents: Set[Text] = Set(t"term", t"number", t"string", t"typal")
 
   // Every Scala 3 keyword, hard and soft. Harlequin's lexer tags SOFT keywords (`inline`,
   // `transparent`, `opaque`, `open`, `using`, `extension`, …) as identifiers — as Scala does —
@@ -407,72 +362,25 @@ object Repl:
   private def symbolic(text: Text): Boolean =
     text.s.length > 0 && text.s.forall { char => !identifierChar(char) && !char.isWhitespace }
 
-  // The innermost unclosed bracket before the cursor, and (for `(`) whether it opens a
-  // `def`/`class`/`given`/`extension` parameter list rather than an argument list — told
-  // apart by the keyword one or two significant tokens before the `(`.
-  private def enclosingContext(sig: IndexedSeq[Token]): (Text, Boolean) =
-    var stack: List[(Text, Boolean)] = Nil
-    var i = 0
-    while i < sig.length do
-      sig(i).text match
-        case t"(" =>
-          val param = i >= 1 && (defKeywordSet.contains(sig(i - 1).text)
-                                 || (i >= 2 && defKeywordSet.contains(sig(i - 2).text)))
-          stack = (t"(", param) :: stack
-        case t"[" => stack = (t"[", false) :: stack
-        case t"{" => stack = (t"{", false) :: stack
-        case t")" | t"]" | t"}" => if stack.nonEmpty then stack = stack.tail
-        case _ => ()
-      i += 1
+  // Keyword completion (the Scala compiler offers none), via Soundness's prophesy engine:
+  // `harlequin.Lexis.context` extracts the partial identifier at the cursor and the reversed
+  // lexeme context before it (tokenized depth — no compiler run), and prophesy's corpus-derived
+  // pattern tree (`ScalaKeywords.pattern`, 98% recall over the Soundness corpus) looks up the
+  // keywords plausible there. This replaces flame's former hand-curated token classifier.
+  // Returns the matching keyword candidates AND whether the grammar expects a FRESH NAME at the
+  // cursor (`val x…`, `def na…` — prophesy's `TermBinding`/`TypeBinding` expectation), where the
+  // compiler's name/member completions are noise the caller should suppress.
+  def keywordCompletions(code: Text, offset: Int): (List[CompletionItem], Boolean) =
+    val (prefix, context) = Lexis.context(code, offset.z)
+    val found = prophesy.ScalaKeywords.pattern(context)
+    val words = prefix.lay(found.keywords) { partial => found.keywords.filter(_.starts(partial)) }
+    val items = words.to(List).sortBy(_.s).map(CompletionItem(_, t"keyword", t""))
 
-    if stack.isEmpty then (t"", false) else stack.head
+    val binding =
+      found.expectation == prophesy.KeywordPattern.Expectation.TermBinding
+      || found.expectation == prophesy.KeywordPattern.Expectation.TypeBinding
 
-  // Whether the whitespace immediately before the cursor contains a line break (so the cursor
-  // sits on a fresh line — a statement boundary at top level or inside a `{ … }` block).
-  private def trailingNewline(before: Text): Boolean =
-    before.s.reverseIterator.takeWhile(_.isWhitespace).contains('\n')
-
-  // The keywords valid at the cursor, from a coarse token-based classification of `before`.
-  private def keywordsAt(before: Text): List[Text] =
-    val sig: IndexedSeq[Token] =
-      tokenize(before).filter { tok => tok.accent != t"unparsed" && tok.text.trim != t"" }.toIndexedSeq
-
-    if sig.isEmpty then statementKeywords
-    else
-      val last = sig(sig.length - 1)
-      val text = last.text
-      val (opener, param) = enclosingContext(sig)
-
-      if text == t"." then Nil
-      else if text == t"{" || text == t";" then statementKeywords
-      else if modifierFollowers.contains(text) then modifierFollowers(text)
-      // A type position (ascription or bound): the type itself is an identifier — no keyword,
-      // and specifically no `with` (which belongs only to a template header, see below).
-      else if text == t":" || text == t"<:" || text == t">:" then Nil
-      else if exprTriggers.contains(text) then
-        if (text == t"(" || text == t",") && param then paramKeywords else exprKeywords
-      else if withTriggers.contains(text) then List(t"with")
-      else if text == t"case" then Nil
-      else
-        val closeBracket = text == t")" || text == t"]" || text == t"}"
-        val operator     = symbolic(text) && !closeBracket
-        val valueEnding  = closeBracket || text == t"_" || (valueAccents.contains(last.accent) && !symbolic(text))
-
-        // A complete value + newline starts a new statement (top level / in a block); an
-        // operator does not. A value with no newline (postfix) offers no keyword here — `match`
-        // is offered only via the infix path (`completionsAt`), which requires a trailing space.
-        if valueEnding && trailingNewline(before) && (opener == t"" || opener == t"{")
-        then statementKeywords
-        else if operator then exprKeywords
-        else Nil
-
-  // Scala keywords valid at the cursor, as completion candidates. Merged with the compiler's
-  // (member/name) completions, which never include keywords.
-  def keywordCompletions(code: Text, offset: Int): List[CompletionItem] =
-    val start:  Int  = identifierStart(code, offset)
-    val prefix: Text = code.keep(offset).skip(start)
-
-    keywordsAt(code.keep(start)).filter(_.starts(prefix)).map(CompletionItem(_, t"keyword", t""))
+    (items, binding)
 
   // The infix-completion receiver: when the cursor is at `<value-expr> <space> <partial>` — a
   // value followed by whitespace, not a member selection — returns that value expression with a
@@ -1511,9 +1419,13 @@ class Repl[version <: Scalac.Versions]
             matchKw ::: matched
 
           // Otherwise prepend the keywords valid at this position (the compiler offers none)
-          // to its name/definition completions.
+          // to its name/definition completions. When prophesy reports that the grammar expects
+          // a FRESH NAME here (`val x…`, `def na…`), the compiler's name completions are noise:
+          // offer only the keywords, and skip the (mutex'd) compile entirely.
           case _ =>
-            Repl.keywordCompletions(code, offset) ::: mutex(safely(Repl.complete(context, code, offset)).or(Nil))
+            val (keywords, binding) = Repl.keywordCompletions(code, offset)
+            if binding then keywords
+            else keywords ::: mutex(safely(Repl.complete(context, code, offset)).or(Nil))
 
   // Typecheck-highlights, compiles, and runs `code`, returning a `Reply` with the highlighting, the
   // result value, its rendered type, and any diagnostics. Only COMPILATION and the session-state

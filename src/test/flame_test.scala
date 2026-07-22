@@ -264,22 +264,23 @@ object Tests extends Suite(m"Flame Tests"):
           repl.completionsAt(t"z9.le", 5).map(_.name)
       . assert(_.contains(t"length"))
 
-      // Keyword completion is position-classified (`Repl.keywordCompletions`, no compiler).
+      // Keyword completion is position-classified by prophesy's corpus-derived pattern tree
+      // (`Repl.keywordCompletions` via `Lexis.context`/`ScalaKeywords.pattern` — no compiler).
       test(m"`val`/`var` are keyword completions at a statement start"):
-        Repl.keywordCompletions(t"va", 2).map(_.name)
+        Repl.keywordCompletions(t"va", 2)._1.map(_.name)
       . assert(_ == List(t"val", t"var"))
 
       test(m"`import` is a keyword completion at the start of a line"):
-        Repl.keywordCompletions(t"imp", 3).map(_.name)
+        Repl.keywordCompletions(t"imp", 3)._1.map(_.name)
       . assert(_.contains(t"import"))
 
-      test(m"no keywords are offered after a member-selection dot"):
-        Repl.keywordCompletions(t"List(1).ma", 10)
-      . assert(_ == Nil)
+      test(m"`match` is offered after a member-selection dot (`expr.match` is valid Scala 3)"):
+        Repl.keywordCompletions(t"List(1).ma", 10)._1.map(_.name)
+      . assert(_ == List(t"match"))
 
-      test(m"no keyword (in particular `match`) is offered after a value with no space"):
-        Repl.keywordCompletions(t"List(1)ma", 9)
-      . assert(_ == Nil)
+      test(m"`match` is offered directly after a value (`List(1)match` tokenizes as a keyword)"):
+        Repl.keywordCompletions(t"List(1)ma", 9)._1.map(_.name)
+      . assert(_ == List(t"match"))
 
       test(m"a value followed by a space is an infix receiver"):
         Repl.infixBase(t"List(1) ma", 10)._1
@@ -293,45 +294,53 @@ object Tests extends Suite(m"Flame Tests"):
         Repl.infixBase(t"val x ", 6)._1
       . assert(_ == Unset)
 
-      test(m"a soft modifier offers a curated follow-set, not the whole definition list"):
-        Repl.keywordCompletions(t"transparent ", 12).map(_.name)
-      . assert(_ == List(t"inline", t"trait"))
+      test(m"a soft modifier offers a follow-set, not the whole definition list"):
+        Repl.keywordCompletions(t"transparent ", 12)._1.map(_.name)
+      . assert { names => names.contains(t"inline") && names.contains(t"trait") && !names.contains(t"import") }
 
-      test(m"`inline` offers def/given/val"):
-        Repl.keywordCompletions(t"inline ", 7).map(_.name)
-      . assert(_ == List(t"def", t"given", t"val"))
+      test(m"`inline` offers def/given/val (and inline-if/match)"):
+        Repl.keywordCompletions(t"inline ", 7)._1.map(_.name)
+      . assert { names => List(t"def", t"given", t"val", t"if", t"match").forall(names.contains) }
 
       test(m"`with` is not offered after a type ascription `:`"):
-        Repl.keywordCompletions(t"val x: w", 8)
+        Repl.keywordCompletions(t"val x: w", 8)._1
       . assert(_ == Nil)
 
-      test(m"`with` is offered in a template header after `extends`"):
-        Repl.keywordCompletions(t"class A extends w", 17).map(_.name)
+      test(m"`with` is offered in a template header after the parent type"):
+        Repl.keywordCompletions(t"class A extends B w", 19)._1.map(_.name)
       . assert(_ == List(t"with"))
 
       test(m"definition keywords are not offered in expression position"):
-        Repl.keywordCompletions(t"1 + va", 6)
+        Repl.keywordCompletions(t"1 + va", 6)._1
       . assert(_ == Nil)
 
-      test(m"`new` is offered in expression position"):
-        Repl.keywordCompletions(t"1 + n", 5).map(_.name)
+      test(m"`new` is offered at a statement start"):
+        Repl.keywordCompletions(t"n", 1)._1.map(_.name)
       . assert(_.contains(t"new"))
 
       test(m"`using` is offered inside a parameter list"):
-        Repl.keywordCompletions(t"def f(u", 7).map(_.name)
+        Repl.keywordCompletions(t"def f(u", 7)._1.map(_.name)
       . assert(_ == List(t"using"))
 
+      test(m"a parameter list expects a fresh name, suppressing member completions"):
+        Repl.keywordCompletions(t"def f(u", 7)._2
+      . assert(_ == true)
+
+      test(m"a binding position (`val x`) expects a fresh name"):
+        Repl.keywordCompletions(t"val x", 5)._2
+      . assert(_ == true)
+
       test(m"a method-call argument is not a parameter position"):
-        Repl.keywordCompletions(t"foo(v", 5)
+        Repl.keywordCompletions(t"foo(v", 5)._1
       . assert(_ == Nil)
 
       test(m"the Scala 2 `implicit` keyword is not offered"):
-        Repl.keywordCompletions(t"impl", 4)
+        Repl.keywordCompletions(t"impl", 4)._1
       . assert(_ == Nil)
 
-      test(m"the dropped do-while `do` keyword is not offered"):
-        Repl.keywordCompletions(t"1 + d", 5)
-      . assert(_ == Nil)
+      test(m"`do` is offered after a `while` condition (Scala 3 while-do)"):
+        Repl.keywordCompletions(t"while true d", 12)._1.map(_.name)
+      . assert(_ == List(t"do"))
 
       // `incomplete` decides whether Enter continues onto a new line or submits. The
       // verdict is reliable for well-formed input (the cases below); malformed, non-prefix
