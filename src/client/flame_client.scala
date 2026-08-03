@@ -44,6 +44,7 @@ import soundness.*
 
 import escapade.Faint
 import escapade.Italic
+import termcapDefinitions.xtermTrueColorTermcap
 import iridescence.WebColors
 // `soundness.*` also re-exports an unrelated `Signal` (embarcadero's workload-grant signal), so the
 // POSIX terminal `Signal` (whose `.Int` is SIGINT) is named explicitly to resolve the clash.
@@ -183,18 +184,18 @@ def runClient(): Unit =
 
 // Runs a REPL server on the given TCP port and blocks until interrupted.
 private def serve(portNumber: Int)(using Stdio, Monitor, Probate, System): Exit =
-  given Scalac[3.8, Universe.Classfile] = Scalac(Nil)
+  given Scalac[3.9, Universe.Classfile] = Scalac(Nil)
   given Classloader = serverClassloader
 
   safely(urticose.Port[Tcp](portNumber)).lay(invalidPort(portNumber)): port =>
     recover:
-      case BindError(_) => Out.println(t"flame: port $portNumber is unavailable"); Exit.Fail(5)
-      case error: Error => Out.println(t"flame: ${error.message}"); Exit.Fail(6)
+      case BindError(_) => Out.println(t"Port $portNumber is unavailable"); Exit.Fail(5)
+      case error: Error => Out.println(t"${error.message}"); Exit.Fail(6)
 
     . protect:
         val sessions = Sessions()
         val service  = sessions.serve(port)
-        Out.println(t"flame: serving a REPL on port $portNumber (Ctrl+C or /quit to stop)")
+        Out.println(t"Serving a REPL on port $portNumber (Ctrl+C or /quit to stop)")
         sessions.awaitQuit()
         service.stop()
         Exit.Ok
@@ -209,10 +210,10 @@ private def serve(portNumber: Int)(using Stdio, Monitor, Probate, System): Exit 
 // applied first; `/quit` (or Ctrl+D / EOF) ends the session. `async` has no effect here (every
 // submission runs synchronously), so `/set async` is intercepted with a short notice.
 private def basicRepl(settings: List[Text])(using Stdio, Monitor, Probate, System, DaemonService[?]): Exit =
-  given Scalac[3.8, Universe.Classfile] = Scalac(Nil)
+  given Scalac[3.9, Universe.Classfile] = Scalac(Nil)
   given Classloader = serverClassloader
 
-  val repl:   Repl[3.8]         = Repl.make[3.8](Repl.Prelude.empty)
+  val repl:   Repl[3.9]         = Repl.make[3.9](Repl.Prelude.empty)
   val reader: ji.BufferedReader = ji.BufferedReader(ji.InputStreamReader(summon[Stdio].in, "UTF-8"))
   var id:     Int              = 0
   var buffer: Text             = t""
@@ -253,7 +254,7 @@ private def basicRepl(settings: List[Text])(using Stdio, Monitor, Probate, Syste
 
           if buffer == t"" && text.trim == t"/quit" then running = false
           else if buffer == t"" && text.trim == t"/set async" then
-            Out.println(t"flame: async mode is not available in --basic")
+            Out.println(t"Async mode is not available in --basic")
           else
             val code: Text = if buffer == t"" then text else t"$buffer\n$text"
 
@@ -288,7 +289,7 @@ private def httpServe(portNumber: Int)
 
   // Printed from the client (not the daemon) so it reaches the user's terminal; the URL is
   // on its own line so terminals render it as a clean, clickable link.
-  Out.println(t"flame: serving the web REPL (press Ctrl+C to stop):")
+  Out.println(t"Serving the web REPL (press Ctrl+C to stop):")
   Out.println(t"  http://localhost:$portNumber/")
 
   // A TYPED Ctrl+C never reaches the `trap`: the Ethereal launcher reads the terminal in raw mode
@@ -327,7 +328,7 @@ private def installCompletions()(using stdio: Stdio, service: DaemonService[?])(
 
   recover:
     case error: InstallError =>
-      Out.println(t"flame: could not install tab-completions")
+      Out.println(t"Could not install tab-completions")
       Exit.Fail(8)
 
   . protect:
@@ -347,7 +348,7 @@ private def socketFile: Text = t"$socketDirectory/${ProcessHandle.current.nn.pid
 // Runs a REPL server on a per-process UNIX domain socket (used when no port is
 // given) and blocks until quit, unlinking the socket file on the way out.
 private def serveSocket()(using Stdio, Monitor, Probate, System): Exit =
-  given Scalac[3.8, Universe.Classfile] = Scalac(Nil)
+  given Scalac[3.9, Universe.Classfile] = Scalac(Nil)
   given Classloader = serverClassloader
 
   val socketPath: Text = socketFile
@@ -377,7 +378,7 @@ private def serveSocket()(using Stdio, Monitor, Probate, System): Exit =
 
     val sessions = Sessions()
     val service  = sessions.serve(socketPath)
-    Out.println(t"flame: serving a REPL on $socketPath (Ctrl+C or /quit to stop)")
+    Out.println(t"Serving a REPL on $socketPath (Ctrl+C or /quit to stop)")
     sessions.awaitQuit()
     service.stop()
 
@@ -388,7 +389,7 @@ private def serveSocket()(using Stdio, Monitor, Probate, System): Exit =
 
     Exit.Ok
   catch case error: Throwable =>
-    Out.println(t"flame: could not serve on $socketPath: ${error.toString.tt}")
+    Out.println(t"Could not serve on $socketPath: ${error.toString.tt}")
     Exit.Fail(6)
 
 // Builds the classloader the REPL compiles against inside the Ethereal daemon.
@@ -438,19 +439,19 @@ private def serverClassloader(using System): Classloader =
   catch case _: Throwable => threadContextClassloader
 
 private def invalidPort(portNumber: Int)(using Stdio): Exit =
-  Out.println(t"flame: $portNumber is not a valid TCP port")
+  Out.println(t"$portNumber is not a valid TCP port")
   Exit.Fail(2)
 
 private def missingHost(using Stdio): Exit =
-  Out.println(t"flame: --host needs the hostname of a flame server to connect to")
+  Out.println(t"The --host flag needs the hostname of a flame server to connect to")
   Exit.Fail(2)
 
 private def invalidHost(host: Text)(using Stdio): Exit =
-  Out.println(t"flame: '$host' is not a valid hostname")
+  Out.println(t"'$host' is not a valid hostname")
   Exit.Fail(2)
 
 private def unreachableRemote(host: Text, portNumber: Int)(using Stdio): Exit =
-  Out.println(t"flame: could not connect to $host:$portNumber")
+  Out.println(t"Could not connect to $host:$portNumber")
   Exit.Fail(3)
 
 // Runs `body` over a fresh TCP connection to `endpoint` — always closing it afterwards —
@@ -468,11 +469,11 @@ private def connectDomain[result](socket: DomainSocket)(body: Duplex => result):
   try socket.duplex(body) catch case _: ji.IOException => Unset
 
 private def unreachableSocket(path: Text)(using Stdio): Exit =
-  Out.println(t"flame: could not connect to $path")
+  Out.println(t"Could not connect to $path")
   Exit.Fail(3)
 
 private def failedToLaunch(using Stdio): Exit =
-  Out.println(t"flame: could not start a REPL server")
+  Out.println(t"Could not start a REPL server")
   Exit.Fail(3)
 
 // Starts a REPL server in the background — a detached `flame serve-socket` process on its
@@ -512,14 +513,14 @@ private def launchServer[result]()(using Stdio, System)(body: Duplex => result):
 private def keyTest(kitty: Boolean)(using Stdio, Monitor, Probate, Console, Environment): Exit =
   recover:
     case TerminalError() =>
-      Out.println(t"flame: the terminal could not be initialised")
+      Out.println(t"The terminal could not be initialised")
       Exit.Fail(4)
 
   . protect:
       interactive: terminal ?=>
         given Stdio = terminal.stdio
         if kitty then Out.print(t"\e[>1u")
-        Out.print(t"flame: press keys to see how they decode; Ctrl+C or Ctrl+D to stop\r\n")
+        Out.print(t"Press keys to see how they decode; Ctrl+C or Ctrl+D to stop\r\n")
         val events = terminal.eventIterator()
         var running = true
 
@@ -571,19 +572,19 @@ private def connectSocket(join: Optional[Text], initial: List[Text])
 
   live.to(List) match
     case Nil =>
-      Out.println(t"flame: starting a REPL server…")
+      Out.println(t"Starting a REPL server…")
       launchServer()(converse(join, initial)(_)).or(failedToLaunch)
 
     case path :: Nil =>
       connectDomain(DomainSocket(path))(converse(join, initial)(_)).or(unreachableSocket(path))
 
     case paths =>
-      Out.println(t"flame: several REPL servers are running:")
+      Out.println(t"Several REPL servers are running:")
 
       paths.each: path =>
         Out.println(t"  $path")
 
-      Out.println(t"flame: stop all but one, or connect to a specific one with 'flame --host localhost'")
+      Out.println(t"Stop all but one, or connect to a specific one with 'flame --host localhost'")
       Exit.Fail(7)
 
 // Connects the terminal REPL to a flame server on another host over TCP (`flame --host HOST
@@ -619,7 +620,7 @@ private def converse(join: Optional[Text], initial: List[Text])(duplex: Duplex)
 
   recover:
     case TerminalError() =>
-      Out.println(t"flame: the terminal could not be initialised")
+      Out.println(t"The terminal could not be initialised")
       Exit.Fail(4)
 
   . protect:
@@ -665,6 +666,13 @@ private def runRepl
   // editor renders the unique completion's remainder (or the common stem + "...") faint.
   @volatile var ghostReply: Optional[(Text, List[Repl.CompletionItem])] = Unset
   val ghostPending: TrieMap[Int, Text] = TrieMap()
+
+  // Ghost-request debounce (matching the web front-end's 200ms): each edit bumps the generation and
+  // schedules a request; only the latest generation — once no newer edit has arrived within the
+  // window — actually sends. A typechecked completion holds the server's compiler mutex for as much
+  // as a second against a large import context, so firing one per KEYSTROKE (as before) queued a
+  // compile per typed character, delaying submissions and Tab completions behind stale ghosts.
+  @volatile var ghostGen: Int = 0
 
   // The server's latest verdict on whether the current line is an incomplete prefix (so
   // Enter continues onto a new line) or ready to submit, paired with the value it was
@@ -792,7 +800,7 @@ private def runRepl
     else Out.println(Repl.messages.session(reply.name))
 
   // Apply the startup settings from `--set`/`--language` by submitting each as a command to the
-  // session, printing its confirmation (`flame: X enabled`) below the banner. Synchronous — async mode
+  // session, printing its confirmation (`X enabled`) below the banner. Synchronous — async mode
   // is off at startup — so each reply lands on `submits` in order.
   initial.each: command =>
     duplex.send(zephyrine.Stream(framed(encode(Repl.Request.Submit(nextId.getAndIncrement, command)))))
@@ -874,12 +882,23 @@ private def runRepl
         incompletePending(id) = editor.value
         duplex.send(zephyrine.Stream(framed(encode(Repl.Request.Tokenize(id, editor.value)))))
 
-        // Ask for the inline suggestion too, but only with the cursor at the end of the
-        // line (where the ghost is shown).
+        // Ask for the inline suggestion too, but only with the cursor at the end of the line (where
+        // the ghost is shown), and DEBOUNCED: the request is scheduled 200ms out and sent only if no
+        // further edit arrives in the window, so fast typing coalesces to one completion request
+        // (each is a full typechecked compile on the server) instead of one per keystroke.
+        ghostGen += 1
+
         if editor.position == editor.value.length then
-          val gid = nextId.getAndIncrement
-          ghostPending(gid) = editor.value
-          duplex.send(zephyrine.Stream(framed(encode(Repl.Request.Complete(gid, editor.value, editor.position)))))
+          val gen      = ghostGen
+          val value    = editor.value
+          val position = editor.position
+
+          async:
+            jl.Thread.sleep(200)
+            if ghostGen == gen then
+              val gid = nextId.getAndIncrement
+              ghostPending(gid) = value
+              duplex.send(zephyrine.Stream(framed(encode(Repl.Request.Complete(gid, value, position)))))
 
     // The inline suggestion for the current line: the remainder of a unique completion, or
     // the common stem of several (then "..."), shown only with the cursor at the line's end
@@ -1146,7 +1165,7 @@ private def runRepl
           // argument, report the current session and the ones available.
           val name = line.skip(t"/session".length).trim
           duplex.send(zephyrine.Stream(framed(encode(Repl.Request.Session(nextId.getAndIncrement, name)))))
-          safely(sessionReplies.take().nn).lay(t"flame: no response from the server\n"): reply =>
+          safely(sessionReplies.take().nn).lay(t"No response from the server\n"): reply =>
             if name == t"" then t"${Repl.messages.sessionList(reply.name, reply.names)}\n"
             else if reply.name == name then t"${Repl.messages.switched(reply.name)}\n"
             else t"${Repl.messages.noSession(name)}\n"
@@ -1295,13 +1314,19 @@ private def cadetBorder(child: Pane): Pane =
 private def replyText(reply: Repl.Reply): Text = reply match
   case Repl.Reply.Ran(_, value, output, tpe, name, diagnostics, _) =>
     // The value is shown only when there is one, as `name = value : type`, each part omitted
-    // when absent — so no bare `=`/`:` appears when there is no result.
+    // when absent — so no bare `=`/`:` appears when there is no result. The line is syntax-coloured
+    // like code: the binding NAME reads as a binding (term colour, italic), `=` and `:` as operator/
+    // symbol punctuation, and the TYPE in the type colour (the same teal a type gets everywhere else).
+    // The value itself is rendered verbatim (it already carries its own inspect colouring).
     val valueLine: Text =
       val rendered: Text = value.or(t"")
       if rendered == t"" then t"" else
-        val binding: Text = name.let { each => t"$each = " }.or(t"")
-        val typed:   Text = tpe.let { each => t" : $each" }.or(t"")
-        t"$binding$rendered$typed\n"
+        val binding: Teletype =
+          name.lay(e"") { each => e"$Italic(${palette.scalaTerm}($each)) ${palette.scalaParenthesis}(=) " }
+        val typed: Teletype =
+          tpe.lay(e"") { each => e"${palette.scalaSymbol}(:) ${palette.scalaType}($each)" }
+
+        t"${e"$binding$rendered$typed".render(xtermTrueColorTermcap)}\n"
 
     val diag: Text = if diagnostics != t"" then t"$diagnostics\n" else t""
     t"$output$valueLine$diag"
@@ -1438,26 +1463,9 @@ private def hex(rgb: Int): Color in Srgb =
 // (italic — see `colourful`). Zed has no distinct "modifier" scope (modifiers share the keyword
 // colour) and no error/margin syntax scopes, so those reuse the nearest editor/UI colours; and
 // Harlequin has no boolean accent, so `true`/`false` render as keywords, not Zed's pink.
-private given palette: ScalaSyntaxPalette = new Palette:
-  type Form = Srgb
-  def background:       Color in Srgb = hex(0x000000)  // editor.background
-  def foreground:       Color in Srgb = hex(0xd4be98)  // editor.foreground
-  def scalaError:       Color in Srgb = hex(0xea6962)  // deleted (a clear red)
-  def scalaNumber:      Color in Srgb = hex(0xcc3366)  // number
-  def scalaString:      Color in Srgb = hex(0x99ffff)  // string
-  def scalaTerm:        Color in Srgb = hex(0xffcc99)  // variable — every term (binding or usage)
-  def scalaType:        Color in Srgb = hex(0x00cc99)  // type
-  def scalaKeyword:     Color in Srgb = hex(0xff6633)  // keyword
-  // Harlequin's `Symbol` accent covers brackets and `:` (Zed punctuation.bracket); its `Parens`
-  // accent covers `=`/`.`-style operators (Zed operator) — the names read backwards, so the colours
-  // are assigned by which tokens actually carry each accent, not by the method name.
-  def scalaSymbol:      Color in Srgb = hex(0xcc6699)  // punctuation.bracket — `(` `)` `[` `]` `:`
-  def scalaParenthesis: Color in Srgb = hex(0xf28534)  // operator — `=` `.`
-  def scalaModifier:    Color in Srgb = hex(0xff6633)  // keyword (no distinct modifier scope)
-  def scalaComment:     Color in Srgb = hex(0x928374)  // comment
-  def subdued:          Color in Srgb = hex(0x5a524c)  // editor.line_number
-  def accented:         Color in Srgb = hex(0xd4be98)  // editor.active_line_number
-  def margin:           Color in Srgb = hex(0x111111)  // editor.gutter.background
+// The palette itself now lives in core (`SemanticRender.palette`), shared with the server-side
+// diagnostics rendering so an error message's types and code samples colour exactly as the editor does.
+private given palette: ScalaSyntaxPalette = SemanticRender.palette
 
 // Maps a Harlequin accent name (as carried on the wire) back to its `Accent`.
 private def accentOf(accent: Text): Accent = accent match
@@ -1480,8 +1488,6 @@ private def accentOf(accent: Text): Accent = accent match
 // `foo`/`T` where introduced from where applied — as the styling policy Harlequin#1439 leaves to the
 // front-end. (A live-heuristic token has no role yet, so it is refined to italic by the server.)
 private def colourful(tokens: List[Repl.Token]): Teletype =
-  import harlequin.syntaxHighlighting.tokenTeletypeable
-
   val text: Text = tokens.map(_.text).join
 
   // A `/`-command line is a REPL command, not Scala, so it is highlighted specially rather than
@@ -1499,7 +1505,13 @@ private def colourful(tokens: List[Repl.Token]): Teletype =
     if params == t"" then command else e"$command$Faint(${commandParameter}($params))"
   else
     tokens.map: token =>
-      val coloured: Teletype = harlequin.Token(token.text, accentOf(token.accent)).teletype
+      // Invoked through the typeclass instance directly: `soundness.*` now also exports delicious's
+      // `teletype` extension (on `SemanticMessage`), which shadows escapade's generic `.teletype`
+      // extension for the `Teletypeable` instance here.
+      val coloured: Teletype =
+        harlequin.syntaxHighlighting.tokenTeletypeable
+         . teletype(harlequin.Token(token.text, accentOf(token.accent)))
+
       if token.role.let(_ == t"binding").or(false) then e"$Italic($coloured)" else coloured
 
     . join

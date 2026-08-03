@@ -50,6 +50,9 @@ case class WebReply
 // the `/api/…` routes in `serveHttp`). Flat case classes, so jacinta derives their JSON codecs
 // automatically, exactly as it does for `WebRequest`/`WebReply`.
 case class ApiEval(code: Text)                        // POST body for `/api/sessions/{name}/eval`
+case class ApiComplete(code: Text, offset: Int)       // POST body for `/api/sessions/{name}/complete`
+case class ApiCompletion(name: Text, kind: Text, signature: Text)  // one completion candidate
+case class ApiCompletions(completions: List[ApiCompletion])        // the completion response
 case class ApiSessionsList(sessions: List[Text])      // GET  /api/sessions
 case class ApiSessionCreated(session: Text)           // POST /api/sessions
 case class ApiError(error: Text)                      // a 400/404 error body
@@ -84,6 +87,8 @@ val replScript: Text = t"""
     ".prompt { color: #808080; }",
     ".result { color: #b5cea8; }",
     ".error { color: #f48771; white-space: pre-wrap; }",
+    // An embedded code sample in a diagnostic never word-wraps mid-token (see `SemanticRender`).
+    ".error .code-sample { white-space: pre; }",
     ".notice { color: #e5c07b; font-weight: bold; white-space: pre-wrap; }",
     ".pending { color: #808080; font-style: italic; }",
     ".completions { position: fixed; z-index: 20; background: #252526; border: 1px solid #454545;",
@@ -322,12 +327,22 @@ val replScript: Text = t"""
     if (out) { if (out.charAt(out.length - 1) === "\\n") out = out.slice(0, -1); }
     if (out) html += "<div>" + escapeHtml(out) + "</div>";
     if (msg.value) {
+      // Syntax-colour the `name = value : type` line like code: the binding NAME as a binding (term
+      // colour, italicised via `.binding`), `=`/`:` as operator/symbol punctuation, and the TYPE in
+      // the type colour — matching the CLI. The value itself is already server-rendered HTML.
       var line = msg.value;
-      if (msg.name) line = escapeHtml(msg.name) + " = " + line;
-      if (msg.tpe) line += " : " + escapeHtml(msg.tpe);
+      if (msg.name)
+        line = "<span class='tok-term binding'>" + escapeHtml(msg.name) + "</span>"
+             + " <span class='tok-parens'>=</span> " + line;
+      if (msg.tpe)
+        line += "<span class='tok-symbol'>:</span> "
+              + "<span class='tok-typal'>" + escapeHtml(msg.tpe) + "</span>";
       html += "<div class='result'>" + line + "</div>";
     }
-    if (msg.diagnostics) html += "<div class='error'>" + escapeHtml(msg.diagnostics) + "</div>";
+    // Diagnostics are server-rendered, trusted HTML (types re-rendered through stenography in
+    // `SemanticRender`, everything else already HTML-escaped there), so they are inserted as-is —
+    // like the value above — rather than re-escaped.
+    if (msg.diagnostics) html += "<div class='error'>" + msg.diagnostics + "</div>";
     target.innerHTML = html;
   }
 
@@ -789,15 +804,20 @@ private def outputReply(seq: Int, chunk: Text): WebReply =
 // render in `Rendering.Inspect`), so it is safe to serialize straight to JSON.
 private def apiResult(reply: Repl.Reply): ApiResult = reply match
   case Repl.Reply.Ran(_, value, output, tpe, name, diagnostics, _) =>
-    ApiResult(t"ran", value.or(t""), tpe.or(t""), output, name.or(t""), diagnostics)
+    ApiResult(t"ran", value.or(t""), tpe.or(t""), output, name.or(t""), plain(diagnostics))
 
   case Repl.Reply.Threw(_, output, diagnostics, _) =>
-    ApiResult(t"error", output = output, diagnostics = diagnostics)
+    ApiResult(t"error", output = output, diagnostics = plain(diagnostics))
 
-  case Repl.Reply.Rejected(_, diagnostics, _) => ApiResult(t"error", diagnostics = diagnostics)
-  case Repl.Reply.Crashed(_, diagnostics, _)  => ApiResult(t"error", diagnostics = diagnostics)
+  case Repl.Reply.Rejected(_, diagnostics, _) => ApiResult(t"error", diagnostics = plain(diagnostics))
+  case Repl.Reply.Crashed(_, diagnostics, _)  => ApiResult(t"error", diagnostics = plain(diagnostics))
   case Repl.Reply.Failed(_, message)          => ApiResult(t"error", diagnostics = message)
   case _                                      => ApiResult(t"error")
+
+// The REST API's sessions render as `Inspect`, so a diagnostic is coloured ANSI (types re-rendered
+// through stenography); strip the ANSI so the JSON carries clean text with the stenography-rendered
+// type names intact.
+private def plain(diagnostics: Text): Text = SemanticRender.stripAnsi(diagnostics)
 
 // The `Content-Type` for every JSON API response, and a helper that frames a JSON string as a
 // fixed-length body under a given status (`Http.Status` carries an `apply(headers, body)`).
@@ -815,7 +835,7 @@ private def jsonResponse(status: Http.Status, body: Text): Http.Response =
 // Blocks until `quit` is fulfilled (the CLI completes it on Ctrl+C; the standalone `web`
 // main passes one that is never fulfilled and relies on the JVM's own signal handling).
 def serveHttp(port: Int, quit: Promise[Unit])(using Monitor, System, Probate, Classloader): Unit =
-  given Scalac[3.8, Universe.Classfile] = Scalac(Nil)
+  given Scalac[3.9, Universe.Classfile] = Scalac(Nil)
 
   // Multiple named sessions — each browser connection auto-starts a fresh randomly-named session and
   // may `/session`-switch to any other. Result values render as HTML (via `flame.HtmlRender`'s
@@ -840,7 +860,7 @@ def serveHttp(port: Int, quit: Promise[Unit])(using Monitor, System, Probate, Cl
   // `push` sends an unsolicited frame to THIS browser (via the connection's WebSocket channel), used
   // to deliver an async submission's result out-of-band once it is ready.
   def respondJson(current: juca.AtomicReference[Text], push: Text => Unit, payload: Text): Text =
-    def session: Optional[Repl[3.8]] = sessions.session(current.get.nn)
+    def session: Optional[Repl[3.9]] = sessions.session(current.get.nn)
 
     safely(payload.read[Json].as[WebRequest]).let: request =>
       request.kind match
@@ -869,7 +889,7 @@ def serveHttp(port: Int, quit: Promise[Unit])(using Monitor, System, Probate, Cl
             WebReply(t"result", request.seq, t"", t"", Repl.messages.unknownCommand(code), t"", Nil).in[Json].show
           else
             session.lay
-             (WebReply(t"error", request.seq, t"", t"", t"", t"flame: no active session", Nil).in[Json].show): repl =>
+             (WebReply(t"error", request.seq, t"", t"", t"", t"No active session", Nil).in[Json].show): repl =>
               if !repl.asyncEnabled then resultReply(request.seq, repl.react(request.seq, code)).in[Json].show
               else
                 // Async mode: acknowledge with `pending` IMMEDIATELY (pushed directly, so it is sent
@@ -914,7 +934,7 @@ def serveHttp(port: Int, quit: Promise[Unit])(using Monitor, System, Probate, Cl
           . in[Json].show
 
         case _ =>
-          WebReply(t"error", request.seq, t"", t"", t"", t"flame: unknown request", Nil).in[Json].show
+          WebReply(t"error", request.seq, t"", t"", t"", t"Unknown request", Nil).in[Json].show
 
     . or(t"")
 
@@ -990,8 +1010,9 @@ def serveHttp(port: Int, quit: Promise[Unit])(using Monitor, System, Probate, Cl
       // A plain request/response HTTP API over an INDEPENDENT plain-text session registry
       // (`apiSessions`), served alongside the browser UI and WebSocket. `POST /api/sessions` creates a
       // session; `GET /api/sessions` lists them; `POST /api/sessions/{name}/eval` runs the JSON body's
-      // `code` on that session and returns the result as JSON. Routing is exact-string (like the arms
-      // above), so the `{name}` path segment is peeled off by stripping the fixed prefix and suffix.
+      // `code` on that session; `POST /api/sessions/{name}/complete` returns the tab-completion
+      // candidates at a cursor `offset` in `code`. Routing is exact-string (like the arms above), so
+      // the `{name}` path segment is peeled off by stripping the fixed prefix and suffix.
       case t"/api/sessions" if request.method == Http.Post =>
         jsonResponse(Http.Ok, ApiSessionCreated(apiSessions.create()).in[Json].show)
 
@@ -1014,10 +1035,33 @@ def serveHttp(port: Int, quit: Promise[Unit])(using Monitor, System, Probate, Cl
             case _ =>
               jsonResponse(Http.BadRequest, ApiError(t"the request body must be JSON: {\"code\": \"…\"}").in[Json].show)
 
+      case target if request.method == Http.Post
+                     && target.starts(t"/api/sessions/") && target.ends(t"/complete") =>
+        val name: Text = target.strip(t"/api/sessions/").strip(t"/complete", Rtl)
+
+        apiSessions.session(name).lay
+         (jsonResponse(Http.NotFound, ApiError(t"no session named '$name'").in[Json].show)): repl =>
+          // Body is `{"code": "…", "offset": N}`; a stream/parse failure yields `Unset` → 400. The
+          // cursor is clamped to the code, then the engine's completions at that point are returned —
+          // Scala members/keywords, or the `/`-command completions when `code` starts with `/`.
+          safely(request.body().memoize.utf8.read[Json].as[ApiComplete]) match
+            case req: ApiComplete =>
+              val offset: Int = req.offset.max(0).min(req.code.length)
+              val items: List[ApiCompletion] =
+                repl.completionsAt(req.code, offset).map: item =>
+                  ApiCompletion(item.name, item.kind, item.signature)
+
+              jsonResponse(Http.Ok, ApiCompletions(items).in[Json].show)
+
+            case _ =>
+              jsonResponse
+               (Http.BadRequest,
+                ApiError(t"the request body must be JSON: {\"code\": \"…\", \"offset\": N}").in[Json].show)
+
       case _ =>
         Http.Response(Http.NotFound)(t"not found")
 
-  java.lang.System.out.nn.println("flame: serving the web REPL (press Ctrl+C to stop):")
+  java.lang.System.out.nn.println("Serving the web REPL (press Ctrl+C to stop):")
   java.lang.System.out.nn.println(s"  http://localhost:$port/")
   quit.attend()
   safely(service.cancel())

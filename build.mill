@@ -21,11 +21,13 @@ object settings:
   // rejects flame's (and Soundness's) capture-checked code in its `cc` phase, and cannot read
   // `mandible`/`hyperbole` TASTy. A standard-Scala build was attempted and abandoned for these
   // reasons.
-  val scalaVersion = sys.env.getOrElse("SOUNDNESS_SCALA_VERSION", "3.9.0-RC1-propensive")
+  // Moved to the 3.9.0-RC4 stream (matching Soundness origin/main) for `-Xsemantic-diagnostics`,
+  // the compiler support behind the `delicious` semantic-diagnostics module. From RC4-p1 the tag
+  // and jar-coordinate version coincide, so no `-propensive` suffix.
+  val scalaVersion = sys.env.getOrElse("SOUNDNESS_SCALA_VERSION", "3.9.0-RC4-p6")
   // The propensive/proscala release the toolchain jars are downloaded from (unless a local
-  // `SOUNDNESS_SCALA_HOME` is set), exactly as in the Soundness build. `3.9.0-RC1-p3` ships jars
-  // built as the `scalaVersion` coordinate `3.9.0-RC1-propensive`.
-  val scalaRelease = sys.env.getOrElse("SOUNDNESS_SCALA_RELEASE", "3.9.0-RC1-p3")
+  // `SOUNDNESS_SCALA_HOME` is set), exactly as in the Soundness build.
+  val scalaRelease = sys.env.getOrElse("SOUNDNESS_SCALA_RELEASE", "3.9.0-RC4-p6")
   // Empty by default → download `scalaRelease`. Set to a local `make`-built `release` directory
   // to use its `release/lib` jars directly (fork-developer mode).
   val scalaHome = sys.env.getOrElse("SOUNDNESS_SCALA_HOME", "")
@@ -84,7 +86,13 @@ object settings:
   val coreDeps = Seq(
     mvn"dev.soundness:soundness-all:$soundnessVersion",
     mvn"dev.soundness:hyperbole-core:$soundnessVersion",
-    mvn"dev.soundness:mandible-core:$soundnessVersion")
+    mvn"dev.soundness:mandible-core:$soundnessVersion",
+    // `delicious` interprets the compiler's `-Xsemantic-diagnostics` markup and re-renders the types
+    // it carries through stenography; the `scala` sub-module (the TASTy-unpickling `Reifier`) is
+    // compiler-backed, hence not in the `soundness-all` umbrella.
+    mvn"dev.soundness:delicious-core:$soundnessVersion",
+    mvn"dev.soundness:delicious-scala:$soundnessVersion",
+    mvn"dev.soundness:delicious-ansi:$soundnessVersion")
 
   val clientDeps = Seq(
     mvn"dev.soundness:ethereal-core:$soundnessVersion",

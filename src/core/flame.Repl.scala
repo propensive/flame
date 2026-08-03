@@ -78,11 +78,8 @@ object Repl:
       def objectName(index: Int): Text = t"rs$$line$$$index"
 
       def wrap(index: Int, history: List[Text], imports: List[Text], code: Text): Text =
-        // `import p.*` brings regular members into scope but NOT `given` instances (Scala 3),
-        // so `given` selector too — otherwise a `given` declared on an earlier line would be
-        // invisible to later ones, unlike a `val`/`def`.
-        val historyImports = history.map: previous =>
-          t"  import $previous.{given, *}"
+        val historyImports = history.map: statement =>
+          t"  $statement"
 
         val body = code.cut(t"\n").map: line =>
           t"  $line"
@@ -97,6 +94,9 @@ object Repl:
 
   trait Layout:
     def objectName(index: Int): Text
+
+    // `history` holds fully-rendered import statements (one per prior wrapper object), not
+    // object names: the session renders them itself so it can exclude shadowed members.
     def wrap(index: Int, history: List[Text], imports: List[Text], code: Text): Text
 
   enum Outcome:
@@ -289,8 +289,11 @@ object Repl:
   // line is completed in import position (a package/member path); anything else is wrapped
   // as `val __completion = <code>` so a bare expression is valid to complete against. The
   // caret is shifted past the whole prefix. Each candidate's `Syntax` signature is rendered
-  // to text for the wire.
-  def complete(context: List[Text], code: Text, offset: Int)(using Scalac[?, ?], LocalClasspath)
+  // to text for the wire, abbreviated against `imports` — the session scope — so a completion for a
+  // session-defined member reads as the user would write it (`Foo.Bar.type`, not
+  // `<empty>.rs$line$3.Foo.Bar.type`), exactly as the result line and diagnostics do.
+  def complete(context: List[Text], code: Text, offset: Int, imports: stenography.Imports)
+      (using Scalac[?, ?], LocalClasspath)
   :   List[CompletionItem] =
     import highlighting.typecheckedScala
 
@@ -315,7 +318,7 @@ object Repl:
     // items are dropped here — otherwise every keyword would be offered twice.
     Scala.highlight(wrapped, caret = caret.z).completions.lay(Nil): completions =>
       completions.items.filter(_.kind != prophesy.Completion.Kind.Keyword).map: item =>
-        CompletionItem(item.name, item.kind.toString.tt, item.signature.qualified)
+        CompletionItem(item.name, item.kind.toString.tt, item.signature.text(using imports))
 
   private def identifierChar(char: Char): Boolean = char.isLetterOrDigit || char == '_'
 
@@ -583,25 +586,24 @@ object Repl:
   def isCommand(line: Text): Boolean = commandTokens.contains(line.cut(t" ").head)
 
   // The user-facing status/notice lines that BOTH front-ends show, kept here so the CLI and the web
-  // stay word-for-word identical. Each is a complete line carrying the `flame:` program prefix (as the
-  // engine's other messages, e.g. `/tasty` usage, already do); the front-end adds its own trailing
-  // newline (CLI) or styling (web).
+  // stay word-for-word identical. Each is a complete line, e.g. `/tasty` usage, already do); the
+  // front-end adds its own trailing newline (CLI) or styling (web).
   object messages:
-    def session(name: Text): Text = t"flame: session $name"
+    def session(name: Text): Text = t"Session $name"
 
     def sessionList(name: Text, names: List[Text]): Text =
-      t"flame: session $name — available: ${names.join(t", ")}"
+      t"Session $name — available: ${names.join(t", ")}"
 
-    def switched(name: Text): Text = t"flame: switched to session $name"
-    def noSession(name: Text): Text = t"flame: no session named '$name'"
+    def switched(name: Text): Text = t"Switched to session $name"
+    def noSession(name: Text): Text = t"No session named '$name'"
 
     def joinFailed(requested: Text, started: Text): Text =
-      t"flame: no session named '$requested' — started session $started"
+      t"No session named '$requested' — started session $started"
 
-    def unknownCommand(line: Text): Text = t"flame: unknown command: $line"
+    def unknownCommand(line: Text): Text = t"Unknown command: $line"
 
     val serverRestarted: Text =
-      t"flame: the server restarted — your previous session (definitions, imports and settings) was lost"
+      t"The server restarted — your previous session (definitions, imports and settings) was lost"
 
   // The Scala type of an expression, read from a typechecked highlight of
   // `<context> val __result = <code>`: the binding's token carries the resolved type as a
@@ -620,7 +622,9 @@ object Repl:
   // `Unset` when the base does not begin with a letter or isn't a plain type name (function,
   // tuple, intersection, literal types), so the caller falls back to `resN`.
   def baseName(qualified: Text): Optional[Text] =
-    val q: Text = qualified.trim
+    // A SINGLETON type (an object's type, `Foo.Bar.type`) names its binding after the object, not
+    // after the `type` suffix — which, being a keyword, would otherwise mint `type2`, `type3`, ….
+    val q: Text = qualified.trim.strip(t".type", Rtl).trim
     if q.contains(t"=>") then Unset else
       // Soundness infix `X is Y [by Z]` names the trait `Y`; otherwise take the type
       // constructor (strip any `[…]` type arguments) and its last dotted segment.
@@ -639,15 +643,32 @@ object Repl:
   // taken if it's a keyword or already resolves in the session scope (a prior binding or an
   // imported name) — reusing it would shadow, or make two same-scope wildcard imports ambiguous
   // on a later line. Resolution is checked by asking the compiler to complete the bare name.
+  // NOTE: each `taken` check is a full compiler run; `evaluate` no longer uses this (see the
+  // compile-free `Repl#freeBindingName`), so it remains only for external callers.
   def freeName(base: Text, context: List[Text])(using Scalac[?, ?], LocalClasspath): Text =
     def taken(candidate: Text): Boolean =
       allKeywords.contains(candidate)
-      || complete(context, candidate, candidate.length).exists(_.name == candidate)
+      || complete(context, candidate, candidate.length, stenography.Imports.empty)
+          .exists(_.name == candidate)
 
     if !taken(base) then base else
       var n = 2
       while taken(t"$base${n.toString.tt}") do n += 1
       t"$base${n.toString.tt}"
+
+  // The declaration keywords that can open a line which can NEVER be an expression, so `evaluate`
+  // skips the try-as-expression compile and its result-type probe — two compiler runs that could
+  // only fail at the parser. (`val`/`var`/`def`, possibly behind modifiers, are recognised by
+  // `definitionKind` instead; a line opening with a MODIFIER alone still takes the expression-first
+  // path, which remains correct, just unoptimised.)
+  private val declarationKeywords: Set[Text] =
+    Set(t"import", t"export", t"class", t"trait", t"object", t"enum", t"given", t"type", t"package")
+
+  def neverExpression(line: Text): Boolean =
+    definitionKind(line).present || {
+      val first: Text = line.trim.s.takeWhile(_.isLetter).nn.tt
+      declarationKeywords.contains(first)
+    }
 
   // Whether `code` is a single bare identifier — an existing name typed on its own, with no
   // operator, selection, application, or whitespace. Such a line is echoed under that very name
@@ -771,11 +792,13 @@ object Repl:
   // A `def`'s displayed signature: its header, plus the inferred return type when the source omits
   // one (`def f(a: Int) = a` → `def f(a: Int): Int`). Inference typechecks the def applied to `???`s;
   // if that fails (an unusual signature), the header is shown without a return type.
-  def defSignature(line: Text, name: Text, context: List[Text])(using Scalac[?, ?], LocalClasspath): Text =
+  def defSignature(line: Text, name: Text, context: List[Text], imports: stenography.Imports)
+      (using Scalac[?, ?], LocalClasspath)
+  :   Text =
     val header: Text = defHeader(line)
     if annotatesReturnType(header) then header else
       val probe: Text = t"{ $line\n${defApplication(header, name)} }"
-      safely(resultType(context, probe)).let(_.qualified) match
+      safely(resultType(context, probe)).let(_.text(using imports)) match
         case tpe: Text => t"$header: $tpe"
         case _         => header
 
@@ -834,10 +857,24 @@ class Repl[version <: Scalac.Versions]
   @volatile
   private var completionCache: Map[Text, List[Repl.CompletionItem]] = Map()
 
+  // Semantic diagnostics (`-Xsemantic-diagnostics`): a shared `delicious.Reifier` unpickles the TASTy
+  // embedded in error messages so their types re-render through stenography. It embeds a compiler, so
+  // it is EXPENSIVE — built lazily, only when a diagnostic actually carries semantic markup, and
+  // dropped when `/classload` changes the classpath (so a newly-loaded library's types reify too).
+  @volatile
+  private var reifierCache: Optional[delicious.Reifier] = Unset
+
   private var index:   Int        = 0
   private var result:  Int        = 0
   private var history: List[Text] = Nil
   private var seeded:  Boolean     = false
+
+  // Each wrapper object's exported member names (decoded), captured by reflection right
+  // after its compilation. Needed to let a later definition SHADOW an earlier one of the
+  // same name: all the history imports sit in a single scope, where two wildcard imports
+  // both binding `x` make every use of `x` ambiguous — so each earlier wrapper's import
+  // must exclude the names that a later wrapper re-defines (see `historyImports`).
+  private var historyMembers: Map[Text, Set[Text]] = Map()
 
   // The user's persistent imports. An `import` statement creates no member, so — unlike
   // the `val`/`def`/`class` definitions that later lines see through the history imports
@@ -880,6 +917,67 @@ class Repl[version <: Scalac.Versions]
   private lazy val replLoader: ReplLoader = ReplLoader(classloader.java)
   private lazy val loader: Classloader = new Classloader(replLoader)
 
+  // The decoded member names a wrapper object exports, read by reflection WITHOUT
+  // initializing the class (the body — the user's code — must run only once, at the
+  // line's own evaluation). Synthetic members (`MODULE$`, lambdas — anything with `$`
+  // left in its decoded name) are dropped. A bare `type` alias leaves no trace in
+  // bytecode, so a re-defined alias cannot be shadowed this way — an accepted
+  // limitation.
+  private def wrapperMembers(name: Text): Set[Text] =
+    try
+      def names[member](array: Array[member | Null] | Null)(name: member => String)
+      :   List[String] =
+        val elements = array.nn
+        List.range(0, elements.length).map { index => name(elements(index).nn) }
+
+      val cls     = Class.forName(t"$name$$".s, false, replLoader).nn
+      val methods = names(cls.getDeclaredMethods)(_.getName.nn)
+      val fields  = names(cls.getDeclaredFields)(_.getName.nn)
+      val classes = names(cls.getDeclaredClasses)(_.getSimpleName.nn)
+
+      (methods ::: fields ::: classes)
+        .map { each => scala.reflect.NameTransformer.decode(each) }
+        .filter { each => each.indexOf('$') < 0 }
+        .map(_.tt)
+        .to(Set)
+
+    catch case _: Throwable => Set()
+
+  // A binding name for a new result: `base` if free, else `base2`, `base3`, … A candidate is taken
+  // if it is a keyword or a name a prior wrapper (or the prelude seed) already binds — reusing one
+  // would shadow it confusingly. Checked against `historyMembers` (each wrapper's reflected
+  // exports), so — unlike the compiler-completion probe `Repl.freeName` runs — it costs NO compiler
+  // run. A name bound only by an IMPORT is deliberately reusable: the new binding shadows it
+  // (standard REPL behaviour), exactly as `historyImports`' exclusions arrange between wrappers.
+  private def freeBindingName(base: Text): Text =
+    val bound: Set[Text] = historyMembers.values.foldLeft(Set[Text]())(_ ++ _)
+    def taken(candidate: Text): Boolean =
+      Repl.allKeywords.contains(candidate) || bound.contains(candidate)
+
+    if !taken(base) then base else
+      var n = 2
+      while taken(t"$base${n.toString.tt}") do n += 1
+      t"$base${n.toString.tt}"
+
+  // The import statements exposing the prior wrapper objects' members (and givens) to
+  // the next line. They all sit in ONE scope, where two wildcard imports both binding
+  // `x` make every use of `x` ambiguous — so, to let a later definition SHADOW an
+  // earlier one of the same name (standard REPL behaviour), each earlier wrapper's
+  // import excludes every member that a later wrapper re-defines, leaving exactly one
+  // binding per name.
+  private def historyImports: List[Text] =
+    val exports: List[Set[Text]] = history.map { name => historyMembers.getOrElse(name, Set()) }
+
+    history.zip(exports).zipWithIndex.map: (line, position) =>
+      val (name, members) = line
+      val later: Set[Text] = exports.drop(position + 1).fold(Set())(_ ++ _)
+      val hidden: List[Text] = members.intersect(later).to(List).sortBy(_.s)
+
+      if hidden.isEmpty then t"import $name.{given, *}"
+      else
+        val exclusions = hidden.map { member => t"`$member` as _" }.join(t", ")
+        t"import $name.{$exclusions, given, *}"
+
   // The compile classpath must come from the *same* loader the wrapper objects
   // are run against (`classloader`, below), not from `classloaders.threadContext`:
   // `interpret` may run on a background worker thread (the TCP accept loop) whose
@@ -896,6 +994,119 @@ class Repl[version <: Scalac.Versions]
     // The `/classload` entries come last, so the base classpath (the scala library, soundness, …)
     // always resolves first and an added JAR only supplements it.
     LocalClasspath((entries ::: extraEntries)*)
+
+  // The shared reifier for semantic diagnostics, built lazily against the current classpath (its
+  // types resolve there). `reifierCache` is cleared by `/classload`, so the next diagnostic rebuilds
+  // it with the enlarged classpath.
+  private def semanticReifier(using System): delicious.Reifier = reifierCache.or:
+    val created = delicious.Reifier(classpath)
+    reifierCache = created
+    created
+
+  // The stenography `Imports` a rendered type is abbreviated against — so a type in an error message
+  // reads the way the user would WRITE it (`Int`, not `scala.Int`; `ListBuffer`, not
+  // `scala.collection.mutable.ListBuffer`). A WILDCARD import (`import p.*`) puts the prefix `p` in
+  // `typenames`, so any `p.Foo` shows as `Foo`; a SPECIFIC import (`import p.Foo`) puts `p#Foo` in
+  // `direct`, so exactly that type shows as `Foo`. The always-in-scope compiler imports (`scala`,
+  // `java.lang`, `scala.Predef`, `scala.collection.immutable`) and the REPL's own wrapper objects (so a
+  // user-defined type shows unqualified) are seeded too. Every user-facing rendering of a type goes
+  // through these: the result line, a `def`'s signature, completion signatures and diagnostics.
+  private def semanticImports: stenography.Imports =
+    import stenography.Typename
+    var typenames: Set[Typename] = Set()
+    var direct:    Set[Typename] = Set()
+
+    // A `Typename` node is either a TERM (an object or a package) or a TYPE (a class or a trait), and
+    // `has` is an exact match — but a prefix's TEXT does not say which shape each of its nodes takes,
+    // and the sources disagree: `Typename.apply` builds every node as a term, while a prefix reified
+    // from pickled TASTy may carry type nodes (a package's own type does, which is why `<root>.<empty>`
+    // as a term never matched the reifier's `<root>.<empty>` with a type node). So seed EVERY shape
+    // combination of the prefix's nodes — 2^(n-1) for n segments, a handful for the 2–4 segment
+    // prefixes involved. (The same wrinkle `directType` handles below for a specific import.)
+    def wildcard(prefix: Text): Unit =
+      if prefix != t"" then prefix.cut(t".").to(List) match
+        case Nil          => ()
+        case head :: tail =>
+          typenames ++= tail.foldLeft(List[Typename](Typename.Top(head))): (parents, name) =>
+            parents.flatMap: parent =>
+              List(Typename.Term(parent, name), Typename.Type(parent, name))
+
+    def directType(full: Text): Unit =
+      // `hasDirect` is an EXACT `Typename` match. A reified type is a `Typename.Type` (its final node is
+      // a class/trait/type), but `Typename.apply` always builds the final node as a `Term` — so the two
+      // never match unless we construct the `Type` node ourselves. Seed both the `Type` shape (a
+      // class/trait/type — the usual case) and the `Term` shape (an object member) so either matches.
+      val dot = full.s.lastIndexOf('.')
+      if dot < 0 then direct += Typename(full)
+      else
+        val parent: Typename = Typename(full.keep(dot))
+        val name:   Text     = full.skip(dot + 1)
+        direct += Typename.Type(parent, name)
+        direct += Typename.Term(parent, name)
+
+    List(t"scala", t"java.lang", t"scala.Predef", t"scala.collection.immutable").each(wildcard)
+
+    // The wrapper objects are top-level in the EMPTY package, so the compiler spells a session-defined
+    // type `<empty>.rs$line$3.Foo` — two prefixes that are pure session bookkeeping and that the user
+    // never writes. Both are elided by the same mechanism as any other in-scope prefix: each wrapper's
+    // members ARE wildcard-imported into every line (`historyImports`), so seeding the wrapper as a
+    // wildcard prefix is exactly the truth about the scope. It must be seeded AS THE COMPILER SPELLS
+    // IT, empty package included — a bare `rs$line$3` is a different `Typename` and never matched,
+    // which is why the prefix used to leak. Seeding the empty package itself covers any other
+    // top-level name. Abbreviation is structural, so it composes at any depth: `Foo`, `Foo.Bar.type`,
+    // `List[Foo.Bar.type]`. The wrapper CURRENTLY being compiled is seeded too — a diagnostic from
+    // that line names the types the line itself defines.
+    //
+    // Every spelling of that root is seeded, because the sources of a rendered type disagree about it.
+    // A type read from a typechecked highlight (the result line, a `def`'s signature) roots at the
+    // empty package — `<empty>.rs$line$3.Foo` — while one reified from a diagnostic's pickled TASTy
+    // roots one level higher, at `<root>.<empty>.rs$line$3.Foo`. And the reified spelling of the empty
+    // package is TRUNCATED to `<empty`: stenography drops the last character of a `Module`-flagged
+    // name to turn a module class's `Foo$` into `Foo`, and the empty package is flagged a module but
+    // named `<empty>`, so it loses its `>`. None of these are namespaces the user can write, so all of
+    // them are elided; listing the spellings costs nothing and needs no upstream change.
+    // The roots themselves, so a name defined directly in the empty package abbreviates as well …
+    List(t"<root>", t"<empty>", t"<empty", t"<root>.<empty>", t"<root>.<empty").each(wildcard)
+
+    // … and every wrapper object beneath each of them.
+    val roots: List[Text] = List(t"", t"<empty>.", t"<empty.", t"<root>.<empty>.", t"<root>.<empty.")
+
+    (history :+ layout.objectName(index)).each: wrapper =>
+      roots.each { root => wildcard(t"$root$wrapper") }
+
+    (prelude.imports.map(_.tt) ::: imports).each: statement =>
+      val body: Text = statement.trim.skip(t"import ".length).trim
+      if body.ends(t".*") then wildcard(body.strip(t".*", Rtl))
+      else if body.contains(t"{") then
+        val prefix: Text = body.cut(t"{").head.trim.strip(t".", Rtl)
+        body.cut(t"{").last.cut(t"}").head.cut(t",").map(_.trim).filter(_ != t"").each: selector =>
+          if selector == t"*" || selector == t"given" then wildcard(prefix)
+          else
+            val name: Text = selector.cut(t"=>").head.trim  // a renamed import (`Foo => Bar`) keeps `Foo`
+            if name != t"" then directType(t"$prefix.$name")
+      else directType(body)
+
+    stenography.Imports(typenames, direct)
+
+  // Renders a resolved type for DISPLAY (a result line's `: type`, a `def`'s return type), abbreviated
+  // against the session's imports so it reads as the user wrote it — the same abbreviation the
+  // diagnostics use, rather than the fully-qualified `Syntax.qualified`.
+  private def renderType(syntax: Syntax): Text = syntax.text(using semanticImports)
+
+  // Renders `notices` to the reply's diagnostics string, re-rendering the types embedded in error
+  // messages through stenography when the compiler supplied semantic markup (`-Xsemantic-diagnostics`);
+  // otherwise the plain messages. Types are abbreviated against the session's imports (`semanticImports`)
+  // so they read as the user wrote them. The output targets THIS session's front-end (`render`):
+  // coloured ANSI for `Inspect` (the CLI), HTML for `Html` (the web). The (expensive) reifier is built
+  // only when some notice actually carries markup.
+  private def renderDiagnostics(notices: List[Notice])(using System): Text =
+    if notices.isEmpty then t"" else
+      given stenography.Imports = semanticImports
+
+      val reifier: Optional[delicious.Reifier] =
+        if notices.exists(_.markup.present) then semanticReifier else Unset
+
+      SemanticRender.render(notices, reifier, render == Repl.Rendering.Html)
 
   // The compiler to use for the next line: the session's `Scalac` plus the flag of every setting the
   // user has switched on (`/set <name>`). `Scalac.Option` is contravariant in its version, so an
@@ -919,7 +1130,13 @@ class Repl[version <: Scalac.Versions]
     val quiet: Scalac.Option[version] =
       Scalac.Option[version](t"-Wconf:msg=reserved for internal compiler use:s")
 
-    Scalac(scalac.options ::: quiet :: extra)
+    // Emit SEMANTIC diagnostics: the compiler wraps each type it interpolates into an error message
+    // with in-band markers carrying pickled TASTy, which `delicious` re-renders through stenography
+    // (see `SemanticRender`). Harmless when unused — a plain consumer reads the marker-stripped message.
+    val semantic: Scalac.Option[version] =
+      Scalac.Option[version](t"-Xsemantic-diagnostics")
+
+    Scalac(scalac.options ::: quiet :: semantic :: extra)
 
   // A line that has been COMPILED but not necessarily run. `compile` returns this so `react` can
   // commit the (mutable, mutex-guarded) session state during compilation and then run the object
@@ -952,7 +1169,7 @@ class Repl[version <: Scalac.Versions]
   :   (Built^{onOutput, this, rendered}) logs CompileEvent raises CompilerError raises AsyncError =
 
     val name:    Text = layout.objectName(index)
-    val source:  Text = layout.wrap(index, history, imports, code)
+    val source:  Text = layout.wrap(index, historyImports, imports, code)
     val process       = effectiveScalac(classpath)(Map(t"$name.scala" -> source), out)
     val outcome       = process.complete()
     val notices       = process.notices.to(List)
@@ -967,6 +1184,7 @@ class Repl[version <: Scalac.Versions]
       case CompileResult.Success =>
         index += 1
         history = history :+ name
+        historyMembers = historyMembers.updated(name, wrapperMembers(name))
 
         Built.Deferred: () =>
           // Capture whatever the user's code prints to stdout. Scala's `println` writes to
@@ -1034,12 +1252,39 @@ class Repl[version <: Scalac.Versions]
 
     (last.trim :: parts).reverse.filter(_ != t"")
 
+  // A persistent import whose ROOT names a session definition — `import Foo.Bar`, where `Foo` was
+  // defined on an earlier line — cannot be re-injected verbatim: the persistent imports are emitted
+  // at FILE scope, outside the wrapper object, whereas `Foo` is a member of an earlier wrapper and
+  // is only in scope INSIDE the wrapper, through the history imports. (On the line that introduces
+  // it the import sits in the wrapper body, so it compiles; every later line would then fail with
+  // `Not found: Foo`.) Such a root is therefore requalified against the wrapper object that defines
+  // it — `import rs$line$3.Foo.Bar` — which resolves from anywhere. The LAST wrapper binding the
+  // name wins, matching the shadowing that the history imports' exclusions arrange between wrappers,
+  // and matching a REPL's late binding: redefining `Foo` repoints an earlier `import Foo.Bar`.
+  // The user-written form is what `imports` stores, so `/context` and `/unimport` still show and
+  // match the import as it was typed.
+  private def qualifyImport(statement: Text): Text =
+    val body: Text = importClause(statement)
+    val root: Text = body.cut(t".").head.trim
+
+    val owner: Option[Text] =
+      history.reverse.find { wrapper => historyMembers.getOrElse(wrapper, Set()).contains(root) }
+
+    owner match
+      case Some(wrapper) => t"import $wrapper.$body"
+      case _             => statement
+
+  // The user's persistent imports, in the form they must take outside the wrapper object.
+  private def sessionImports: List[Text] = imports.map(qualifyImport)
+
   // The imports to prepend to a line's wrapper: the prelude's plus the user's accumulated
   // imports, minus any the line itself repeats (so re-importing the same path never makes
   // a duplicate import within one wrapper's scope).
   private def contextImports(line: Text): List[Text] =
     val repeated = importsIn(line)
-    (prelude.imports.map(_.tt) ::: imports).filter { each => !repeated.contains(each) }
+    def keep(statement: Text): Boolean = !repeated.contains(statement)
+
+    prelude.imports.map(_.tt).filter(keep) ::: imports.filter(keep).map(qualifyImport)
 
   // The two lines that render the value bound to `ref` and stash the rendering under `key` for
   // the outcome: an `@experimental` initializer (experimental mode is enabled just here, since
@@ -1095,7 +1340,7 @@ class Repl[version <: Scalac.Versions]
   :   (Built^{onOutput, this}) logs CompileEvent raises CompilerError raises AsyncError =
 
     val expr: Text = line.skip(t"/tasty".length).trim
-    if expr == t"" then Built.Complete(Outcome.Ran(Nil, Unset, t"flame: usage: /tasty <expression>\n"))
+    if expr == t"" then Built.Complete(Outcome.Ran(Nil, Unset, t"Usage: /tasty <expression>\n"))
     else compile(contextImports(line), tastyProbe(expr), onOutput)(Unset)
 
   // `/bytecode <code>` disassembles the JVM bytecode of an expression or definition — e.g. `/bytecode
@@ -1109,14 +1354,14 @@ class Repl[version <: Scalac.Versions]
   private def bytecode(line: Text)(using Monitor, System, Probate)
   :   Built logs CompileEvent raises CompilerError raises AsyncError = Built.Complete:
     val code: Text = line.skip(t"/bytecode".length).trim
-    if code == t"" then Outcome.Ran(Nil, Unset, t"flame: usage: /bytecode <expression or definition>\n")
+    if code == t"" then Outcome.Ran(Nil, Unset, t"Usage: /bytecode <expression or definition>\n")
     else
       given LocalClasspath = classpath
       val name: Text = layout.objectName(index)
 
       // Compile `body` as the wrapper object's contents, returning the result and its notices.
       def attempt(body: Text): (CompileResult, List[Notice]) =
-        val source  = layout.wrap(index, history, contextImports(line), body)
+        val source  = layout.wrap(index, historyImports, contextImports(line), body)
         val process = effectiveScalac(classpath)(Map(t"$name.scala" -> source), out)
         (process.complete(), process.notices.to(List))
 
@@ -1130,10 +1375,48 @@ class Repl[version <: Scalac.Versions]
           index += 1
           BytecodeRender.render(t"$name$$.class")(using loader) match
             case rendered: Text if rendered.trim != t"" => Outcome.Ran(Nil, Unset, t"$rendered\n")
-            case _ => Outcome.Ran(Nil, Unset, t"flame: no bytecode was produced\n")
+            case _ => Outcome.Ran(Nil, Unset, t"No bytecode was produced\n")
 
         case CompileResult.Crash(trace) => Outcome.Crashed(notices, trace)
         case CompileResult.Failure      => Outcome.Rejected(notices)
+
+  // The definition/statement path of `evaluate`: a `val`/`var`/`def` is displayed like an auto-named
+  // expression (name/value/type, or a `def`'s signature); everything else (imports, `given`/`class`/…,
+  // plain statements) keeps its no-output behaviour. Reached directly for a line that can never be an
+  // expression (`Repl.neverExpression`), or as the fallback when the expression attempt is rejected.
+  private def definitionOrStatement
+    ( line: Text, key: Text, context: List[Text], onOutput: Text => Unit )
+    ( using Monitor, System, Probate )
+  :   (Built^{onOutput, this}) logs CompileEvent raises CompilerError raises AsyncError =
+
+    given LocalClasspath = classpath
+
+    Repl.definitionKind(line) match
+      case (t"val" | t"var", bound: Text) => valDefinition(line, bound, key, context, onOutput)
+
+      case (t"def", defName: Text) =>
+        // The signature is computed now (under the mutex, where the compiler is in use); the
+        // run itself produces no output for a `def`.
+        val signature: Text = Repl.defSignature(line, defName, context, semanticImports)
+        mapRan(compile(contextImports(line), line, onOutput)(Unset)):
+          ran => ran.copy(output = t"$signature\n")
+
+      case _ =>
+        // The line compiled as a statement; if it introduced imports, remember them now (under
+        // the mutex) so every later line re-establishes them, and confirm each on its own line
+        // once the statement has run.
+        compile(contextImports(line), line, onOutput)(Unset) match
+          case deferred @ Built.Deferred(_) =>
+            val introduced: List[Text] = importsIn(line)
+            imports = (imports ::: introduced).distinct
+
+            if introduced.isEmpty then deferred else
+              val confirmed: Text =
+                introduced.map { each => t"Imported ${importClause(each)}" }.join(t"", t"\n", t"\n")
+
+              mapRan(deferred) { ran => ran.copy(output = t"${ran.output}$confirmed") }
+
+          case complete => complete
 
   private def evaluate(line: Text, onOutput: Text => Unit)(using Monitor, System, Probate)
   :   (Built^{onOutput, this}) logs CompileEvent raises CompilerError raises AsyncError =
@@ -1144,24 +1427,40 @@ class Repl[version <: Scalac.Versions]
 
     // The scope this line sees, for typing the result and for checking name collisions.
     val context: List[Text] =
-      (prelude.imports.map(_.tt) ::: imports) ::: history.map { name => t"import $name.{given, *}" }
+      (prelude.imports.map(_.tt) ::: sessionImports) ::: historyImports
+
+    // A definition or declaration can never be an expression: go STRAIGHT to the definition/statement
+    // path, skipping the result-type probe and the try-as-expression compile — two whole compiler
+    // runs (each re-loading the session's import context) that could only fail at the parser.
+    if Repl.neverExpression(line) then definitionOrStatement(line, key, context, onOutput)
+    else expressionFirst(line, key, context, onOutput)
+
+  // The expression-first path of `evaluate` (see there): probe the result type, mint a binding name,
+  // and try the line bound as `val <name> = <line>`, falling back to `definitionOrStatement`.
+  private def expressionFirst
+    ( line: Text, key: Text, context: List[Text], onOutput: Text => Unit )
+    ( using Monitor, System, Probate )
+  :   (Built^{onOutput, this}) logs CompileEvent raises CompilerError raises AsyncError =
+
+    given LocalClasspath = classpath
 
     val syntax: Optional[Syntax] = safely(Repl.resultType(context, line))
-    val tpe:    Optional[Text]   = syntax.let(_.qualified)
+    val tpe:    Optional[Text]   = syntax.let(renderType)
 
     // A line that is just an existing identifier (it type-checks, so it resolves) is echoed under
     // that same name — no fresh `val`, no new numbered result. Otherwise the binding name is the
     // result type's base name, lowercased and made unique in scope (`list`, `list2`, …), falling
-    // back to `resN` when no letter-initial type name is available.
+    // back to `resN` when no letter-initial type name is available. Collision-checking the name
+    // (`freeBindingName`) consults the reflected wrapper members — no compiler run.
     val echo: Boolean = syntax.present && Repl.isBareIdentifier(line)
 
     val name: Text =
       if echo then line.trim
-      else tpe.let(Repl.baseName(_)).let(Repl.freeName(_, context)).or(t"res${result.toString.tt}")
+      else tpe.let(Repl.baseName(_)).let(freeBindingName).or(t"res${result.toString.tt}")
 
-    // Try the line as an expression first; a definition or import fails to parse as `val <name> =
-    // …` and falls back to being compiled as a plain statement. A bare identifier is inspected
-    // directly (`echoCode`) rather than re-bound.
+    // Try the line as an expression first; anything else fails to parse as `val <name> = …` and
+    // falls back to the definition/statement path. A bare identifier is inspected directly
+    // (`echoCode`) rather than re-bound.
     val code: Text = if echo then echoCode(name, key, line) else expressionCode(name, key, line)
 
     val expression: Built^{onOutput, this} = compile(contextImports(line), code, onOutput):
@@ -1169,35 +1468,7 @@ class Repl[version <: Scalac.Versions]
 
     expression match
       case Built.Complete(_: Outcome.Rejected) =>
-        // The line is a definition or statement, not an expression. A `val`/`var`/`def` is displayed
-        // like an auto-named expression (name/value/type, or a `def`'s signature); everything else
-        // (imports, `given`/`class`/…, plain statements) keeps its prior no-output behaviour.
-        Repl.definitionKind(line) match
-          case (t"val" | t"var", bound: Text) => valDefinition(line, bound, key, context, onOutput)
-
-          case (t"def", defName: Text) =>
-            // The signature is computed now (under the mutex, where the compiler is in use); the
-            // run itself produces no output for a `def`.
-            val signature: Text = Repl.defSignature(line, defName, context)
-            mapRan(compile(contextImports(line), line, onOutput)(Unset)):
-              ran => ran.copy(output = t"$signature\n")
-
-          case _ =>
-            // The line compiled as a statement; if it introduced imports, remember them now (under
-            // the mutex) so every later line re-establishes them, and confirm each on its own line
-            // once the statement has run.
-            compile(contextImports(line), line, onOutput)(Unset) match
-              case deferred @ Built.Deferred(_) =>
-                val introduced: List[Text] = importsIn(line)
-                imports = (imports ::: introduced).distinct
-
-                if introduced.isEmpty then deferred else
-                  val confirmed: Text =
-                    introduced.map { each => t"Imported ${importClause(each)}" }.join(t"", t"\n", t"\n")
-
-                  mapRan(deferred) { ran => ran.copy(output = t"${ran.output}$confirmed") }
-
-              case complete => complete
+        definitionOrStatement(line, key, context, onOutput)
 
       case Built.Complete(other) =>
         Built.Complete(other)
@@ -1229,7 +1500,7 @@ class Repl[version <: Scalac.Versions]
     given LocalClasspath = classpath
 
     val tpe: Optional[Text] =
-      safely(Repl.resultType(context, t"{ $line\n$bound }")).let(_.qualified)
+      safely(Repl.resultType(context, t"{ $line\n$bound }")).let(renderType)
 
     val lazyVal: Boolean =
       line.trim.cut(t" ").takeWhile { word => word != t"val" && word != t"var" }.contains(t"lazy")
@@ -1263,6 +1534,7 @@ class Repl[version <: Scalac.Versions]
       if errors.isEmpty then
         index += 1
         history = history :+ name
+        historyMembers = historyMembers.updated(name, wrapperMembers(name))
         Outcome.Ran(Nil, Unset, t"")
       else
         Outcome.Rejected(errors.map(Notice(Importance.Error, t"<seed>", _, Unset)))
@@ -1282,16 +1554,16 @@ class Repl[version <: Scalac.Versions]
     val arg: Text = line.trim.skip(t"/unimport".length).trim
 
     if arg == t"" then
-      if imports.isEmpty then Outcome.Ran(Nil, Unset, t"flame: no imports to remove\n")
+      if imports.isEmpty then Outcome.Ran(Nil, Unset, t"No imports to remove\n")
       else
         val listing = imports.map { each => t"  ${importClause(each)}" }.join(t"\n")
-        Outcome.Ran(Nil, Unset, t"flame: imports in scope (remove with /unimport <tokens>):\n$listing\n")
+        Outcome.Ran(Nil, Unset, t"Imports in scope (remove with /unimport <tokens>):\n$listing\n")
     else
       val (removed, kept) = imports.partition { each => importKey(each) == importKey(arg) }
-      if removed.isEmpty then Outcome.Ran(Nil, Unset, t"flame: no matching import to remove: $arg\n")
+      if removed.isEmpty then Outcome.Ran(Nil, Unset, t"No matching import to remove: $arg\n")
       else
         imports = kept
-        Outcome.Ran(Nil, Unset, t"flame: removed import: ${importClause(arg)}\n")
+        Outcome.Ran(Nil, Unset, t"Removed import: ${importClause(arg)}\n")
 
   // The `on`/`off` word of a `/set`/`/language <name> [on|off]` line — defaulting to on when omitted.
   private def enabledBy(rest: List[Text]): Boolean = rest match
@@ -1304,7 +1576,7 @@ class Repl[version <: Scalac.Versions]
   private def set(line: Text): Outcome = line.cut(t" ").filter(_ != t"") match
     case _ :: t"async" :: rest =>
       asyncMode = enabledBy(rest)
-      Outcome.Ran(Nil, Unset, t"flame: async ${if asyncMode then t"enabled" else t"disabled"}\n")
+      Outcome.Ran(Nil, Unset, t"Async ${if asyncMode then t"enabled" else t"disabled"}\n")
 
     case _ :: name :: rest => toggle(Kind.Set, t"setting", name, rest)
 
@@ -1314,7 +1586,7 @@ class Repl[version <: Scalac.Versions]
         t"  [$asyncMark] async — evaluate submissions asynchronously (slow results arrive later)"
         :: settingLines(Kind.Set, experimentalOn = true)
 
-      Outcome.Ran(Nil, Unset, t"flame: compiler settings (/set <name> [on|off]):\n${lines.join(t"\n")}\n")
+      Outcome.Ran(Nil, Unset, t"Compiler settings (/set <name> [on|off]):\n${lines.join(t"\n")}\n")
 
   // `/language <name> [on|off]` toggles an `import language.*` feature; `/language` with no name lists
   // the plain features always and the experimental ones once `/set experimental` is on.
@@ -1328,19 +1600,19 @@ class Repl[version <: Scalac.Versions]
 
       Outcome.Ran
        ( Nil, Unset,
-         t"flame: language features (/language <name> [on|off]):\n${settingLines(Kind.Language, expOn).join(t"\n")}$note\n" )
+         t"Language features (/language <name> [on|off]):\n${settingLines(Kind.Language, expOn).join(t"\n")}$note\n" )
 
   // Toggles the setting of `kind` named `name`, gating experimental language features on `experimental`
   // being enabled; `label` names the category for the messages.
   private def toggle(kind: Kind, label: Text, name: Text, rest: List[Text]): Outcome =
     Repl.settings.find { setting => setting.kind == kind && setting.name == name } match
       case Some(setting) if setting.experimental && !enabledSettings.contains(t"experimental") =>
-        Outcome.Ran(Nil, Unset, t"flame: $name is experimental — enable it first with `/set experimental`\n")
+        Outcome.Ran(Nil, Unset, t"$name is experimental — enable it first with `/set experimental`\n")
 
       case Some(setting) =>
         val enable: Boolean = enabledBy(rest)
         if enable then enabledSettings += name else enabledSettings -= name
-        Outcome.Ran(Nil, Unset, t"flame: $name ${if enable then t"enabled" else t"disabled"}\n")
+        Outcome.Ran(Nil, Unset, t"$name ${if enable then t"enabled" else t"disabled"}\n")
 
       case None =>
         val expOn = enabledSettings.contains(t"experimental")
@@ -1348,7 +1620,7 @@ class Repl[version <: Scalac.Versions]
           Repl.settings
            . filter { s => s.kind == kind && (!s.experimental || expOn) }.map(_.name).join(t", ")
 
-        Outcome.Ran(Nil, Unset, t"flame: unknown $label: $name (known: $known)\n")
+        Outcome.Ran(Nil, Unset, t"Unknown $label: $name (known: $known)\n")
 
   // The `[on|off] name — description` lines for the settings of `kind` (experimental ones only when
   // `experimentalOn`), for the no-argument `/set` / `/language` listings.
@@ -1371,7 +1643,7 @@ class Repl[version <: Scalac.Versions]
   private def showClasspath(using System): Outcome =
     val entries: List[Text] = classpath.entries.map(classpathEntryText)
     val listing: Text = entries.map { each => t"  $each" }.join(t"\n")
-    Outcome.Ran(Nil, Unset, t"flame: classpath (${entries.length.toString.tt} entries):\n$listing\n")
+    Outcome.Ran(Nil, Unset, t"Classpath (${entries.length.toString.tt} entries):\n$listing\n")
 
   // `/classload <file>` adds a JAR file or a directory to the classpath — for BOTH the compiler (so a
   // later line can `import` from it and type-check against it) and the run-time classloader (so the
@@ -1382,7 +1654,7 @@ class Repl[version <: Scalac.Versions]
   private def classload(line: Text)(using System): Outcome =
     val arg: Text = line.trim.skip(t"/classload".length).trim
 
-    if arg == t"" then Outcome.Ran(Nil, Unset, t"flame: usage: /classload <jar-file-or-directory>\n")
+    if arg == t"" then Outcome.Ran(Nil, Unset, t"Usage: /classload <jar-file-or-directory>\n")
     else
       // Resolve a relative path against the process working directory, then canonicalise (`.`/`..` and
       // symlinks), so a bare `lib.jar` works — matching what `/classload` tab-completion offers — and
@@ -1392,9 +1664,9 @@ class Repl[version <: Scalac.Versions]
       val resolved: Text = safely(ji.File(raw.s).getCanonicalPath.nn.tt).or(raw)
 
       safely(resolved.as[Path on Linux]).lay
-       (Outcome.Ran(Nil, Unset, t"flame: '$arg' is not a valid path\n")): path =>
+       (Outcome.Ran(Nil, Unset, t"'$arg' is not a valid path\n")): path =>
         if !path.exists() then
-          Outcome.Ran(Nil, Unset, t"flame: no such file or directory: ${path.encode}\n")
+          Outcome.Ran(Nil, Unset, t"No such file or directory: ${path.encode}\n")
         else
           val entry: ClasspathEntry.Directory | ClasspathEntry.Jar =
             if path.encode.ends(t".jar") || path.encode.ends(t".zip")
@@ -1402,21 +1674,22 @@ class Repl[version <: Scalac.Versions]
             else ClasspathEntry.Directory(path.encode)
 
           if extraEntries.contains(entry) then
-            Outcome.Ran(Nil, Unset, t"flame: already on the classpath: ${path.encode}\n")
+            Outcome.Ran(Nil, Unset, t"Already on the classpath: ${path.encode}\n")
           else
             extraEntries = extraEntries :+ entry
             replLoader.append(entry.javaUrl)  // make it visible to already-running code too
             completionCache = Map()           // the set of resolvable names has changed
-            Outcome.Ran(Nil, Unset, t"flame: added to the classpath: ${path.encode}\n")
+            reifierCache = Unset              // rebuild the diagnostics reifier with the new classpath
+            Outcome.Ran(Nil, Unset, t"Added to the classpath: ${path.encode}\n")
 
   // `/context` lists every import currently in scope — the prelude's baseline imports plus the
   // ones the user has added — so the session's namespace can be inspected without changing it.
   private def showContext: Outcome =
     val all = prelude.imports.map(_.tt) ::: imports
-    if all.isEmpty then Outcome.Ran(Nil, Unset, t"flame: no imports in scope\n")
+    if all.isEmpty then Outcome.Ran(Nil, Unset, t"No imports in scope\n")
     else
       val listing = all.map { each => t"  import ${importClause(each)}" }.join(t"\n")
-      Outcome.Ran(Nil, Unset, t"flame: imports in scope:\n$listing\n")
+      Outcome.Ran(Nil, Unset, t"Imports in scope:\n$listing\n")
 
   // Compiles `line` — committing session state (`index`, `history`, `imports`, `result`, seeding,
   // settings) — and returns the run DEFERRED (`Built`), so `react` can hold the compiler mutex only
@@ -1511,7 +1784,7 @@ class Repl[version <: Scalac.Versions]
     // The scope a compiled line would see: the prelude's and the user's persistent imports,
     // plus the prior wrapper objects' members and givens (as `import rs$line$N.{given, *}`).
     val context: List[Text] =
-      (prelude.imports.map(_.tt) ::: imports) ::: history.map { name => t"import $name.{given, *}" }
+      (prelude.imports.map(_.tt) ::: sessionImports) ::: historyImports
 
     // The full member list of `expr.`, compiled ONCE and cached under the base, so typing
     // further member characters (or backspacing) costs no recompilation. The base's type is
@@ -1519,7 +1792,7 @@ class Repl[version <: Scalac.Versions]
     // by member selection (`expr.partial`) and infix completion (`expr partial`).
     def members(base: Text): List[Repl.CompletionItem] =
       completionCache.get(base).getOrElse:
-        val items = safely(Repl.complete(context, base, base.length)).or(Nil)
+        val items = safely(Repl.complete(context, base, base.length, semanticImports)).or(Nil)
         completionCache = completionCache.updated(base, items)
         items
 
@@ -1545,7 +1818,7 @@ class Repl[version <: Scalac.Versions]
           case _ =>
             val (keywords, binding) = Repl.keywordCompletions(code, offset)
             if binding then keywords
-            else keywords ::: mutex(safely(Repl.complete(context, code, offset)).or(Nil))
+            else keywords ::: mutex(safely(Repl.complete(context, code, offset, semanticImports)).or(Nil))
 
   // Typecheck-highlights, compiles, and runs `code`, returning a `Reply` with the highlighting, the
   // result value, its rendered type, and any diagnostics. Only COMPILATION and the session-state
@@ -1574,15 +1847,20 @@ class Repl[version <: Scalac.Versions]
       case Outcome.Ran(notices, value, output, name, tpe) =>
         // `evaluate` has already chosen the binding name/type and suppressed the value of a bare
         // `Unit` EXPRESSION (a `Unit` `val`/`var` definition keeps its binding, so it still shows).
-        Repl.Reply.Ran(id, value, output, tpe, name, notices.map(_.message).join(t"; "), tokens)
+        Repl.Reply.Ran(id, value, output, tpe, name, renderDiagnostics(notices), tokens)
 
       case Outcome.Rejected(notices) =>
-        Repl.Reply.Rejected(id, notices.map(_.message).join(t"; "), tokens)
+        Repl.Reply.Rejected(id, renderDiagnostics(notices), tokens)
 
       case Outcome.Threw(_, error, output) =>
         // Render the exception's (trimmed) stack trace as a coloured teletype listing, rather than
-        // just its `toString`, so a thrown error surfaces where it came from.
-        Repl.Reply.Threw(id, output, StackTraceRender.render(error), tokens)
+        // just its `toString`, so a thrown error surfaces where it came from. A stack trace carries no
+        // interpolated types, so it needs no semantic rendering — but for the web (`Html`) its ANSI is
+        // stripped and HTML-escaped, since the diagnostics slot there is trusted HTML (see the web
+        // front-end), not plain text.
+        val trace: Text = StackTraceRender.render(error)
+        val rendered: Text = if render == Repl.Rendering.Html then SemanticRender.htmlPlain(trace) else trace
+        Repl.Reply.Threw(id, output, rendered, tokens)
 
       case Outcome.Crashed(notices, _) =>
-        Repl.Reply.Crashed(id, notices.map(_.message).join(t"; "), tokens)
+        Repl.Reply.Crashed(id, renderDiagnostics(notices), tokens)

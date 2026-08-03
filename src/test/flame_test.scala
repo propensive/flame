@@ -82,9 +82,9 @@ private def exchange(socket: jn.Socket, request: Repl.Request): Repl.Reply =
 object ReplFixture:
   var greeting: String = "hello"
 
-  def session(using Scalac[3.8, Universe.Classfile], Classloader, TemporaryDirectory, Monitor, System, Probate)
+  def session(using Scalac[3.9, Universe.Classfile], Classloader, TemporaryDirectory, Monitor, System, Probate)
   :   (Repl.Outcome, Repl.Outcome) =
-    val repl = Repl[3.8]:
+    val repl = Repl[3.9]:
       def size: Int = greeting.length
 
     val before: Repl.Outcome = repl.interpret(t"size")
@@ -94,7 +94,7 @@ object ReplFixture:
 object Tests extends Suite(m"Flame Tests"):
   def run(): Unit =
     suite(m"REPL tests"):
-      given Scalac[3.8, Universe.Classfile] = Scalac(Nil)
+      given Scalac[3.9, Universe.Classfile] = Scalac(Nil)
 
       test(m"a definition is visible on a later line"):
         supervise:
@@ -113,6 +113,26 @@ object Tests extends Suite(m"Flame Tests"):
       . assert:
           case Repl.Outcome.Ran(_, _, _, _, _) => true
           case _                         => false
+
+      test(m"an import of a session definition persists to a later line"):
+        supervise:
+          val repl = Repl()
+          repl.interpret(t"object Foo { object Bar { def hi = 42 } }")
+          repl.interpret(t"import Foo.Bar")
+          repl.interpret(t"Bar.hi")
+      . assert:
+          case Repl.Outcome.Ran(_, _, _, _, _) => true
+          case _                               => false
+
+      test(m"a wildcard import of a session definition persists to a later line"):
+        supervise:
+          val repl = Repl()
+          repl.interpret(t"object Foo { val n = 7 }")
+          repl.interpret(t"import Foo.*")
+          repl.interpret(t"n")
+      . assert:
+          case Repl.Outcome.Ran(_, _, _, _, _) => true
+          case _                               => false
 
       test(m"/unimport removes an import so it is no longer in scope"):
         supervise:
@@ -138,21 +158,83 @@ object Tests extends Suite(m"Flame Tests"):
         supervise:
           Repl().interpret(t"/unimport nonsense.does.not.exist")
       . assert:
-          case Repl.Outcome.Ran(_, _, output, _, _) => output.contains(t"no matching import")
+          case Repl.Outcome.Ran(_, _, output, _, _) => output.contains(t"No matching import")
           case _                              => false
 
       test(m"/classpath lists the current classpath"):
         supervise:
           Repl().interpret(t"/classpath")
       . assert:
-          case Repl.Outcome.Ran(_, _, output, _, _) => output.contains(t"classpath (")
+          case Repl.Outcome.Ran(_, _, output, _, _) => output.contains(t"Classpath (")
           case _                              => false
+
+      def diagnostics(reply: Repl.Reply): Text = reply match
+        case r: Repl.Reply.Rejected => SemanticRender.stripAnsi(r.diagnostics)
+        case _                      => t""
+
+      test(m"a type-error diagnostic renders types via stenography, abbreviated to `Int`"):
+        supervise:
+          diagnostics(Repl().react(0, t"val n: Int = \"hello\""))
+      . assert { diag => diag.contains(t"Int") && !diag.contains(t"scala.Int") }
+
+      test(m"a type-error diagnostic abbreviates a session-imported type to its simple name"):
+        supervise:
+          val repl = Repl()
+          repl.react(0, t"import scala.collection.mutable.ListBuffer")
+          diagnostics(repl.react(1, t"val b: ListBuffer[Int] = \"no\""))
+      . assert { diag => diag.contains(t"ListBuffer[Int]") && !diag.contains(t"mutable.ListBuffer") }
+
+      // The wrapper objects (`rs$line$N`, in the empty package) are session bookkeeping: no rendering
+      // the user sees may name them — not the result line's type, a `def`'s signature, a diagnostic,
+      // nor a completion signature.
+      test(m"a session-defined type renders as the user wrote it, without the wrapper object"):
+        supervise:
+          val repl = Repl()
+          repl.interpret(t"object Foo { object Bar }")
+          repl.interpret(t"Foo.Bar")
+      . assert:
+          case Repl.Outcome.Ran(_, _, _, _, tpe) => tpe == t"Foo.Bar.type"
+          case _                                 => false
+
+      test(m"an object's result binds a name from the object, not from the `.type` suffix"):
+        supervise:
+          val repl = Repl()
+          repl.interpret(t"object Foo { object Bar }")
+          repl.interpret(t"Foo.Bar")
+      . assert:
+          case Repl.Outcome.Ran(_, _, _, name, _) => name == t"bar"
+          case _                                  => false
+
+      test(m"a `def` returning a session-defined type shows no wrapper object in its signature"):
+        supervise:
+          val repl = Repl()
+          repl.interpret(t"object Foo { class Baz }")
+          repl.interpret(t"def make = new Foo.Baz")
+      . assert:
+          case Repl.Outcome.Ran(_, _, output, _, _) =>
+            output.contains(t"def make: Foo.Baz") && !output.contains(t"rs$$line$$")
+          case _ => false
+
+      test(m"a diagnostic naming a session-defined type shows no wrapper object"):
+        supervise:
+          val repl = Repl()
+          repl.react(0, t"object Foo { object Bar }")
+          diagnostics(repl.react(1, t"val n: Int = Foo.Bar"))
+      . assert { diag => diag.contains(t"Foo.Bar.type") && !diag.contains(t"rs$$line$$") }
+
+      test(m"a completion signature shows no wrapper object"):
+        supervise:
+          val repl = Repl()
+          repl.interpret(t"object Foo { object Bar { def hi = 42 }; def make = Bar }")
+          repl.completionsAt(t"Foo.mak", 7)
+      . assert: items =>
+          items.exists(_.name == t"make") && items.all(!_.signature.contains(t"rs$$line$$"))
 
       test(m"/classload reports a nonexistent path"):
         supervise:
           Repl().interpret(t"/classload /no/such/directory/lib.jar")
       . assert:
-          case Repl.Outcome.Ran(_, _, output, _, _) => output.contains(t"no such file or directory")
+          case Repl.Outcome.Ran(_, _, output, _, _) => output.contains(t"No such file or directory")
           case _                              => false
 
       test(m"/classload adds an entry that /classpath then shows"):
@@ -204,7 +286,7 @@ object Tests extends Suite(m"Flame Tests"):
           Repl().interpret(t"val x = 40 + 2")
       . assert:
           case Repl.Outcome.Ran(_, value, _, name, tpe) =>
-            value == t"42" && name == t"x" && tpe == t"scala.Int"
+            value == t"42" && name == t"x" && tpe == t"Int"
           case _ => false
 
       test(m"a `var` definition shows its name, value and type"):
@@ -244,7 +326,7 @@ object Tests extends Suite(m"Flame Tests"):
         supervise:
           Repl().interpret(t"def g(n: Int) = n + 1")
       . assert:
-          case Repl.Outcome.Ran(_, _, output, _, _) => output.trim == t"def g(n: Int): scala.Int"
+          case Repl.Outcome.Ran(_, _, output, _, _) => output.trim == t"def g(n: Int): Int"
           case _                                     => false
 
       test(m"/set experimental enables experimental definitions"):
@@ -453,14 +535,14 @@ object Tests extends Suite(m"Flame Tests"):
           case _ => false
 
     suite(m"REPL binding tests"):
-      given Scalac[3.8, Universe.Classfile] = Scalac(Nil)
+      given Scalac[3.9, Universe.Classfile] = Scalac(Nil)
 
       test(m"captured values and a lifted definition are usable in the REPL"):
         supervise:
           val greeting: String = "hello"
           var counter:  Int    = 5
 
-          val repl = Repl[3.8]:
+          val repl = Repl[3.9]:
             val text  = greeting
             val count = counter
             def total: Int = text.length + count
@@ -473,7 +555,7 @@ object Tests extends Suite(m"Flame Tests"):
       test(m"a lifted import is in scope for REPL lines"):
         supervise:
           // the lifted import is consumed by the macro, so it reads as unused here
-          @annotation.nowarn val repl = Repl[3.8]:
+          @annotation.nowarn val repl = Repl[3.9]:
             import scala.collection.mutable.ListBuffer
 
           repl.interpret(t"println(ListBuffer(1, 2, 3).sum)")
@@ -485,7 +567,7 @@ object Tests extends Suite(m"Flame Tests"):
         supervise:
           val secret: Int = 42
 
-          val repl = Repl[3.8]:
+          val repl = Repl[3.9]:
             val seed = secret
 
           repl.interpret(t"val doubled = seed*2")
@@ -495,7 +577,7 @@ object Tests extends Suite(m"Flame Tests"):
           case _                         => false
 
     suite(m"REPL result rendering"):
-      given Scalac[3.8, Universe.Classfile] = Scalac(Nil)
+      given Scalac[3.9, Universe.Classfile] = Scalac(Nil)
 
       test(m"an expression's value is rendered via Inspectable"):
         supervise:
@@ -542,7 +624,7 @@ object Tests extends Suite(m"Flame Tests"):
       . assert(_.contains(t"\n"))
 
     suite(m"REPL TCP server"):
-      given Scalac[3.8, Universe.Classfile] = Scalac(Nil)
+      given Scalac[3.9, Universe.Classfile] = Scalac(Nil)
 
       test(m"a reply carries the value, type and highlighting"):
         supervise:
@@ -653,13 +735,13 @@ object Tests extends Suite(m"Flame Tests"):
           case _                              => false
 
     suite(m"REPL block captures outside references"):
-      given Scalac[3.8, Universe.Classfile] = Scalac(Nil)
+      given Scalac[3.9, Universe.Classfile] = Scalac(Nil)
 
       test(m"a lifted def can reference a value from the enclosing scope"):
         supervise:
           val base = 100
 
-          val repl = Repl[3.8]:
+          val repl = Repl[3.9]:
             def shifted(n: Int): Int = n + base
 
           repl.interpret(t"shifted(5)")
@@ -669,7 +751,7 @@ object Tests extends Suite(m"Flame Tests"):
 
       test(m"a lifted def captures an enclosing method parameter"):
         def session(base: Int): Repl.Outcome = supervise:
-          val repl = Repl[3.8]:
+          val repl = Repl[3.9]:
             def plus(n: Int): Int = n + base
 
           repl.interpret(t"plus(2)")
@@ -683,7 +765,7 @@ object Tests extends Suite(m"Flame Tests"):
         supervise:
           val base = 100
 
-          val repl = Repl[3.8]:
+          val repl = Repl[3.9]:
             val offset = 5
             def total: Int = offset + base
 
@@ -706,7 +788,7 @@ object Tests extends Suite(m"Flame Tests"):
         supervise:
           var tally = 1
 
-          val repl = Repl[3.8]:
+          val repl = Repl[3.9]:
             def bump(): Unit = tally = tally + 10
 
           repl.interpret(t"bump()")
@@ -716,7 +798,7 @@ object Tests extends Suite(m"Flame Tests"):
 
       test(m"a lifted import is in scope for a lifted def and for later lines"):
         supervise:
-          val repl = Repl[3.8]:
+          val repl = Repl[3.9]:
             import scala.collection.mutable.ListBuffer
             def make: ListBuffer[Int] = ListBuffer(1, 2, 3)
 
@@ -728,7 +810,7 @@ object Tests extends Suite(m"Flame Tests"):
 
       test(m"a block-local var can be reassigned from a REPL line"):
         supervise:
-          val repl = Repl[3.8]:
+          val repl = Repl[3.9]:
             var counter = 10
 
           repl.interpret(t"counter = counter + 5")
