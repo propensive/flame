@@ -2,6 +2,8 @@ package flame
 
 import java.util.concurrent.atomic as juca
 
+import scala.caps
+
 import soundness.*
 import perihelion.*
 import perihelion.given
@@ -1021,7 +1023,7 @@ def serveHttp(port: Int, quit: Promise[Unit])(using Monitor, System, Probate, Cl
 
       case target if request.method == Http.Post
                      && target.starts(t"/api/sessions/") && target.ends(t"/eval") =>
-        val name: Text = target.strip(t"/api/sessions/").strip(t"/eval", Rtl)
+        val name: Text = target.chomp(t"/api/sessions/").chomp(t"/eval", Rtl)
 
         apiSessions.session(name).lay
          (jsonResponse(Http.NotFound, ApiError(t"no session named '$name'").in[Json].show)): repl =>
@@ -1037,7 +1039,7 @@ def serveHttp(port: Int, quit: Promise[Unit])(using Monitor, System, Probate, Cl
 
       case target if request.method == Http.Post
                      && target.starts(t"/api/sessions/") && target.ends(t"/complete") =>
-        val name: Text = target.strip(t"/api/sessions/").strip(t"/complete", Rtl)
+        val name: Text = target.chomp(t"/api/sessions/").chomp(t"/complete", Rtl)
 
         apiSessions.session(name).lay
          (jsonResponse(Http.NotFound, ApiError(t"no session named '$name'").in[Json].show)): repl =>

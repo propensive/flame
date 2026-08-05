@@ -1,7 +1,7 @@
                                                                                                   /*
 ┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓
 ┃                                                                                                  ┃
-┃    Soundness, version 0.54.0. © Copyright 2021-25 Jon Pretty, Propensive OÜ.                     ┃
+┃    Soundness, version 0.64.0. © Copyright 2021-25 Jon Pretty, Propensive OÜ.                     ┃
 ┃                                                                                                  ┃
 ┃    Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file     ┃
 ┃    except in compliance with the License. You may obtain a copy of the License at                ┃
@@ -17,43 +17,26 @@
                                                                                                   */
 package flame
 
-import java.lang as jl
-
-import proscenium.compat.*
+import scala.compiletime.summonFrom
 
 import anticipation.*
-import digression.*
-import escapade.*, termcapDefinitions.xtermTrueColorTermcap
-import hieroglyph.*, textMetrics.uniformMetric
+import spectacular.*
 
-// Renders the stack trace of an exception thrown by user code (under `strategies.throwUnsafely`) to a
-// coloured, truecolor-ANSI listing, for the REPL's `Threw` reply. Uses Soundness `digression`:
-// `StackTrace(throwable)` captures the frames, and escapade renders `StackTrace` to a `Teletype` (its
-// exception class + message, then each frame's class·method and file:line) via digression's default
-// `StackTrace.Palette`. The internal REPL/JVM plumbing above the user's wrapper object is trimmed off.
-object StackTraceRender:
-  // The index of the OUTERMOST frame belonging to the user's code: their code is compiled into the
-  // wrapper objects `rs$line$N`, so this is the last frame whose (raw) class name starts with
-  // `rs$line$`. Read from the raw `StackTraceElement`s (whose names are unmangled, unlike the frames
-  // digression rewrites), but the frame ORDER matches `StackTrace`'s, so the index carries over.
-  private def lastUserFrame(error: Throwable): Int =
-    val raw:  scala.Array[jl.StackTraceElement | Null] = error.getStackTrace.nn
-    var last: Int                                = -1
-    var i:    Int                                = 0
-
-    while i < raw.length do
-      if raw(i).nn.getClassName.nn.startsWith("rs$line$") then last = i
-      i += 1
-
-    last
-
-  def render(error: Throwable): Text =
-    val trace: StackTrace = StackTrace(error)
-    val last:  Int        = lastUserFrame(error)
-
-    // Drop the machinery above the user's outermost frame (reflection, the classloader, the engine,
-    // the worker thread); keep the whole trace if no user frame is identifiable.
-    val trimmed: StackTrace =
-      if last < 0 then trace else trace.dropRight(trace.frames.length - 1 - last)
-
-    trimmed.teletype.render(xtermTrueColorTermcap)
+// Renders a REPL result value as plain text for the CLI, by the same cascade `HtmlRender` uses for
+// the web — `Inspectable`, else `Showable`, else `toString`.
+//
+// The fallbacks are load-bearing, not belt-and-braces: since Soundness #1693 the collection
+// instances are written for the prelude's opaque `List`/`Set`/`Map`, so a REPL line that evaluates
+// to a *stdlib* collection (which `List(1, 2, 3)` is, under the default predef the REPL compiles
+// user code with) has no `Inspectable` at all. A bare `value.inspect` in the wrapper then fails to
+// resolve, and the resulting error — pickled by `-Xsemantic-diagnostics` — takes the compile down
+// with it, so the line reports a compiler crash rather than its value.
+//
+// `render` is inlined into the compiled wrapper, where the value's static type and its instances
+// are in scope; it binds the summoned given by name and calls its typeclass method directly, so
+// the wrapper needs no spectacular extension import — only `flame.InspectRender` on the classpath.
+object InspectRender:
+  inline def render[value](v: value): Text = summonFrom:
+    case inspectable: (`value` is Inspectable) => inspectable.text(v)
+    case showable:    (`value` is Showable)    => showable.text(v)
+    case _                                     => v.toString.tt

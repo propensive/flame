@@ -34,6 +34,10 @@ package flame
 
 import java.util as ju
 
+// This file is almost entirely quotes-API work, and the reflection API speaks stdlib lists
+// throughout, so `List`/`Nil` are the stdlib ones HERE, shadowing the prelude's opaque
+// collections; the two seams that hand data to `Repl.Prelude` convert explicitly.
+import scala.collection.immutable.{List, Nil}
 import scala.collection.mutable as scm
 import scala.quoted.*
 import scala.quoted.runtime.impl.QuotesImpl
@@ -221,7 +225,11 @@ object ReplMacro:
         PickledQuotes.pickleQuote(tree)(using quotes.asInstanceOf[QuotesImpl].ctx)
 
     val importsExpr: Expr[List[String]] = Expr(imports.to(List))
-    val preludeExpr: Expr[Repl.Prelude] = '{Repl.Prelude($importsExpr, ${Expr(pickled)})}
+
+    // `Prelude` holds the prelude's opaque lists, so the stdlib lists this file works in are
+    // converted where they cross into it.
+    val preludeExpr: Expr[Repl.Prelude] =
+      '{Repl.Prelude(proscenium.List.of($importsExpr), proscenium.List.of(${Expr(pickled)}))}
 
     ' {
         val repl: Repl[version] =
@@ -281,7 +289,7 @@ object ReplMacro:
                 // to a `val` of the tracked function type) for the same reason as in `consumer`.
                 val cellPut: Expr[Unit] =
                   ' {
-                      val cell: Array[Object] = new Array[Object](1)
+                      val cell: scala.Array[Object] = new scala.Array[Object](1)
                       cell(0) = $read
 
                       val supply: ju.function.Supplier[Object] =

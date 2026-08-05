@@ -32,7 +32,11 @@
                                                                                                   */
 package flame
 
-import language.adhocExtensions
+import scala.language.adhocExtensions
+
+// Like `ReplMacro`, this file drives the compiler API directly, which speaks stdlib lists, so
+// `List`/`Nil` here are the stdlib ones, shadowing the prelude's opaque collections.
+import scala.collection.immutable.{List, Nil}
 
 import dotty.tools.dotc as dtd
 import dotty.tools.dotc.CompilationUnit
@@ -77,9 +81,11 @@ object ReplModuleCompiler:
   def compile
     ( classpath: LocalClasspath )
     ( moduleName: Text, out: Text )
-    ( pickled: List[String] )
+    // The caller (`Repl.ensureSeeded`) works in the prelude's collections, so this entry point
+    // takes and returns those, and the compiler-facing body works in stdlib lists.
+    ( pickled: proscenium.List[String] )
     ( using System )
-  :   List[Text] =
+  :   proscenium.List[Text] =
 
     var messages: List[Text] = Nil
 
@@ -90,15 +96,20 @@ object ReplModuleCompiler:
     object driver extends dtd.Driver:
       val currentContext =
         val context = QuotesCache.init(initCtx.fresh)
-        val arguments: List[Text] = List(t"-d", out, t"-classpath", classpath(), t"")
-        setup(arguments.map(_.s).to(Array), context).map(_(1)).get
+        // `-experimental`: the pickled block was typed in the host's compilation, whose language
+        // features (`genericNumberLiterals` among them) mark the definitions they touch — down to
+        // `Int` — as experimental. Recompiling those trees without the flag rejects them, so the
+        // seed compiler is given the same permission the trees were typed under.
+        val arguments: List[Text] =
+          List(t"-experimental", t"-d", out, t"-classpath", classpath(), t"")
+        setup(arguments.map(_.s).toArray, context).map(_(1)).get
 
       def run(): List[Text] =
         given Context = currentContext.fresh.setReporter(reporter)
-        ReplModuleCompiler().newRun.compileUnits(ModuleUnit(moduleName.s, pickled) :: Nil)
+        ReplModuleCompiler().newRun.compileUnits(ModuleUnit(moduleName.s, pickled.stdlib) :: Nil)
         messages
 
-    driver.run()
+    proscenium.List.of(driver.run())
 
 // A purpose-built compiler (modelled on `scala.quoted.staging.QuoteCompiler`)
 // that takes a closed quoted block of definitions and emits a normal, importable

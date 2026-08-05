@@ -32,11 +32,15 @@
                                                                                                   */
 package flame
 
+import scala.caps
+
 import _root_.java.io as ji
 import _root_.java.net as jn
 import _root_.java.nio.channels as jnc
 
 import soundness.*
+
+import proscenium.compat.*
 
 import classloaders.threadContextClassloader
 import filesystemBackends.virtualMachine
@@ -68,7 +72,7 @@ private def exchange(input: ji.InputStream, output: ji.OutputStream, request: Re
   send(output, request)
   val in     = ji.DataInputStream(input)
   val length = in.readInt()
-  val bytes  = new Array[Byte](length)
+  val bytes  = new scala.Array[Byte](length)
   in.readFully(bytes)
   Bintel.read[Repl.Reply](bytes.immutable(using Unsafe))
 
@@ -289,11 +293,15 @@ object Tests extends Suite(m"Flame Tests"):
             value == t"42" && name == t"x" && tpe == t"Int"
           case _ => false
 
+      // `List(1, 2, 3)` in a REPL line is the STDLIB list (the REPL compiles user code with the
+      // ordinary predef), which has no `Inspectable` instance since Soundness #1693 moved the
+      // collection instances onto the prelude's opaque types — so it renders through
+      // `InspectRender`'s `toString` fallback, as `List(1, 2, 3)` rather than the old `[1, 2, 3]`.
       test(m"a `var` definition shows its name, value and type"):
         supervise:
           Repl().interpret(t"var y = List(1, 2, 3)")
       . assert:
-          case Repl.Outcome.Ran(_, value, _, name, _) => value == t"[1, 2, 3]" && name == t"y"
+          case Repl.Outcome.Ran(_, value, _, name, _) => value == t"List(1, 2, 3)" && name == t"y"
           case _                                       => false
 
       test(m"a `val` definition still persists for later lines"):
@@ -344,38 +352,38 @@ object Tests extends Suite(m"Flame Tests"):
         supervise:
           val code = t"List(1, 2, 3).ma"
           Repl().completionsAt(code, code.length).map(_.name)
-      . assert(_.contains(t"map"))
+      . assert(_.has(t"map"))
 
       test(m"completions are offered inside a definition's right-hand side"):
         supervise:
           val code = t"def foo() = System.o"
           Repl().completionsAt(code, code.length).map(_.name)
-      . assert(_.contains(t"out"))
+      . assert(_.has(t"out"))
 
       test(m"completions are offered inside a val's right-hand side"):
         supervise:
           val code = t"val xs = List(1, 2, 3).ma"
           Repl().completionsAt(code, code.length).map(_.name)
-      . assert(_.contains(t"map"))
+      . assert(_.has(t"map"))
 
       test(m"completions see the session's imports for a first-token prefix"):
         supervise:
           val repl = Repl()
           repl.interpret(t"import scala.collection.mutable.ListBuffer")
           repl.completionsAt(t"ListB", 5).map(_.name)
-      . assert(_.contains(t"ListBuffer"))
+      . assert(_.has(t"ListBuffer"))
 
       test(m"completions work in import position"):
         supervise:
           val code = t"import sca"
           Repl().completionsAt(code, code.length).map(_.name)
-      . assert(_.contains(t"scala"))
+      . assert(_.has(t"scala"))
 
       test(m"slash-command lines complete against the engine's commands"):
         supervise:
           val code = t"/set ex"
           Repl().completionsAt(code, code.length).map(_.name)
-      . assert(_.contains(t"/set experimental"))
+      . assert(_.has(t"/set experimental"))
 
       test(m"a new definition invalidates the cached member completions"):
         supervise:
@@ -383,7 +391,7 @@ object Tests extends Suite(m"Flame Tests"):
           repl.completionsAt(t"z9.le", 5)        // z9 undefined: caches an empty member list
           repl.interpret(t"val z9 = \"hi\"")      // defining z9 must drop the stale cache
           repl.completionsAt(t"z9.le", 5).map(_.name)
-      . assert(_.contains(t"length"))
+      . assert(_.has(t"length"))
 
       // Keyword completion is position-classified by prophesy's corpus-derived pattern tree
       // (`Repl.keywordCompletions` via `Lexis.context`/`ScalaKeywords.pattern` — no compiler).
@@ -393,7 +401,7 @@ object Tests extends Suite(m"Flame Tests"):
 
       test(m"`import` is a keyword completion at the start of a line"):
         Repl.keywordCompletions(t"imp", 3)._1.map(_.name)
-      . assert(_.contains(t"import"))
+      . assert(_.has(t"import"))
 
       test(m"`match` is offered after a member-selection dot (`expr.match` is valid Scala 3)"):
         Repl.keywordCompletions(t"List(1).ma", 10)._1.map(_.name)
@@ -417,11 +425,11 @@ object Tests extends Suite(m"Flame Tests"):
 
       test(m"a soft modifier offers a follow-set, not the whole definition list"):
         Repl.keywordCompletions(t"transparent ", 12)._1.map(_.name)
-      . assert { names => names.contains(t"inline") && names.contains(t"trait") && !names.contains(t"import") }
+      . assert { names => names.has(t"inline") && names.has(t"trait") && !names.has(t"import") }
 
       test(m"`inline` offers def/given/val (and inline-if/match)"):
         Repl.keywordCompletions(t"inline ", 7)._1.map(_.name)
-      . assert { names => List(t"def", t"given", t"val", t"if", t"match").forall(names.contains) }
+      . assert { names => List(t"def", t"given", t"val", t"if", t"match").all { (word: Text) => names.has(word) } }
 
       test(m"`with` is not offered after a type ascription `:`"):
         Repl.keywordCompletions(t"val x: w", 8)._1
@@ -437,7 +445,7 @@ object Tests extends Suite(m"Flame Tests"):
 
       test(m"`new` is offered at a statement start"):
         Repl.keywordCompletions(t"n", 1)._1.map(_.name)
-      . assert(_.contains(t"new"))
+      . assert(_.has(t"new"))
 
       test(m"`using` is offered inside a parameter list"):
         Repl.keywordCompletions(t"def f(u", 7)._1.map(_.name)
@@ -555,7 +563,7 @@ object Tests extends Suite(m"Flame Tests"):
       test(m"a lifted import is in scope for REPL lines"):
         supervise:
           // the lifted import is consumed by the macro, so it reads as unused here
-          @annotation.nowarn val repl = Repl[3.9]:
+          @scala.annotation.nowarn val repl = Repl[3.9]:
             import scala.collection.mutable.ListBuffer
 
           repl.interpret(t"println(ListBuffer(1, 2, 3).sum)")
@@ -691,7 +699,7 @@ object Tests extends Suite(m"Flame Tests"):
           val a = sessions.create()
           val b = sessions.create()
           sessions.session(a).vouch.interpret(t"val marker = 111")
-          ( a != b && sessions.names.contains(a) && sessions.names.contains(b),
+          ( a != b && sessions.names.has(a) && sessions.names.has(b),
             sessions.session(a).vouch.interpret(t"marker"),
             sessions.session(b).vouch.interpret(t"marker") )
       . assert:
@@ -717,7 +725,7 @@ object Tests extends Suite(m"Flame Tests"):
             channel.close()
             service.stop()
       . assert:
-          case Repl.Reply.Session(_, name, names) => name != t"" && names.contains(name)
+          case Repl.Reply.Session(_, name, names) => name != t"" && names.has(name)
           case _                                  => false
 
       test(m"a completion request returns matching completions"):

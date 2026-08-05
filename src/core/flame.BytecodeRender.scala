@@ -24,6 +24,8 @@ import hellenism.*
 import iridescence.*
 import mandible.*
 import prepositional.*
+import proscenium.compat.*
+import rudiments.*
 import vacuous.*
 
 // Renders the JVM bytecode of a compiled class to a coloured, truecolor-ANSI listing, for the REPL's
@@ -55,7 +57,7 @@ object BytecodeRender:
   def render(resource: Text)(using Classloader): Optional[Text] =
     Classfile(resource).let: classfile =>
       classfile.methods
-        .filter { method => !synthetic.contains(method.name) }
+        .filter { method => !synthetic.has(method.name) }
         .map { method => (method.name, method.bytecode) }
         .collect { case (name, code: Bytecode) => e"$Bold($name)\n${code.teletype}" }
         .join(e"\n\n")

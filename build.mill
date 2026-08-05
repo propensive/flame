@@ -24,10 +24,10 @@ object settings:
   // Moved to the 3.9.0-RC4 stream (matching Soundness origin/main) for `-Xsemantic-diagnostics`,
   // the compiler support behind the `delicious` semantic-diagnostics module. From RC4-p1 the tag
   // and jar-coordinate version coincide, so no `-propensive` suffix.
-  val scalaVersion = sys.env.getOrElse("SOUNDNESS_SCALA_VERSION", "3.9.0-RC4-p6")
+  val scalaVersion = sys.env.getOrElse("SOUNDNESS_SCALA_VERSION", "3.9.0-RC4-p9")
   // The propensive/proscala release the toolchain jars are downloaded from (unless a local
   // `SOUNDNESS_SCALA_HOME` is set), exactly as in the Soundness build.
-  val scalaRelease = sys.env.getOrElse("SOUNDNESS_SCALA_RELEASE", "3.9.0-RC4-p6")
+  val scalaRelease = sys.env.getOrElse("SOUNDNESS_SCALA_RELEASE", "3.9.0-RC4-p9")
   // Empty by default → download `scalaRelease`. Set to a local `make`-built `release` directory
   // to use its `release/lib` jars directly (fork-developer mode).
   val scalaHome = sys.env.getOrElse("SOUNDNESS_SCALA_HOME", "")
@@ -72,7 +72,12 @@ object settings:
 
   // Flame's sources are written for the proscenium predef (the soundness house
   // predef), so the standalone build replicates `-Yno-predef -Yimports:…`.
-  val predef = Seq("-Yno-predef", "-Yimports:java.lang,scala,proscenium")
+  // `scala` is deliberately NOT imported (as of Soundness #1693): the blessed collections are
+  // proscenium's opaque `List`/`Set`/`Map`/`Array`, and naming both packages would make every
+  // such reference ambiguous. Stdlib collections — which the Dotty compiler API flame drives
+  // speaks throughout — must announce themselves with an explicit `scala.`-qualified name or
+  // import, and cross the boundary through `proscenium.compat`.
+  val predef = Seq("-Yno-predef", "-Yimports:java.lang,proscenium")
 
   // The `soundness-all` umbrella: every Soundness module, so a Flame user can `import
   // soundness.*` in the REPL and reach all of it. The cost is that Flame's OWN sources also

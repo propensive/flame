@@ -21,6 +21,10 @@ import java.io as ji
 import java.net as jn
 import java.nio.channels as jnc
 
+import scala.caps
+
+import proscenium.compat.*
+
 import ambience.*
 import anthology.*
 import anticipation.*
@@ -89,13 +93,13 @@ class Sessions[version <: Scalac.Versions]
   // numbered suffix in the astronomically-unlikely event every animal is taken), and returns the name.
   def create(): Text =
     lock:
-      val free: List[Text] = Sessions.animals.filter { animal => !registry.contains(animal) }
+      val free: List[Text] = Sessions.animals.filter { animal => !registry.stdlib.contains(animal) }
 
       val name: Text =
         if free.nonEmpty then Random.global.shuffle(free).head else
           var n = 2
           val base = Random.global.shuffle(Sessions.animals).head
-          while registry.contains(t"$base$n") do n += 1
+          while registry.stdlib.contains(t"$base$n") do n += 1
           t"$base$n"
 
       registry = registry.updated(name, Repl.make[version](Repl.Prelude.empty, render))
@@ -259,7 +263,7 @@ class Sessions[version <: Scalac.Versions]
 
         if length < 0 then continue = false
         else
-          val bytes: Array[Byte] = new Array[Byte](length)
+          val bytes: scala.Array[Byte] = new scala.Array[Byte](length)
           in.readFully(bytes)
           val message: Data = bytes.immutable(using Unsafe)
 

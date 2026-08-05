@@ -37,18 +37,25 @@ import java.lang as jl
 import java.net as jn
 import java.util.concurrent as juc
 
+import scala.caps
+import scala.collection.immutable as sci
+
 import scala.collection.concurrent.TrieMap
 import scala.collection.mutable as scm
 
 import soundness.*
+
+// The stdlib-shaped operations on the prelude's opaque collections (Soundness #1693).
+import proscenium.compat.*
 
 import escapade.Faint
 import escapade.Italic
 import termcapDefinitions.xtermTrueColorTermcap
 import iridescence.WebColors
 // `soundness.*` also re-exports an unrelated `Signal` (embarcadero's workload-grant signal), so the
-// POSIX terminal `Signal` (whose `.Int` is SIGINT) is named explicitly to resolve the clash.
-import profanity.Signal
+// POSIX terminal signal type (whose `.Int` is SIGINT) is named explicitly to resolve the clash. It
+// is `profanity.Interrupt` as of Soundness 0.64 (`Signal` was its former name).
+import profanity.Interrupt
 
 import backstops.silentBackstop
 import classloaders.threadContextClassloader
@@ -111,14 +118,19 @@ private inline def command
 private def settingValues(flag: Flag of List[Text], kind: Repl.Kind)(using Cli, Interpreter): List[Text] =
   given (List[Text]) is Interpretable = _.map(_())
   given (List[Text]) is Discoverable =
-    _ => Repl.settings.filter(_.kind == kind).map { setting => Suggestion(setting.name) }
+    _ => Repl.settings.filter(_.kind == kind).map { setting => Suggestion(setting.name) }.stdlib
   flag().or(Nil)
 
 // The `/set`/`/language` commands to run on startup, from `--set`/`--language` (compiler settings
 // applied first, so `--set experimental` unlocks any experimental `--language` features).
 private def initialSettings(using Cli, Interpreter): List[Text] =
-  settingValues(SetOpt, Repl.Kind.Set).map { name => t"/set $name" }
-  ::: settingValues(LanguageOpt, Repl.Kind.Language).map { name => t"/language $name" }
+  val setCommands: List[Text] =
+    settingValues(SetOpt, Repl.Kind.Set).map { (name: Text) => t"/set $name" }
+
+  val languageCommands: List[Text] =
+    settingValues(LanguageOpt, Repl.Kind.Language).map { (name: Text) => t"/language $name" }
+
+  setCommands ::: languageCommands
 
 // The default TCP port for `flame listen` (a remote-reachable REPL server) and for `flame --host`
 // when no `--port` is given. Arbitrary, but stable so the two ends agree without configuration.
@@ -285,7 +297,7 @@ private def httpServe(portNumber: Int)
 
   // A real SIGINT (e.g. `kill -INT <pid>`) fulfils `quit` and stops the server cleanly.
   trap:
-    case Signal.Int => quit.offer(()) yet SignalResponse.Accept
+    case Interrupt.Int => quit.offer(()) yet SignalResponse.Accept
 
   // Printed from the client (not the daemon) so it reaches the user's terminal; the URL is
   // on its own line so terminals render it as a clean, clickable link.
@@ -373,7 +385,7 @@ private def serveSocket()(using Stdio, Monitor, Probate, System): Exit =
       case _: PathError | _: IoError => ()
     . protect:
       val directory = socketDirectory.as[Path on Linux]
-      if !directory.exists() then directory.create[Directory]()
+      if !directory.existent() then directory.create[Directory]()
       socketPath.as[Path on Linux].wipe()
 
     val sessions = Sessions()
@@ -430,8 +442,10 @@ private def serverClassloader(using System): Classloader =
       val executablePath: Text = ji.File(executable.s).getCanonicalPath.nn.tt
       val bootstrapUrls: List[jn.URL] = threadContextClassloader.java match
         case loader: jn.URLClassLoader =>
-          loader.getURLs.nn.iterator.to(List).map(_.nn).filter: entry =>
+          val urls = loader.getURLs.nn.iterator.map(_.nn).filter: entry =>
             safely(ji.File(entry.toURI).getCanonicalPath.nn.tt) != executablePath
+
+          List.from(urls)
         case _ =>
           Nil
 
@@ -501,7 +515,7 @@ private def launchServer[result]()(using Stdio, System)(body: Duplex => result):
       waited += 100
 
       socketPaths(socketDirectory).each: candidate =>
-        if result.absent && !before.contains(candidate) then
+        if result.absent && !before.has(candidate) then
           result = connectDomain(DomainSocket(candidate))(body)
 
     result
@@ -548,7 +562,8 @@ private def socketPaths(directory: Text): List[Text] =
   recover:
     case _: PathError => Nil
   . protect:
-    directory.as[Path on Linux].children.map(_.encode).filter(_.ends(t".sock")).to(List)
+    val names: Chain[Text] = directory.as[Path on Linux].children.map(_.encode)
+    List.from(names.stdlib.filter(_.ends(t".sock")))
 
 // Connects to a per-process UNIX domain socket. With no server running, launches one
 // in the background and attaches to it (so `flame` alone is a self-contained REPL,
@@ -600,7 +615,7 @@ private def connectRemote(host: Optional[Text], portNumber: Int, join: Optional[
       recover:
         case HostnameError(_, _) => invalidHost(hostText)
       . protect:
-          val endpoint: Endpoint[TcpPort] = hostText.as[Hostname] via port
+          val endpoint: Endpoint[TcpPort] = hostText.as[Hostname] on port
           connect(endpoint)(converse(join, initial)(_)).or(unreachableRemote(hostText, portNumber))
 
 // The read/edit/print loop. The server's reply is printed verbatim. Ctrl+C/Ctrl+D
@@ -651,9 +666,10 @@ private def runRepl
 
   // `duplex.source` blocks on its first socket read, so force the iterator lazily —
   // only once a request has been sent — otherwise it would deadlock before the editor
-  // even starts (the server sends nothing until it receives a message). `toLazyList` is
-  // zephyrine's legacy view of the kernel read stream: one materialized chunk per refill.
-  lazy val chunks: Iterator[Data] = duplex.source.toLazyList.iterator
+  // even starts (the server sends nothing until it receives a message). `toProgression` is
+  // zephyrine's legacy view of the kernel read stream: one materialized chunk per refill
+  // (it was `toLazyList` before Soundness #1693 made it yield a `Chain`).
+  lazy val chunks: Iterator[Data] = duplex.source.toProgression.iterator
   @volatile var live = true
 
   // Replies to session queries/switches (the server only sends a `Session` reply in answer to a
@@ -991,7 +1007,7 @@ private def runRepl
             duplex.send(zephyrine.Stream(framed(encode(Repl.Request.Session(nextId.getAndIncrement, t"")))))
             val names:   List[Text] = safely(sessionReplies.take().nn).lay(Nil)(_.names)
             val partial: Text       = editor.value.skip(t"/session ".length)
-            val matches: List[Text] = names.filter(_.starts(partial)).map { name => t"/session $name" }
+            val matches: List[Text] = names.filter(_.starts(partial)).map { (name: Text) => t"/session $name" }
 
             matches match
               case Nil => ()
@@ -1234,7 +1250,7 @@ private def replPane
   def edge: Pane = panel(minWidth = 1, maxWidth = 1)(())
 
   val box = cadetBorder:
-    file
+    strip
      ( edge,
        panel(minHeight = rows, maxHeight = rows):
          val extent = summon[Extent]
@@ -1255,7 +1271,7 @@ private def replPane
     val list = panel(minHeight = compLines.length, maxHeight = compLines.length):
       summon[Extent].put(compLines.join(e"\n"))
 
-    rank(box, list)
+    stack(box, list)
 
 // One replayable line of the session: the source `text` (to compute the box's wrapped height at any
 // terminal width), the highlight `tokens` (to redraw the box), and the `result` text printed below it
@@ -1272,7 +1288,7 @@ private def replayBox(tokens: List[Repl.Token], rows: Int): Pane =
   def edge: Pane = panel(minWidth = 1, maxWidth = 1)(())
 
   cadetBorder:
-    file
+    strip
      ( edge,
        panel(minHeight = rows, maxHeight = rows)(summon[Extent].put(colourful(tokens))),
        edge )
@@ -1300,11 +1316,11 @@ private def cadetBorder(child: Pane): Pane =
     panel(minWidth = 1, maxWidth = 1, minHeight = 1, maxHeight = 1):
       summon[Extent].put(e"$colour($glyph)")
 
-  def band(left: Text, right: Text): Pane = file(corner(left), horizontalRule, corner(right))
+  def band(left: Text, right: Text): Pane = strip(corner(left), horizontalRule, corner(right))
 
-  rank
+  stack
    ( band(style.topLeft, style.topRight),
-     file(verticalRule, child, verticalRule),
+     strip(verticalRule, child, verticalRule),
      band(style.bottomLeft, style.bottomRight) )
 
 // Renders a server reply to the text shown below the submitted line's box — the SAME text
@@ -1376,7 +1392,7 @@ private def completionTable(items: List[Repl.CompletionItem], width: Int): List[
   // The name column is as wide as the widest name (capped so the signature keeps room); the glyph
   // takes 1 column + 1 space, and the signature the remainder — kept 1 column short of the terminal
   // so an ambiguous-width glyph can't push the line into a wrap.
-  val nameCol: Int = items.map(_.name.length).maxOption.getOrElse(0).min((width - 12).max(1))
+  val nameCol: Int = items.map(_.name.length).stdlib.maxOption.getOrElse(0).min((width - 12).max(1))
   val sigCol:  Int = (width - nameCol - 4).max(1)
 
   items.map: item =>
@@ -1412,14 +1428,15 @@ private def completeAt
   if editor.value.starts(t"/") && !completesAsScala(editor.value) then
     slashCommands.filter { (name, _) => name.starts(editor.value) } match
       case (name, _) :: Nil =>
-        (LineEditor(name, name.length, editor.mode), Nil)
+        val none: List[Repl.CompletionItem] = Nil
+        (LineEditor(name, name.length, editor.mode), none)
 
       case matches =>
-        val items =
-          matches.map: (name, help) =>
-            Repl.CompletionItem(name, t"command", help)
+        val items: List[Repl.CompletionItem] =
+          matches.map: (entry: (Text, Text)) =>
+            Repl.CompletionItem(entry(0), t"command", entry(1))
 
-        val prefix = longestCommonPrefix(matches.map(_._1))
+        val prefix = longestCommonPrefix(matches.map { (entry: (Text, Text)) => entry(0) })
 
         val advanced =
           if prefix.length > editor.value.length then LineEditor(prefix, prefix.length, editor.mode)
@@ -1434,10 +1451,12 @@ private def completeAt
 
     candidates match
       case single :: Nil =>
-        (insertCompletion(editor, single.name), Nil)
+        val none: List[Repl.CompletionItem] = Nil
+        (insertCompletion(editor, single.name), none)
 
       case _ =>
-        val prefix = longestCommonPrefix(candidates.map(_.name))
+        val prefix =
+          longestCommonPrefix(candidates.map { (item: Repl.CompletionItem) => item.name })
 
         val advanced =
           if prefix.length > partialLength(editor) then insertCompletion(editor, prefix) else editor
@@ -1504,7 +1523,7 @@ private def colourful(tokens: List[Repl.Token]): Teletype =
 
     if params == t"" then command else e"$command$Faint(${commandParameter}($params))"
   else
-    tokens.map: token =>
+    tokens.map: (token: Repl.Token) =>
       // Invoked through the typeclass instance directly: `soundness.*` now also exports delicious's
       // `teletype` extension (on `SemanticMessage`), which shadows escapade's generic `.teletype`
       // extension for the `Teletypeable` instance here.
@@ -1574,7 +1593,7 @@ private def insertChar(tokens: List[Repl.Token], p: Int, c: Char): List[Repl.Tok
   val kind     = charKind(c)
   val ch: Text = c.toString.tt
   def tok(text: Text, accent: Text): Repl.Token = Repl.Token(text, accent, Unset)
-  val arr      = tokens.toVector
+  val arr: sci.Vector[Repl.Token] = tokens.stdlib.toVector
   val offsets  = arr.scanLeft(0)(_ + _.text.length)
   val total    = offsets(arr.length)
 
@@ -1586,24 +1605,24 @@ private def insertChar(tokens: List[Repl.Token], p: Int, c: Char): List[Repl.Tok
 
       val mid =
         if kind == accentKind(t.accent) || t.accent == t"string"
-        then Series(tok(t.text.keep(at) + ch + t.text.skip(at), t.accent))
-        else Series(tok(t.text.keep(at), t.accent), tok(ch, defaultAccent(kind)),
+        then sci.Vector(tok(t.text.keep(at) + ch + t.text.skip(at), t.accent))
+        else sci.Vector(tok(t.text.keep(at), t.accent), tok(ch, defaultAccent(kind)),
                     tok(t.text.skip(at), t.accent))
 
-      (arr.take(i) ++ mid ++ arr.drop(i + 1)).to(List)
+      List.from(arr.take(i) ++ mid ++ arr.drop(i + 1))
 
     case None =>
       if p <= 0 then
         val r = arr(0)
 
-        if kind == accentKind(r.accent) then (tok(ch + r.text, r.accent) +: arr.drop(1)).to(List)
-        else (tok(ch, defaultAccent(kind)) +: arr).to(List)
+        if kind == accentKind(r.accent) then (tok(ch + r.text, r.accent) +: arr.drop(1)).pipe(List.from)
+        else (tok(ch, defaultAccent(kind)) +: arr).pipe(List.from)
       else if p >= total then
         val l = arr(arr.length - 1)
 
         if kind == accentKind(l.accent)
-        then (arr.dropRight(1) :+ tok(l.text + ch, l.accent)).to(List)
-        else (arr :+ tok(ch, defaultAccent(kind))).to(List)
+        then List.from(arr.dropRight(1) :+ tok(l.text + ch, l.accent))
+        else List.from(arr :+ tok(ch, defaultAccent(kind)))
       else
         val i  = arr.indices.find { j => offsets(j) == p }.getOrElse(arr.length)
         val l  = arr(i - 1)
@@ -1612,26 +1631,31 @@ private def insertChar(tokens: List[Repl.Token], p: Int, c: Char): List[Repl.Tok
         val rk = accentKind(r.accent)
 
         if kind == lk
-        then (arr.take(i - 1) ++ Series(tok(l.text + ch, l.accent)) ++ arr.drop(i)).to(List)
+        then List.from(arr.take(i - 1) ++ sci.Vector(tok(l.text + ch, l.accent)) ++ arr.drop(i))
         else if kind == rk
-        then (arr.take(i) ++ Series(tok(ch + r.text, r.accent)) ++ arr.drop(i + 1)).to(List)
-        else (arr.take(i) ++ Series(tok(ch, defaultAccent(kind))) ++ arr.drop(i)).to(List)
+        then List.from(arr.take(i) ++ sci.Vector(tok(ch + r.text, r.accent)) ++ arr.drop(i + 1))
+        else List.from(arr.take(i) ++ sci.Vector(tok(ch, defaultAccent(kind))) ++ arr.drop(i))
 
 private def deleteChar(tokens: List[Repl.Token], p: Int): List[Repl.Token] =
   var offset = 0
 
-  tokens.flatMap: t =>
+  tokens.flatMap: (t: Repl.Token) =>
     val s = offset
     offset += t.text.length
 
-    if p >= s && p < offset then
-      val text = t.text.keep(p - s) + t.text.skip(p - s + 1)
-      if text.length == 0 then Nil else List(Repl.Token(text, t.accent, t.tpe))
-    else
-      List(t)
+    // Ascribed: the opaque `List` dealiases inside `flatMap`'s inference, so the branch type is
+    // pinned here rather than inferred.
+    val replacement: List[Repl.Token] =
+      if p >= s && p < offset then
+        val text = t.text.keep(p - s) + t.text.skip(p - s + 1)
+        if text.length == 0 then Nil else List(Repl.Token(text, t.accent, t.tpe))
+      else
+        List(t)
+
+    replacement
 
 private def replay(base: List[Repl.Token], edits: List[Edit]): List[Repl.Token] =
-  edits.foldLeft(base): (tokens, edit) =>
+  edits.stdlib.foldLeft(base): (tokens: List[Repl.Token], edit: Edit) =>
     edit match
       case Edit.Insert(at, c) => insertChar(tokens, at, c)
       case Edit.Delete(at)    => deleteChar(tokens, at)
@@ -1649,24 +1673,36 @@ private class LiveState:
   // Records the keystroke `oldBuf -> newBuf`, returning this buffer's version and
   // the heuristic tokens to draw now.
   def record(oldBuf: Text, newBuf: Text): (Int, List[Repl.Token]) = synchronized:
-    if newBuf.length == 0 then
-      checkpointTokens = Nil
-      log = Nil
-      checkpointVersion = version
-      (version, Nil)
-    else
-      if newBuf != oldBuf then diff(oldBuf, newBuf) match
-        case Some(edit) =>
-          version += 1
-          log = log :+ (version, edit)
+    // The result is bound to a typed local before it leaves the `synchronized` block: inferred
+    // straight through, its element type picks up a capture variable the declared result rejects.
+    val result: (Int, List[Repl.Token]) =
+      if newBuf.length == 0 then
+        checkpointTokens = Nil
+        log = Nil
+        checkpointVersion = version
+        // Bound first: an opaque `List` written straight into a tuple picks up a capture
+        // variable on its element type, which the declared result type then rejects.
+        val empty: List[Repl.Token] = Nil
+        (version, empty)
+      else
+        if newBuf != oldBuf then diff(oldBuf, newBuf) match
+          case Some(edit) =>
+            version += 1
+            log = log :+ ((version, edit))
 
-        case None =>   // not a single-char edit (paste, kill-line): plain fallback
-          checkpointTokens = List(Repl.Token(newBuf, t"term", Unset))
-          checkpointVersion = version
-          version += 1
-          log = Nil
+          case None =>   // not a single-char edit (paste, kill-line): plain fallback
+            checkpointTokens = List(Repl.Token(newBuf, t"term", Unset))
+            checkpointVersion = version
+            version += 1
+            log = Nil
 
-      (version, replay(checkpointTokens, log.map(_._2)))
+        // Ascribed: `replay`'s result otherwise carries an inferred capture set, which the
+        // declared `(Int, List[Repl.Token])` result type will not accept.
+        val edits: List[Edit] = log.map { (entry: (Int, Edit)) => entry(1) }
+        val tokens: List[Repl.Token] = replay(checkpointTokens, edits)
+        (version, tokens)
+
+    result
 
   // A `tokenize` reply for buffer version `v` arrived: if newer than our
   // checkpoint, adopt it and drop the edits it already accounts for.
@@ -1680,7 +1716,7 @@ private class LiveState:
 // own commands (shared with the web front-end via `Repl.slashCommands`) plus the client-only
 // ones. Keep the client-only entries in step with the dispatch in `converse`.
 private val slashCommands: List[(Text, Text)] =
-  Repl.slashCommands ++ List
+  Repl.slashCommands ::: List
     ( t"/clear"      -> t"clear the screen and forget the session history",
       t"/session"    -> t"switch to another session (or list them)",
       t"/disconnect" -> t"leave the session, keeping the server running",
@@ -1711,7 +1747,7 @@ private def longestCommonPrefix(names: List[Text]): Text = names match
   case Nil => t""
 
   case head :: tail =>
-    tail.foldLeft(head): (prefix, name) =>
+    tail.stdlib.foldLeft(head): (prefix: Text, name: Text) =>
       prefix.keep(commonPrefix(prefix, name))
 
 // The leading run of spaces/tabs of `line` — the indentation copied onto an auto-indented new line.
@@ -1735,15 +1771,18 @@ private def stripTrailingBlank(text: Text): Text =
 // cut is truncated to its kept prefix; tokens past the cut are dropped.
 private def trimTokens(tokens: List[Repl.Token], length: Int): List[Repl.Token] =
   var remaining = length
-  tokens.flatMap: token =>
-    if remaining <= 0 then Nil
-    else if token.text.length <= remaining then
-      remaining -= token.text.length
-      List(token)
-    else
-      val kept = token.text.keep(remaining)
-      remaining = 0
-      List(token.copy(text = kept))
+  tokens.flatMap: (token: Repl.Token) =>
+    val kept: List[Repl.Token] =
+      if remaining <= 0 then Nil
+      else if token.text.length <= remaining then
+        remaining -= token.text.length
+        List(token)
+      else
+        val prefix = token.text.keep(remaining)
+        remaining = 0
+        List(token.copy(text = prefix))
+
+    kept
 
 // Non-empty with every bracket closed; open brackets continue the input onto a new line.
 private def balanced(text: Text): Boolean =
@@ -1771,7 +1810,7 @@ private def endsWithContinuation(text: Text): Boolean =
     val last:     Char    = trimmed.charAt(trimmed.length - 1)
     val operator: Boolean = "+-*/%<>=&|^.:,@".indexOf(last.toInt) >= 0
     val lastWord: Text    = trimmed.drop(trimmed.lastIndexWhere(_.isWhitespace) + 1).nn.tt
-    operator || continuationKeywords.contains(lastWord)
+    operator || continuationKeywords.has(lastWord)
 
 private def singleLineComplete(text: Text): Boolean =
   balanced(text) && !endsWithContinuation(text)
@@ -1787,7 +1826,8 @@ private def framed(data: Data): Data =
   val length: Int = data.length
 
   val header: Data =
-    IArray[Byte]((length >>> 24).toByte, (length >>> 16).toByte, (length >>> 8).toByte, length.toByte)
+    Array.of[Byte]
+     ( (length >>> 24).toByte, (length >>> 16).toByte, (length >>> 8).toByte, length.toByte )
 
   header ++ data
 
@@ -1808,6 +1848,6 @@ private class FrameReader(chunks: Iterator[Data]):
         | ((buffer(2) & 0xff) << 8) | (buffer(3) & 0xff)
 
       if !fill(4 + length) then Unset else
-        val body: Data = IArray.from(buffer.slice(4, 4 + length))
+        val body: Data = Array.from(buffer.slice(4, 4 + length))
         buffer.remove(0, 4 + length)
         body

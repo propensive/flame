@@ -17,6 +17,8 @@
                                                                                                   */
 package flame
 
+import scala.collection.immutable as sci
+
 import anticipation.*
 import anthology.*
 import escapade.*, termcapDefinitions.xtermTrueColorTermcap
@@ -72,7 +74,7 @@ object SemanticRender:
   // (`Unset` — no marker present, or the reifier could not be built — falls back to compiler text).
   // `html` picks the target: HTML spans for the web, coloured ANSI for the terminal.
   def render(notices: List[Notice], reifier: Optional[Reifier], html: Boolean)(using Imports): Text =
-    notices.map { notice => renderNotice(notice, reifier, html) }.join(t"; ")
+    notices.map { (notice: Notice) => renderNotice(notice, reifier, html) }.join(t"; ")
 
   // The column at which a diagnostic's PROSE word-wraps in the terminal rendering. Neither the daemon
   // nor basic mode knows the client terminal's true width, so this follows the compiler's own
@@ -165,7 +167,7 @@ object SemanticRender:
   // every character, so unwrapped text round-trips exactly.
   private def prose(text: Text): List[Piece] =
     val s: String = stripAnsi(text).s
-    val pieces = List.newBuilder[Piece]
+    val pieces = sci.List.newBuilder[Piece]
     var i = 0
     while i < s.length do
       val char = s.charAt(i)
@@ -183,7 +185,7 @@ object SemanticRender:
         val word: Text = s.substring(start, i).nn.tt
         pieces += Piece.Word(e"$word", word.length)
 
-    pieces.result()
+    List.of(pieces.result())
 
   // Word-wraps a PLAIN (no semantic markup) message for the terminal, through the same flow — no
   // styling, so the wrapped Teletype's plain text is returned directly.
@@ -199,7 +201,7 @@ object SemanticRender:
   // by harlequin (`Tokenized` depth — no compiler, no classpath) and emitted as `tok-<accent>` spans,
   // the same classes the web editor already colours.
   private def htmlNodes(nodes: List[Markup], reifier: Optional[Reifier])(using Imports): Text =
-    nodes.map { node => htmlNode(node, reifier) }.join
+    nodes.map { (node: Markup) => htmlNode(node, reifier) }.join
 
   private def htmlNode(markup: Markup, reifier: Optional[Reifier])(using Imports): Text = markup match
     case Markup.Textual(text)               => htmlPlain(text)
@@ -217,11 +219,11 @@ object SemanticRender:
   // as `tok-*` spans. Newlines are re-inserted between the token lines, exactly as `Repl.project` does.
   private def htmlHighlight(text: Text, context: Scala.Context): Text =
     val lines: List[List[harlequin.Token]] =
-      Scala.highlight(stripAnsi(text), context).lines.to(List).map(_.to(List))
+      List.from(Scala.highlight(stripAnsi(text), context).lines.readable)
 
     lines
-     . map: line =>
-         line.map: token =>
+     . map: (line: List[harlequin.Token]) =>
+         line.map: (token: harlequin.Token) =>
            t"""<span class="tok-${token.accent.toString.tt.lower}">${escapeHtml(token.text)}</span>"""
          . join
      . join(t"\n")
