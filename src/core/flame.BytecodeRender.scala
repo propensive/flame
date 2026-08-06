@@ -1,7 +1,22 @@
                                                                                                   /*
 ┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓
 ┃                                                                                                  ┃
-┃    Soundness, version 0.54.0. © Copyright 2021-25 Jon Pretty, Propensive OÜ.                     ┃
+┃                     ╭────────╮╌──╮                                                               ┃
+┃                     │   ╭────╯   │                                                               ┃
+┃                     │   │    │   │                                                               ┃
+┃                     │   ╰──╮ │   │╭─────────╮╭───╮╌────╮╌────╮╭────────╮                         ┃
+┃                     │   ╭──╯ │   ││   ╭─╮   ││   ╭─╮   ╭─╮   ││   ╭─╮  │                         ┃
+┃                     │   │    │   ││   │ │   ││   │ │   │ │   ││   ╰─╯  │                         ┃
+┃                     │   │    │   ││   │ │   ││   │ │   │ │   ││   ╭────╯                         ┃
+┃                     │   │    │   ││   ╰─╯   ││   │ │   │ │   ││   ╰────╮                         ┃
+┃                     ╰───╯    ╰───╯╰────╌╰───╯╰───╯ ╰───╯ ╰───╯╰────────╯                         ┃
+┃                                                                                                  ┃
+┃    Flame, version 0.1.0.                                                                         ┃
+┃    © Copyright 2026 Jon Pretty, Propensive OÜ.                                                   ┃
+┃                                                                                                  ┃
+┃    The primary distribution site is:                                                             ┃
+┃                                                                                                  ┃
+┃        https://propensive.com/                                                                   ┃
 ┃                                                                                                  ┃
 ┃    Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file     ┃
 ┃    except in compliance with the License. You may obtain a copy of the License at                ┃
