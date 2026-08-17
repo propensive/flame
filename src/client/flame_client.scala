@@ -60,17 +60,21 @@ import profanity.Interrupt
 import backstops.silentBackstop
 import classloaders.threadContextClassloader
 import executives.completions
-import filesystemBackends.virtualMachine
+import filesystemBackends.virtualMachineFilesystem
 import filesystemOptions.createNonexistentParents.enabled
 import filesystemOptions.deleteRecursively.disabled
 import filesystemOptions.overwritePreexisting.disabled
 import harlequin.Accent
+// `border` is the one ultimatum layout combinator the `soundness` umbrella does not re-export —
+// `panel`, `stack`, `strip`, `layout` and `paint` all are — so it is named directly from its own
+// package rather than reached through the umbrella.
+import ultimatum.border
 import interfaces.paths.pathOnLinux
 import internetAccess.online
 import interpreters.posixInterpreter
 import logging.silentLogging
 import probates.cancelProbate
-import socketBackends.virtualMachine
+import socketBackends.virtualMachineSockets
 import supervisors.globalSupervisor
 import systems.javaSystem
 import temporaryDirectories.systemTemporaryDirectory
@@ -82,9 +86,15 @@ val Listen = Subcommand("listen", "serve the terminal REPL over TCP, for remote 
 val Port = Flag[Int]("port", false, List('p'), "a TCP port — the web front-end, or a remote REPL server")
 val Host = Flag[Text]("host", false, List('H'), "connect to a flame REPL server running on this host")
 val Session = Flag[Text]("session", false, List('s'), "join an existing REPL session by name")
-val SetOpt = Flag[List[Text]]("set", true, Nil, "compiler settings to enable on startup (space-separated)")
-val LanguageOpt = Flag[List[Text]]("language", true, Nil, "language features to enable on startup (space-separated)")
 val Basic = Flag[Unit]("basic", false, Nil, "run a minimal, in-process, synchronous line-based REPL")
+
+// One flag per `/set`/`/language` setting, so every setting is enabled by name —
+// `flame --experimental --captureChecking`. Derived from the single list in `Repl.settings`, so the
+// flags, the REPL's own commands and their completions cannot drift apart: a setting added there is
+// a `--flag` here for free, and this is the ONLY way to set one from the command line.
+val settingFlags: List[(Repl.Setting, Flag of Unit)] =
+  Repl.settings.map: setting =>
+    (setting, Flag[Unit](setting.name, false, Nil, setting.description))
 
 // Exoskeleton's derived `Int is Interpretable` decodes through a `Decodable[Int]` that captures its
 // `Tactic[NumberError]`; under capture checking that impure instance cannot satisfy `Flag.apply`'s
@@ -112,25 +122,25 @@ private inline def command
     given Environment = caps.unsafe.unsafeAssumePure(summon[Invocation].environment)
     body
 
-// Reads a repeatable settings flag, offering the `/set`/`/language` feature names of `kind` as
-// tab-completions for its value. The `Interpretable`/`Discoverable` givens are scoped to this read so
-// the two flags' different suggestion lists don't clash.
-private def settingValues(flag: Flag of List[Text], kind: Repl.Kind)(using Cli, Interpreter): List[Text] =
-  given (List[Text]) is Interpretable = _.map(_())
-  given (List[Text]) is Discoverable =
-    _ => Repl.settings.filter(_.kind == kind).map { setting => Suggestion(setting.name) }.stdlib
-  flag().or(Nil)
+// The settings named by their own flags (`--experimental`, `--feature`, …).
+//
+// EVERY flag is read, not just until one matches: reading a flag is what registers it with
+// Exoskeleton (`Flag#apply` calls `cli.register`), and registration is the only way it reaches the
+// completion output. A read placed behind a condition — or inside `execute`, whose block does not
+// run at all in completion mode — silently costs that flag its tab-completion.
+private def flaggedSettings(using Cli, Interpreter): List[Repl.Setting] =
+  settingFlags.filter { (_, flag) => flag().present }.map { (setting, _) => setting }
 
-// The `/set`/`/language` commands to run on startup, from `--set`/`--language` (compiler settings
-// applied first, so `--set experimental` unlocks any experimental `--language` features).
+// The `/set`/`/language` commands to run on startup, one per setting flag given. Compiler settings
+// are applied FIRST, so `--experimental` unlocks the experimental `--language` features named
+// alongside it — `/language captureChecking` is rejected until `/set experimental` has run.
 private def initialSettings(using Cli, Interpreter): List[Text] =
-  val setCommands: List[Text] =
-    settingValues(SetOpt, Repl.Kind.Set).map { (name: Text) => t"/set $name" }
+  val flagged: List[Repl.Setting] = flaggedSettings
 
-  val languageCommands: List[Text] =
-    settingValues(LanguageOpt, Repl.Kind.Language).map { (name: Text) => t"/language $name" }
+  def named(kind: Repl.Kind): List[Text] = flagged.filter(_.kind == kind).map(_.name)
 
-  setCommands ::: languageCommands
+  named(Repl.Kind.Set).map { (name: Text) => t"/set $name" }
+  ::: named(Repl.Kind.Language).map { (name: Text) => t"/language $name" }
 
 // The default TCP port for `flame listen` (a remote-reachable REPL server) and for `flame --host`
 // when no `--port` is given. Arbitrary, but stable so the two ends agree without configuration.
@@ -143,11 +153,45 @@ val defaultPort: Int = 4319
 def runClient(): Unit =
   cli:
     arguments match
+      // `flame -<flag>…` — the terminal REPL with options: `-s NAME` joins a session, `--host HOST`
+      // (with optional `--port`) connects to a remote server (`flame listen`), and the settings flags
+      // enable settings on startup. This case fires only when the first token is a FLAG (`head` begins
+      // with `-`), which cannot be a subcommand.
+      //
+      // It is matched FIRST so that, when the word being completed is a flag, the subcommand patterns
+      // below are never evaluated. Matching a `Subcommand` also SUGGESTS it, and a suggestion at the
+      // cursor takes precedence over the flag list (`Completion`'s `cursorSuggestions` wins over
+      // `flagSuggestions`) — so trying the subcommands first left `flame --exp<TAB>` offering
+      // `serve`/`listen`/`install` and no flags at all. Ordering costs nothing at run time: a
+      // subcommand never begins with `-`, so no invocation changes meaning.
+      case Argument(head) :: _ if head.starts(t"-") =>
+        // EVERY flag this command accepts is read here, unconditionally and before any `command`,
+        // so that all of them register and are offered together for `flame --<TAB>`. Reading them
+        // lazily — at the point each is needed — would register only those on the branch actually
+        // taken, and reading them inside `command` would register none of them at all.
+        val settings: List[Text]     = initialSettings
+        val basic:    Boolean        = Basic().present
+        val host:     Optional[Text] = Host()
+        val port:     Int            = Port().or(defaultPort)
+        val session:  Optional[Text] = Session()
+
+        // `flame --basic` — a minimal, self-contained, in-process synchronous REPL (no socket
+        // server, no TUI). Checked before `--host`, so it never falls through to a remote/socket
+        // connection; it still honours the startup settings.
+        if basic then command(basicRepl(settings))
+        else host match
+          case host: Text => command(connectRemote(host, port, session, settings))
+          case _          => command(connectSocket(session, settings))
+
       // `flame serve [--port N | -p N]` — the web front-end (default port 8080). `Port()` registers
       // the flag (so it is offered in tab-completion) and reads its value; the pure `Int`
       // interpreter above yields `Unset` for an absent or non-numeric value, so `.or(8080)` falls back.
+      //
+      // The read is OUTSIDE `command`: in completion mode `execute` returns without running its
+      // block at all, so a flag read within it would never register and never be suggested.
       case Serve() :: _ =>
-        command(httpServe(Port().or(8080)))
+        val port: Int = Port().or(8080)
+        command(httpServe(port))
 
       // `flame install` — install this command's tab-completions into the user's shell.
       case Install() :: _ =>
@@ -157,7 +201,8 @@ def runClient(): Unit =
       // socket), so a `flame --host` client on another machine can reach its sessions. Defaults to
       // `defaultPort`; a non-numeric `--port` also falls back to it.
       case Listen() :: _ =>
-        command(serve(Port().or(defaultPort)))
+        val port: Int = Port().or(defaultPort)
+        command(serve(port))
 
       // Internal: the per-process UNIX-socket REPL server that `connectSocket`/`launchServer`
       // spawns in the background (see `launchServer`). Not a user-facing command — `serve` now
@@ -170,26 +215,6 @@ def runClient(): Unit =
       case Nil =>
         command(connectSocket(Session(), Nil))
 
-      // `flame -<flag>…` — the terminal REPL with options: `-s NAME` joins a session, `--host HOST`
-      // (with optional `--port`) connects to a remote server (`flame listen`), and `--set`/`--language`
-      // enable settings on startup. This case fires only when the first token is a FLAG (`head` begins
-      // with `-`), so it reads the flags there rather than in the catch-all — a flag read in a
-      // completion-visible catch-all would suppress the subcommand suggestions for the bare first word,
-      // whereas here the subcommands are already ruled out (the word starts with `-`), and their
-      // completions (`--set`/`--language` values etc.) are exactly what should be offered.
-      case Argument(head) :: _ if head.starts(t"-") =>
-        val settings: List[Text] = initialSettings
-
-        // `flame --basic` — a minimal, self-contained, in-process synchronous REPL (no socket
-        // server, no TUI). Checked before `--host`, so it never falls through to a remote/socket
-        // connection; it still honours `--set`/`--language` startup settings.
-        if Basic().present then command(basicRepl(settings))
-        else Host() match
-          case host: Text =>
-            command(connectRemote(host, Port().or(defaultPort), Session(), settings))
-
-          case _ =>
-            command(connectSocket(Session(), settings))
 
       case _ =>
         command(Exit.Fail(1))
@@ -201,7 +226,7 @@ private def serve(portNumber: Int)(using Stdio, Monitor, Probate, System): Exit 
 
   safely(urticose.Port[Tcp](portNumber)).lay(invalidPort(portNumber)): port =>
     recover:
-      case BindError(_) => Out.println(t"Port $portNumber is unavailable"); Exit.Fail(5)
+      case Bind.Error(_) => Out.println(t"Port $portNumber is unavailable"); Exit.Fail(5)
       case error: Error => Out.println(t"${error.message}"); Exit.Fail(6)
 
     . protect:
@@ -369,7 +394,7 @@ private def serveSocket()(using Stdio, Monitor, Probate, System): Exit =
   // never lingers as a stale file a later client has to clean up.
   val removeSocket: Runnable = () =>
     recover:
-      case _: PathError | _: IoError => ()
+      case _: Path.Error | _: IoError => ()
     . protect:
       socketPath.as[Path on Linux].wipe()
       ()
@@ -382,7 +407,7 @@ private def serveSocket()(using Stdio, Monitor, Probate, System): Exit =
     // if the directory exists), unlike `Files.createDirectories`, so the directory (which persists
     // across processes) is created only when absent.
     recover:
-      case _: PathError | _: IoError => ()
+      case _: Path.Error | _: IoError => ()
     . protect:
       val directory = socketDirectory.as[Path on Linux]
       if !directory.existent() then directory.create[Directory]()
@@ -395,7 +420,7 @@ private def serveSocket()(using Stdio, Monitor, Probate, System): Exit =
     service.stop()
 
     recover:
-      case _: PathError | _: IoError => ()
+      case _: Path.Error | _: IoError => ()
     . protect:
       socketPath.as[Path on Linux].wipe()
 
@@ -427,7 +452,7 @@ private def serverClassloader(using System): Classloader =
   // launcher). Either way we fall back to the thread-context loader.
   try
     recover:
-      case _: PathError | _: IoError => threadContextClassloader
+      case _: Path.Error | _: IoError => threadContextClassloader
     . protect:
       val executable: Text = unsafely(System.properties.ethereal.script[Text]())
       val tmpDir: Path on Linux = temporaryDirectory/Uuid()
@@ -474,8 +499,8 @@ private def unreachableRemote(host: Text, portNumber: Int)(using Stdio): Exit =
 // `duplex` loan introduces. The loan confines the connection to `body`, so a pure connectable is
 // sound here: seal it for this call. (The domain-socket connectable carries no `caps.any`, so
 // `connectDomain` needs no such seal.)
-private def connect[result](endpoint: Endpoint[TcpPort])(body: Duplex => result): Optional[result] =
-  given (Endpoint[TcpPort] is Connectable) = caps.unsafe.unsafeAssumePure(Connectable.tcpEndpoint)
+private def connect[result](endpoint: Endpoint[Tcp.Port])(body: Duplex => result): Optional[result] =
+  given (Endpoint[Tcp.Port] is Connectable) = caps.unsafe.unsafeAssumePure(Connectable.tcpEndpoint)
   try endpoint.duplex(body) catch case _: ji.IOException => Unset
 
 // As `connect`, but over a UNIX domain socket.
@@ -521,12 +546,12 @@ private def launchServer[result]()(using Stdio, System)(body: Duplex => result):
     result
 
 // TEMPORARY keyboard diagnostic. Instead of the editor, print each terminal event
-// as a Profanity `Keypress` (or other `TerminalEvent`), so we can see exactly how
+// as a Profanity `Keypress` (or other `Terminal.Event`), so we can see exactly how
 // keys — including Shift+Enter — are decoded. With `kitty = true` the kitty
 // keyboard protocol is enabled first. Ctrl+C or Ctrl+D stops it.
 private def keyTest(kitty: Boolean)(using Stdio, Monitor, Probate, Console, Environment): Exit =
   recover:
-    case TerminalError() =>
+    case Terminal.Error() =>
       Out.println(t"The terminal could not be initialised")
       Exit.Fail(4)
 
@@ -560,7 +585,7 @@ private def keyTest(kitty: Boolean)(using Stdio, Monitor, Probate, Console, Envi
 // so this is empty on the first run; an undecodable directory path yields nothing).
 private def socketPaths(directory: Text): List[Text] =
   recover:
-    case _: PathError => Nil
+    case _: Path.Error => Nil
   . protect:
     val names: Chain[Text] = directory.as[Path on Linux].children.map(_.encode)
     List.from(names.stdlib.filter(_.ends(t".sock")))
@@ -580,7 +605,7 @@ private def connectSocket(join: Optional[Text], initial: List[Text])
     if connectDomain(DomainSocket(path)) { _ => () }.absent
     then
       recover:
-        case _: PathError | _: IoError => ()
+        case _: Path.Error | _: IoError => ()
       . protect:
         path.as[Path on Linux].wipe()
     else live += path
@@ -613,13 +638,13 @@ private def connectRemote(host: Optional[Text], portNumber: Int, join: Optional[
   host.lay(missingHost): hostText =>
     safely(urticose.Port[Tcp](portNumber)).lay(invalidPort(portNumber)): port =>
       recover:
-        case HostnameError(_, _) => invalidHost(hostText)
+        case Hostname.Error(_, _) => invalidHost(hostText)
       . protect:
-          val endpoint: Endpoint[TcpPort] = hostText.as[Hostname] on port
+          val endpoint: Endpoint[Tcp.Port] = hostText.as[Hostname] on port
           connect(endpoint)(converse(join, initial)(_)).or(unreachableRemote(hostText, portNumber))
 
 // The read/edit/print loop. The server's reply is printed verbatim. Ctrl+C/Ctrl+D
-// dismiss the line editor (`DismissError`) and end the session.
+// dismiss the line editor (`Question.Error`) and end the session.
 private def converse(join: Optional[Text], initial: List[Text])(duplex: Duplex)
     (using Stdio, Monitor, Probate, Console, Environment)
 :   Exit =
@@ -634,7 +659,7 @@ private def converse(join: Optional[Text], initial: List[Text])(duplex: Duplex)
   val nextId      = juc.atomic.AtomicInteger(1)          // 0 is reserved for submit
 
   recover:
-    case TerminalError() =>
+    case Terminal.Error() =>
       Out.println(t"The terminal could not be initialised")
       Exit.Fail(4)
 
@@ -753,56 +778,57 @@ private def runRepl
     while live do
       val data: Optional[Data] = frames.next()
 
-      if data.absent then live = false
-      else safely(Bintel.read[Repl.Reply](data.vouch)).let:
-        case Repl.Reply.Tokenized(id, highlight, incomplete) =>
-          pending.remove(id).foreach(state.reconcile(_, highlight))
-          incompletePending.remove(id).foreach { value => incompleteFor = (value, incomplete) }
-          terminal.events.put(TerminalInfo.Redraw)
+      // Braced, so the assignment is a block rather than a named argument.
+      data.lay({ live = false }): bytes =>
+        safely(Bintel.read[Repl.Reply](bytes)).let:
+          case Repl.Reply.Tokenized(id, highlight, incomplete) =>
+            pending.remove(id).foreach(state.reconcile(_, highlight))
+            incompletePending.remove(id).foreach { value => incompleteFor = (value, incomplete) }
+            terminal.events.put(Terminal.Info.Redraw)
 
-        case Repl.Reply.Completed(id, items) =>
-          if id == 0 then completions.put(items)
-          else ghostPending.remove(id).foreach: forValue =>
-            ghostReply = (forValue, items)
-            terminal.events.put(TerminalInfo.Redraw)
+          case Repl.Reply.Completed(id, items) =>
+            if id == 0 then completions.put(items)
+            else ghostPending.remove(id).foreach: forValue =>
+              ghostReply = (forValue, items)
+              terminal.events.put(Terminal.Info.Redraw)
 
-        case reply: Repl.Reply.Session =>
-          sessionReplies.put(reply)
+          case reply: Repl.Reply.Session =>
+            sessionReplies.put(reply)
 
-        // The placeholder ack for an async submission: note its id, then unblock the waiting submit
-        // (which shows the "evaluating" panel). The real reply follows later with the same id.
-        case reply @ Repl.Reply.Pending(id) =>
-          asyncPending(id) = ()
-          submits.put(reply)
+          // The placeholder ack for an async submission: note its id, then unblock the waiting submit
+          // (which shows the "evaluating" panel). The real reply follows later with the same id.
+          case reply @ Repl.Reply.Pending(id) =>
+            asyncPending(id) = ()
+            submits.put(reply)
 
-        // A streamed chunk of an async run's stdout: accumulate it and, if the transcript entry is
-        // recorded, refresh its live display and replay so the output appears as it is produced. (If
-        // the entry isn't recorded yet, the submit loop applies the accumulated output when it files it.)
-        case Repl.Reply.Output(id, chunk) =>
-          asyncOutput(id) = asyncOutput.getOrElse(id, t"") + chunk
+          // A streamed chunk of an async run's stdout: accumulate it and, if the transcript entry is
+          // recorded, refresh its live display and replay so the output appears as it is produced. (If
+          // the entry isn't recorded yet, the submit loop applies the accumulated output when it files it.)
+          case Repl.Reply.Output(id, chunk) =>
+            asyncOutput(id) = asyncOutput.getOrElse(id, t"") + chunk
 
-          asyncEntries.get(id).foreach: entry =>
-            entry.result = evaluating(id)
+            asyncEntries.get(id).foreach: entry =>
+              entry.result = evaluating(id)
+              asyncReplay = true
+              terminal.events.put(Terminal.Info.Redraw)
+
+          // An out-of-band fill for an async submission (id previously seen via `Pending`): update the
+          // matching transcript entry — or stash the text if the entry isn't recorded yet — and replay.
+          case reply if asyncPending.contains(replyId(reply)) =>
+            val id = replyId(reply)
+            asyncPending.remove(id)
+            asyncOutput.remove(id)
+            val text = replyText(reply)
+
+            asyncEntries.remove(id) match
+              case Some(entry) => entry.result = text
+              case None        => asyncResults(id) = text
+
             asyncReplay = true
-            terminal.events.put(TerminalInfo.Redraw)
+            terminal.events.put(Terminal.Info.Redraw)
 
-        // An out-of-band fill for an async submission (id previously seen via `Pending`): update the
-        // matching transcript entry — or stash the text if the entry isn't recorded yet — and replay.
-        case reply if asyncPending.contains(replyId(reply)) =>
-          val id = replyId(reply)
-          asyncPending.remove(id)
-          asyncOutput.remove(id)
-          val text = replyText(reply)
-
-          asyncEntries.remove(id) match
-            case Some(entry) => entry.result = text
-            case None        => asyncResults(id) = text
-
-          asyncReplay = true
-          terminal.events.put(TerminalInfo.Redraw)
-
-        case reply =>
-          submits.put(reply)
+          case reply =>
+            submits.put(reply)
 
   // Start this connection's session: join the one named by `-s`/`--session` if it exists, otherwise
   // let the server assign a fresh animal name. Show the resulting session, noting when a requested
@@ -970,7 +996,7 @@ private def runRepl
           case Keypress.Ctrl('C' | 'D') => running = false; editing = false
           case Keypress.Escape          => running = false; editing = false
 
-          case _: TerminalInfo.WindowSize =>
+          case _: Terminal.Info.WindowSize =>
             // A resize reflows all prior on-screen content unpredictably, so there is no sound
             // way to reconcile the existing inline layout. Instead WIPE the screen and reset the
             // block, then — once the resize settles (hysteresis) — redraw the editor fresh from the
@@ -985,11 +1011,11 @@ private def runRepl
               jl.Thread.sleep(200)
               if resizeGen == gen then
                 resizeReplay = true
-                terminal.events.put(TerminalInfo.Redraw)
+                terminal.events.put(Terminal.Info.Redraw)
 
           // A tokenize reply arrived (posted by the reader): re-derive the highlight
           // from the reconciled checkpoint and repaint, with no edit and no new request.
-          case TerminalInfo.Redraw =>
+          case Terminal.Info.Redraw =>
             // The settle after a resize: lay the whole session out afresh from the top, then draw
             // the (reset) editor immediately below it. Otherwise it is a tokenize repaint.
             if resizeReplay || asyncReplay then
@@ -1221,7 +1247,7 @@ private def runRepl
               // The final reply already arrived — apply it; no need to register for streaming.
               entry.result = text
               asyncReplay = true
-              terminal.events.put(TerminalInfo.Redraw)
+              terminal.events.put(Terminal.Info.Redraw)
 
             case None =>
               // Register so the reader can stream stdout into this entry and finally fill it; apply any
@@ -1230,7 +1256,7 @@ private def runRepl
               if asyncOutput.contains(sid) then
                 entry.result = evaluating(sid)
                 asyncReplay = true
-                terminal.events.put(TerminalInfo.Redraw)
+                terminal.events.put(Terminal.Info.Redraw)
 
   // The loop has exited (Ctrl+D/C, Escape, /quit, or a closed stream): stop the reader.
   live = false
@@ -1339,8 +1365,17 @@ private def replyText(reply: Repl.Reply): Text = reply match
       if rendered == t"" then t"" else
         val binding: Teletype =
           name.lay(e"") { each => e"$Italic(${palette.scalaTerm}($each)) ${palette.scalaParenthesis}(=) " }
+        // A singleton type also shows the type it widens to, after a `<:`. It is coloured exactly as
+        // the type is — it IS a type — but `Faint`, so it reads as context about the result's type
+        // rather than as part of it: `42: 42 <: Int` says the result is a `42`, and that a `42` is
+        // an `Int`.
         val typed: Teletype =
-          tpe.lay(e"") { each => e"${palette.scalaSymbol}(:) ${palette.scalaType}($each)" }
+          tpe.lay(e""): each =>
+            val widened: Teletype =
+              each.base.lay(e""): base =>
+                e" $Faint(${palette.scalaSymbol}(<:) ${palette.scalaType}($base))"
+
+            e"${palette.scalaSymbol}(:) ${palette.scalaType}(${each.text})$widened"
 
         t"${e"$binding$rendered$typed".render(xtermTrueColorTermcap)}\n"
 

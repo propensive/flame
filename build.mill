@@ -21,18 +21,33 @@ object settings:
   // rejects flame's (and Soundness's) capture-checked code in its `cc` phase, and cannot read
   // `mandible`/`hyperbole` TASTy. A standard-Scala build was attempted and abandoned for these
   // reasons.
-  // Moved to the 3.9.0-RC4 stream (matching Soundness origin/main) for `-Xsemantic-diagnostics`,
-  // the compiler support behind the `delicious` semantic-diagnostics module. From RC4-p1 the tag
-  // and jar-coordinate version coincide, so no `-propensive` suffix.
-  val scalaVersion = sys.env.getOrElse("SOUNDNESS_SCALA_VERSION", "3.9.0-RC4-p9")
+  // On the 3.9.0-RC5 stream, matching Soundness's own default — and the compiler that built the
+  // Soundness bundles this depends on — for `-Xsemantic-diagnostics`, the compiler support behind the
+  // `delicious` semantic-diagnostics module. From RC4-p1 the tag and jar-coordinate version coincide,
+  // so no `-propensive` suffix.
+  //
+  // The parallel 3.10.0-dev stream was tried and does NOT work yet. TASTy is not the obstacle: a
+  // 3.10.0-dev-p11 compiler reads the 3.9.0-RC5-p11-built Soundness TASTy without complaint. What
+  // breaks is (a) `ReplModuleCompiler`'s use of dotc internals — `CompilationUnitInfo`'s
+  // `tastyInfo: Option[TastyInfo]` became `tastyInfoLoader: () => Option[TastyInfo]` — and, past
+  // that, (b) a `RecursionOverflow` in 3.10's capture-checking phase on `Repl.Warm.Request.Compile`.
+  //
+  // NOTE these two `sys.env` overrides do NOT work under Mill: the value is read when the build
+  // script is evaluated, and neither a fresh daemon nor `--no-daemon` propagates the variable. To
+  // switch toolchains, edit the defaults here.
+  val scalaVersion = sys.env.getOrElse("SOUNDNESS_SCALA_VERSION", "3.9.0-RC5-p11")
   // The propensive/proscala release the toolchain jars are downloaded from (unless a local
-  // `SOUNDNESS_SCALA_HOME` is set), exactly as in the Soundness build.
-  val scalaRelease = sys.env.getOrElse("SOUNDNESS_SCALA_RELEASE", "3.9.0-RC4-p9")
+  // `SOUNDNESS_SCALA_HOME` is set), exactly as in the Soundness build — which now takes its jars
+  // from the LATER `-p13` release while still coordinating them as `-p11`. The two are deliberately
+  // different: the synthetic repository below republishes whatever the release ships under
+  // `scalaVersion`, so the pair must be kept in step with Soundness's own, or flame would compile
+  // against a different compiler build from the one that produced the Soundness TASTy it reads.
+  val scalaRelease = sys.env.getOrElse("SOUNDNESS_SCALA_RELEASE", "3.9.0-RC5-p13")
   // Empty by default → download `scalaRelease`. Set to a local `make`-built `release` directory
   // to use its `release/lib` jars directly (fork-developer mode).
   val scalaHome = sys.env.getOrElse("SOUNDNESS_SCALA_HOME", "")
 
-  val soundnessVersion = "0.64.0"
+  val soundnessVersion = "0.65.0"
 
   // The Maven Central version flame's OWN modules (`flame-core`, `flame-web`, `flame-client`) are
   // published under, AND the version the `launcher` module resolves them at. Kept as a single value
@@ -50,6 +65,11 @@ object settings:
     "-Wunused:imports",
     "-Wimplausible-patterns",
     "-Xmax-inlines", "32",
+    // Emit JSR-45 SMAPs (SourceDebugExtension) mapping inlined code back to its source, as the
+    // Soundness build does. Flame's own code is heavily inlined Soundness code, so without this a
+    // frame in one of flame's own classes resolves to a synthetic line with no way back to the call
+    // site; with it, `StackTraceRender`'s resolver can name and expand each frame's inline chain.
+    "-Xjsr45",
     "-Yno-flexible-types",
     "-Yexplicit-nulls",
     "-Ycheck-all-patmat",
@@ -79,51 +99,26 @@ object settings:
   // import, and cross the boundary through `proscenium.compat`.
   val predef = Seq("-Yno-predef", "-Yimports:java.lang,proscenium")
 
-  // The `soundness-all` umbrella: every Soundness module, so a Flame user can `import
-  // soundness.*` in the REPL and reach all of it. The cost is that Flame's OWN sources also
-  // see every top-level name — some clash with `scala.*` (e.g. a linear-algebra `Vector`
-  // shadowing `scala.Vector`); those are disambiguated with a named `import scala.X` where
-  // they occur (see `flame_client.scala`).
-  // `hyperbole` (TASTy-tree introspection, for `/tasty`) and `mandible` (JVM bytecode
-  // disassembly, for `/bytecode`) are NOT part of the `soundness-all` umbrella (both embryonic),
-  // so they are added explicitly — bringing escapade, dendrology, escritoire and iridescence onto
-  // the REPL's compile+run classpath transitively (mandible depends on hyperbole).
-  val coreDeps = Seq(
-    mvn"dev.soundness:soundness-all:$soundnessVersion",
-    mvn"dev.soundness:hyperbole-core:$soundnessVersion",
-    mvn"dev.soundness:mandible-core:$soundnessVersion",
-    // `delicious` interprets the compiler's `-Xsemantic-diagnostics` markup and re-renders the types
-    // it carries through stenography; the `scala` sub-module (the TASTy-unpickling `Reifier`) is
-    // compiler-backed, hence not in the `soundness-all` umbrella.
-    mvn"dev.soundness:delicious-core:$soundnessVersion",
-    mvn"dev.soundness:delicious-scala:$soundnessVersion",
-    mvn"dev.soundness:delicious-ansi:$soundnessVersion")
-
-  val clientDeps = Seq(
-    mvn"dev.soundness:ethereal-core:$soundnessVersion",
-    mvn"dev.soundness:exoskeleton-completions:$soundnessVersion",
-    mvn"dev.soundness:profanity-core:$soundnessVersion",
-    mvn"dev.soundness:urticose-core:$soundnessVersion",
-    mvn"dev.soundness:escapade-core:$soundnessVersion",
-    mvn"dev.soundness:iridescence-core:$soundnessVersion",
-    mvn"dev.soundness:harlequin-ansi:$soundnessVersion",
-    mvn"dev.soundness:escritoire-core:$soundnessVersion",
-    mvn"dev.soundness:ultimatum-core:$soundnessVersion",
-    // Burdock packaging: `Embed` (the compile-time macro) lives in burdock-core;
-    // burdock-boot supplies the `burdock.Bootstrap` class the repackager force-includes.
-    mvn"dev.soundness:burdock-core:$soundnessVersion",
-    mvn"dev.soundness:burdock-boot:$soundnessVersion")
-
-  val testDeps = Seq(
-    mvn"dev.soundness:probably-cli:$soundnessVersion",
-    mvn"dev.soundness:spectacular-core:$soundnessVersion")
-
-  // The web front-end: an HTTP server (scintillate), WebSockets (perihelion), and an
-  // HTML page DSL (graffiti). honeycomb/cataclysm/telekinesis/coaxial come transitively.
-  val webDeps = Seq(
-    mvn"dev.soundness:scintillate-server:$soundnessVersion",
-    mvn"dev.soundness:perihelion-core:$soundnessVersion",
-    mvn"dev.soundness:graffiti-core:$soundnessVersion")
+  // Soundness publishes BUNDLES, not components (Soundness #1744): the ~230 per-component
+  // coordinates this build used to name (`ethereal-core`, `hyperbole-core`, `soundness-all`, …) no
+  // longer exist, and the organization moved from `dev.soundness` to `dev.propensive`.
+  //
+  // `dev.propensive:soundness` is the universal artifact — a POM-only aggregate of the eight
+  // non-opt-in bundles (base, cli, data, sci, test, tool, web, wasi), and the direct successor to
+  // the old `soundness-all` umbrella. Every module takes it, for the same reason `soundness-all`
+  // was taken before: a Flame user must be able to `import soundness.*` in the REPL and reach all
+  // of Soundness, which means all of it has to be on the session's compile+run classpath.
+  //
+  // The cost is unchanged: Flame's OWN sources also see every top-level name, and some clash with
+  // `scala.*` (e.g. a linear-algebra `Vector` shadowing `scala.Vector`); those are disambiguated
+  // with a named `import scala.X` where they occur (see `flame_client.scala`).
+  //
+  // Bundle jars carry no `_3` suffix (`artifactSuffix = ""` in the Soundness build), hence the
+  // single-colon `mvn"…"`. The two opt-in bundles (`soundness-staged`, `soundness-android`) are
+  // excluded from the universal POM and are not needed here: `delicious` (including the
+  // compiler-backed `-scala` half) is in `soundness-tool`, and `mandible` — split across
+  // `soundness-test` (bytecode) and `soundness-tool` (host archives) — is covered by both.
+  val soundnessDeps = Seq(mvn"dev.propensive:soundness:$soundnessVersion")
 
 // Exposes the fork compiler's `release/lib` jars (from a local build via `settings.scalaHome`, or
 // downloaded from the `settings.scalaRelease` GitHub release) as a Maven-layout repository,
@@ -239,6 +234,23 @@ trait Toolchain extends ScalaModule:
   override def repositories: T[Seq[String]] = Task:
     super.repositories() :+ s"file://${toolchain.repo().path}"
 
+  // The Soundness bundle POMs name the fork toolchain at the version Soundness itself was built
+  // with — `soundness-base`/`-test`/`-tool` all pin `scala-library`, `scala3-compiler_3` and
+  // `scala3-staging_3`, and `soundness-tool` also `scala3-tasty-inspector_3`. The synthetic
+  // repository above only ever contains `settings.scalaVersion`, and no fork version exists on
+  // Central, so any pin that differs from ours is unresolvable. Forcing them all to
+  // `settings.scalaVersion` is what lets flame be built by a compiler from a *different* proscala
+  // stream than the one that produced the Soundness jars.
+  override def depManagement: T[Seq[Dep]] = Task:
+    super.depManagement() ++ Seq(
+      mvn"org.scala-lang:scala-library:${settings.scalaVersion}",
+      mvn"org.scala-lang:scala3-library_3:${settings.scalaVersion}",
+      mvn"org.scala-lang:scala3-interfaces:${settings.scalaVersion}",
+      mvn"org.scala-lang:tasty-core_3:${settings.scalaVersion}",
+      mvn"org.scala-lang:scala3-compiler_3:${settings.scalaVersion}",
+      mvn"org.scala-lang:scala3-staging_3:${settings.scalaVersion}",
+      mvn"org.scala-lang:scala3-tasty-inspector_3:${settings.scalaVersion}")
+
   override def scalaCompilerClasspath: T[Seq[PathRef]] = Task:
     // The fork-built jars come from the repository view because Zinc locates the standard
     // library within this classpath BY FILENAME (`scala-library-<version>*.jar`), and the
@@ -266,13 +278,24 @@ trait Project extends Module:
 trait Component(dependencies: PublishModule*) extends Toolchain:
   override def scalaVersion = settings.scalaVersion
   override def scalacOptions = settings.scalaOptions ++ settings.predef
+
+  // The beneficence plugin writes `META-INF/givens/<typeclass>` and `META-INF/services/probably.Suite`
+  // into every module that contributes an entry, so each is a *fragment* of a build-wide index rather
+  // than a whole file. Mill's default assembly rules are last-one-wins, which silently truncates them:
+  // now that flame's Soundness dependency arrives as eight bundle jars — which collide on 66 such
+  // entries — the givens index would lose almost everything, and `beneficence` reads it at runtime
+  // through `getResources`. Concatenate instead, exactly as the Soundness build does (`mergeRules`).
+  // Every fragment ends with a newline, so the empty separator is correct.
+  override def assemblyRules = super.assemblyRules ++ Seq(
+    mill.javalib.Assembly.Rule.AppendPattern("META-INF/givens/.*"),
+    mill.javalib.Assembly.Rule.AppendPattern("META-INF/services/.*"))
   def moduleId: String = moduleDir.last
   def moduleDeps: Seq[PublishModule] = dependencies
   def sources = Task.Sources(moduleDir)
 
 // Mixed into the library modules that are released to Maven Central (`core`, `web`, `client`) — the
 // modules the `launcher` then pulls back in as published coordinates. Every setting mirrors the
-// Soundness build (`soundness/build.mill`, `BaseScalaModule`): the same `dev.soundness` organization,
+// Soundness build (`soundness/build.mill`, `BaseScalaModule`): the same `dev.propensive` organization,
 // URL, Apache-2.0 licence, GitHub SCM and developer, plus the empty `-javadoc.jar` that satisfies
 // Central without generating real docs. `SonatypeCentralPublishModule` targets the Central Portal
 // (central.sonatype.com), driven by the standard `MILL_SONATYPE_*`/`MILL_PGP_*` env vars at release.
@@ -284,7 +307,7 @@ trait Publishing extends Toolchain, SonatypeCentralPublishModule:
 
   def pomSettings = Task(PomSettings(
     description = "flame",
-    organization = "dev.soundness",
+    organization = "dev.propensive",
     url = "https://soundness.dev/",
     licenses = Seq(License.`Apache-2.0`),
     versionControl = VersionControl.github("propensive", "flame"),
@@ -298,24 +321,24 @@ trait Publishing extends Toolchain, SonatypeCentralPublishModule:
 
 object flame extends Project:
   // The REPL engine. Depends on the Scala 3 compiler (it compiles user input) in addition to its
-  // published Soundness components. Published to Maven Central as `dev.soundness:flame-core`.
+  // published Soundness components. Published to Maven Central as `dev.propensive:flame-core`.
   object core extends Component(), Publishing:
     def mvnDeps =
-      settings.coreDeps :+ mvn"org.scala-lang:scala3-compiler_3:${settings.scalaVersion}"
+      settings.soundnessDeps :+ mvn"org.scala-lang:scala3-compiler_3:${settings.scalaVersion}"
 
   // The interactive client library (`flame.runClient` and its helpers). NO LONGER an assembled app:
   // the `@main`/`externalize` entry point moved to the `launcher` module, so this is a plain library
-  // published to Maven Central as `dev.soundness:flame-client`. Depends on `core` and `web` (so
+  // published to Maven Central as `dev.propensive:flame-client`. Depends on `core` and `web` (so
   // `flame serve` can launch the web front-end in-process); those become `flame-core`/`flame-web`
   // POM dependencies, and the web front-end's Soundness deps come transitively.
   object client extends Component(core, web), Publishing:
-    def mvnDeps = settings.clientDeps
+    def mvnDeps = settings.soundnessDeps
 
   // An alternative, web-based front-end (`flame.web`): serves a page and forwards REPL input/output
   // over a WebSocket, driving the same `core` engine as the CLI client. Published as
-  // `dev.soundness:flame-web`; still assembled directly by `make web`, hence `finalMainClass`.
+  // `dev.propensive:flame-web`; still assembled directly by `make web`, hence `finalMainClass`.
   object web extends Component(core), Publishing:
-    def mvnDeps = settings.webDeps
+    def mvnDeps = settings.soundnessDeps
     def finalMainClass = "flame.web"
     def prependShellScript = ""
 
@@ -332,14 +355,16 @@ object flame extends Project:
   // `publishLocal` copy has different bytes and would be inlined, not externalized).
   object launcher extends Component():
     def mvnDeps = Seq(
-      mvn"dev.soundness:flame-client:${settings.flameVersion}",
-      mvn"dev.soundness:burdock-core:${settings.soundnessVersion}",
-      mvn"dev.soundness:burdock-boot:${settings.soundnessVersion}")
+      mvn"dev.propensive:flame-client:${settings.flameVersion}",
+      // Burdock is no longer separately published: `burdock.Bootstrap` (which the repackager
+      // force-includes), the `externalize` macro and the `soundness.repackage` main that `make flame`
+      // invokes all ship in the `soundness-cli` bundle, and in no other.
+      mvn"dev.propensive:soundness-cli:${settings.soundnessVersion}")
     def finalMainClass = "flame.repl"
     // A clean zip (no executable shell preamble) so the Burdock repackager can read and rewrite the
     // assembled JAR.
     def prependShellScript = ""
 
   object test extends Component(core):
-    def mvnDeps = settings.testDeps
+    def mvnDeps = settings.soundnessDeps
     def finalMainClass = "flame.Tests"

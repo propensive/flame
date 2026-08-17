@@ -81,7 +81,7 @@ git tag -s "$VERSION" -m "Version $VERSION"
 if ! mill mill.javalib.SonatypeCentralPublishModule/publishAll \
        --publishArtifacts __.publishArtifacts \
        --shouldRelease true \
-       --bundleName "dev.soundness-flame:$VERSION"; then
+       --bundleName "dev.propensive-flame:$VERSION"; then
   echo "release: publish failed; removing local tag $VERSION" >&2
   git tag -d "$VERSION" >/dev/null
   exit 1

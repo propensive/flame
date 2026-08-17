@@ -75,7 +75,7 @@ import serpentine.*
 import stratiform.*
 import vacuous.*
 
-import filesystemBackends.virtualMachine
+import filesystemBackends.virtualMachineFilesystem
 import interfaces.paths.pathOnLinux
 import stenography.Syntax
 
@@ -113,7 +113,7 @@ object Repl:
     // `name`/`tpe` are set only for a value-producing expression: the binding name chosen for
     // its result (shown, and usable on later lines) and its rendered type.
     case Ran(notices: List[Notice], value: Optional[Text], output: Text,
-             name: Optional[Text] = Unset, tpe: Optional[Text] = Unset)
+             name: Optional[Text] = Unset, tpe: Optional[TypeText] = Unset)
     case Threw(notices: List[Notice], error: Throwable, output: Text)
     case Rejected(notices: List[Notice])
     case Crashed(notices: List[Notice], error: StackTrace)
@@ -205,7 +205,7 @@ object Repl:
     case Tokenized(id: Int, highlight: List[Token], incomplete: Boolean)
     case Completed(id: Int, completions: List[CompletionItem])
 
-    case Ran(id: Int, value: Optional[Text], output: Text, tpe: Optional[Text],
+    case Ran(id: Int, value: Optional[Text], output: Text, tpe: Optional[TypeText],
              name: Optional[Text], diagnostics: Text, highlight: List[Token])
 
     case Rejected(id: Int, diagnostics: Text, highlight: List[Token])
@@ -500,6 +500,14 @@ object Repl:
          t"warn about advanced language features that should be enabled explicitly", Set),
        Setting(t"new-syntax", t"-new-syntax",
          t"require the new `then`/`do`-free control-flow syntax", Set),
+       // Off by default, unlike flame's own build, because it is a trade rather than a free win: the
+       // compiler gives inlined code SYNTHETIC line numbers, decodable only through the SMAP, and
+       // mandible reads the raw `LineNumberTable` — so with this on, `/bytecode` reports those
+       // synthetic lines for inlined instructions. A user's own line is usually a thin wrapper, and
+       // the chain INTO Soundness is already recoverable from the Soundness classfiles, so the
+       // default keeps `/bytecode` honest and this offers the deeper view on request.
+       Setting(t"jsr45", t"-Xjsr45",
+         t"expand inlined code in stack traces (makes /bytecode line numbers synthetic)", Set),
 
        // Plain `import language.*` features.
        Setting(t"postfixOps", t"-language:postfixOps", t"allow postfix operator notation", Language),
@@ -627,36 +635,100 @@ object Repl:
     val serverRestarted: Text =
       t"The server restarted — your previous session (definitions, imports and settings) was lost"
 
+  // An expression's type in the two forms the REPL needs: `precise` is what the result line reports
+  // and what the minted binding is actually given; `widened` is what the binding's NAME is taken
+  // from. They differ only for singleton (constant) types — see `resultType`.
+  case class ResultType(precise: Syntax, widened: Syntax)
+
+  // A result's rendered type, as the front-ends display it. `base` is set only where the type is a
+  // SINGLETON and so is strictly narrower than the type it widens to — `42` to `Int`, `"hello"` to
+  // `String` — and then carries that wider type, which is shown after a `<:` and dimmed: the
+  // precise type is the result's real type and reads at full strength, while its base is context.
+  case class TypeText(text: Text, base: Optional[Text] = Unset):
+    // The whole type as one unstyled string, for the contexts that have no way to dim the base.
+    def plain: Text = base.lay(text) { widened => t"$text <: $widened" }
+
   // The Scala type of an expression, read from a typechecked highlight of
-  // `<context> val __result = <code>`: the binding's token carries the resolved type as a
-  // `Syntax`. The context (the session's imports and prior wrapper objects) is prepended so
-  // the type resolves even for expressions that use session definitions. Only meaningful for
-  // expression lines (statements have no value).
-  def resultType(context: List[Text], code: Text)(using Scalac[?, ?], LocalClasspath): Optional[Syntax] =
+  //
+  //     <context>
+  //     final val __result = <code>
+  //     val __base = __result
+  //
+  // where each binding's token carries its resolved type as a `Syntax`. The context (the session's
+  // imports and prior wrapper objects) is prepended so the type resolves even for expressions that
+  // use session definitions. Only meaningful for expression lines (statements have no value).
+  //
+  // `final val`, not `val`, is what makes the REPL precise about constants. An ordinary `val`
+  // WIDENS a singleton type, so `42` would be reported as `Int` — but that widening is an artifact
+  // of the probe, not of the user's code, so it is simply misinformation. A `final val` keeps the
+  // singleton, and `expressionCode` mints the real binding as a `final val` too, so the type shown
+  // is genuinely the binding's type. Note that this reports only the widening the USER's own code
+  // performs: a probe of `{ val x = 40 + 2; x }` is still `Int`, because `x` is an ordinary `val`,
+  // while `{ val y: 42 = 42; y }` is `42`, because that is what the user declared.
+  //
+  // `__base` re-binds the result through an ORDINARY `val`, which widens the singleton straight
+  // back to `Int`/`String`/`Boolean`. That is what `baseName` reads, so a precisely-typed `42` is
+  // still named `int` rather than falling back to `resN`. Both types come from the one compile.
+  def resultType(context: List[Text], code: Text)(using Scalac[?, ?], LocalClasspath)
+  :   Optional[ResultType] =
+
     import highlighting.typecheckedScala
     val contextLines: Text = context.map { (line: Text) => t"$line\n" }.join
-    val highlighted = Scala.highlight(t"${contextLines}val __result = $code")
+
+    val highlighted =
+      Scala.highlight(t"${contextLines}final val __result = $code\nval __base = __result")
+
     val tokens = List.from(highlighted.lines.readable).flatten
 
-    tokens.find(_.text == t"__result").optional.let(_.meta).let(_.tpe)
+    def typeOf(binding: Text): Optional[Syntax] =
+      tokens.find(_.text == binding).optional.let(_.meta).let(_.tpe)
 
-  // The simple base type name of a qualified type, lowercased at the first letter — e.g.
-  // `scala.collection.immutable.List[scala.Int]` → `list`, `Foo is Addable by Bar` → `addable`.
-  // `Unset` when the base does not begin with a letter or isn't a plain type name (function,
-  // tuple, intersection, literal types), so the caller falls back to `resN`.
-  def baseName(qualified: Text): Optional[Text] =
-    // A SINGLETON type (an object's type, `Foo.Bar.type`) names its binding after the object, not
-    // after the `type` suffix — which, being a keyword, would otherwise mint `type2`, `type3`, ….
-    val q: Text = qualified.trim.chomp(t".type", Rtl).trim
-    if q.contains(t"=>") then Unset else
-      // Soundness infix `X is Y [by Z]` names the trait `Y`; otherwise take the type
-      // constructor (strip any `[…]` type arguments) and its last dotted segment.
-      val core: Text =
-        if q.contains(t" is ")
-        then q.cut(t" is ", 2).last.trim.s.takeWhile { char => !char.isWhitespace && char != '[' }.tt
-        else q.cut(t"[", 2).head.trim
+    // A failed widening probe is not fatal: fall back to the precise type, which names no worse
+    // than the old behaviour did.
+    typeOf(t"__result").let: precise =>
+      ResultType(precise, typeOf(t"__base").or(precise))
 
-      val simple: String = core.cut(t".").last.s
+  // The simple base type name of a type, lowercased at the first letter — e.g.
+  // `scala.collection.immutable.List[scala.Int]` → `list`, `Foo is Addable by Bar` → `addable`,
+  // `String { type Foo = Any }` → `string`. `Unset` when the base does not begin with a letter or
+  // isn't a plain type name (function, tuple, intersection, literal types), so the caller falls
+  // back to `resN`.
+  //
+  // This reads the type's STRUCTURE, not its rendering. Stenography builds a `Syntax` from the
+  // compiler's `TypeRepr`, so every part of a type is already a distinct node with the name it
+  // carries: `Designator#name` is the simple name outright. Picking it out of the rendered text
+  // instead meant re-parsing Scala's type syntax out of a string, and — as the refinement case
+  // showed — each construct that the parsing did not anticipate silently cost a binding its name.
+  def baseName(syntax: Syntax): Optional[Text] =
+    def base(syntax: Syntax): Optional[Text] = syntax match
+      // An INFIX application is a type ALIAS, and an alias's own name is not the name of a type.
+      // Soundness's `X is Y` expands to `Y { type Self = X }`, so the type it actually names is its
+      // RIGHT operand; its companions (`Foo is Addable by Bar`, `Text is Encodable in Bytes`) each
+      // qualify what is already to their left, so they step left and reach the same `is`.
+      case Syntax.Application(Syntax.Simple(alias), operands, true) if operands.length == 2 =>
+        if alias.name == t"is" then base(operands.last) else base(operands.head)
+
+      // Decoration: type arguments, a structural refinement and a capture set each qualify a base
+      // type without changing which type it is, so each is stepped through to what it decorates.
+      case Syntax.Application(left, _, _)  => base(left)
+      case Syntax.Structural(inner, _, _)  => base(inner)
+      case Syntax.Capturing(inner, _)      => base(inner)
+      case Syntax.Suffix(inner, _)         => base(inner)
+
+      // A name, however it is reached. A `Value` is a SINGLETON (an object's type, `Foo.Bar.type`):
+      // it names its binding after the object, not after the `type` suffix — which, being a
+      // keyword, would otherwise mint `type2`, `type3`, ….
+      case Syntax.Simple(designator)       => designator.name
+      case Syntax.Value(designator)        => designator.name
+      case Syntax.Selection(_, right)      => right
+      case Syntax.Projection(_, name)      => name
+
+      // Everything else — functions, tuples, intersections and unions, literal types — has no base
+      // type name to take from it.
+      case _                               => Unset
+
+    base(syntax).let: name =>
+      val simple: String = name.s
 
       if simple.length > 0 && simple.charAt(0).isLetter && simple.forall(identifierChar)
       then (simple.charAt(0).toLower.toString + simple.substring(1).nn).tt
@@ -821,7 +893,7 @@ object Repl:
     val header: Text = defHeader(line)
     if annotatesReturnType(header) then header else
       val probe: Text = t"{ $line\n${defApplication(header, name)} }"
-      safely(resultType(context, probe)).let(_.text(using imports)) match
+      safely(resultType(context, probe)).let(_.precise.text(using imports)) match
         case tpe: Text => t"$header: $tpe"
         case _         => header
 
@@ -913,7 +985,7 @@ class Repl[version <: Scalac.Versions]
   // JARs and directories the user has added with `/classload`. They are appended to every subsequent
   // line's COMPILE classpath (`classpath`, so a later line can `import` from them) and pushed onto the
   // RUN-time classloader's URLs (`replLoader`, so the loaded code can use them).
-  private var extraEntries: List[ClasspathEntry.Directory | ClasspathEntry.Jar] = Nil
+  private var extraEntries: List[Classpath.Entry.Directory | Classpath.Entry.Jar] = Nil
 
   // Async mode (`/set async`): when on, a front-end evaluates each submission on a background worker,
   // acknowledging with a placeholder and delivering the real result out-of-band once it is ready, so a
@@ -932,7 +1004,7 @@ class Repl[version <: Scalac.Versions]
   // own delegating loader, so a freshly-compiled wrapper outranks a same-named class on the parent.
   private class ReplLoader(parent: ClassLoader)
   extends jn.URLClassLoader
-           ( scala.Array[jn.URL | Null](ClasspathEntry.Directory(out.encode).javaUrl), parent ):
+           ( scala.Array[jn.URL | Null](Classpath.Entry.Directory(out.encode).javaUrl), parent ):
     override def loadClass(name: String | Null, resolve: Boolean): Class[?] | Null =
       try findClass(name) catch case _: ClassNotFoundException => super.loadClass(name, resolve)
 
@@ -1124,6 +1196,15 @@ class Repl[version <: Scalac.Versions]
   // diagnostics use, rather than the fully-qualified `Syntax.qualified`.
   private def renderType(syntax: Syntax): Text = syntax.text(using semanticImports)
 
+  // A probed result type, rendered for display. A SINGLETON type carries the type it widens to as
+  // well: the two differ exactly when the precise type is narrower than its base — `42` against
+  // `Int` — which is the case worth annotating, and equality of the two `Syntax` trees is what says
+  // so. Everything else (`List[Int]`, a refined `String { … }`) widens to itself and is shown alone.
+  private def typeText(result: Repl.ResultType): Repl.TypeText =
+    Repl.TypeText
+     ( renderType(result.precise),
+       if result.widened == result.precise then Unset else renderType(result.widened) )
+
   // Renders `notices` to the reply's diagnostics string, re-rendering the types embedded in error
   // messages through stenography when the compiler supplied semantic markup (`-Xsemantic-diagnostics`);
   // otherwise the plain messages. Types are abbreviated against the session's imports (`semanticImports`)
@@ -1183,7 +1264,7 @@ class Repl[version <: Scalac.Versions]
 
   // A line that has been COMPILED but not necessarily run. `compile` returns this so `react` can
   // ── The warm compiler session ────────────────────────────────────────────────────────────────
-  // anthology's `ScalacSession` (Soundness #1697) keeps ONE base context and ONE `Compiler` alive
+  // anthology's `Scalac.Session` (Soundness #1697) keeps ONE base context and ONE `Compiler` alive
   // across compiles, so a line pays to type its own source instead of re-loading the whole
   // classpath's symbol table every time — which is where the REPL's per-operation floor went. Two
   // properties of that API shape what follows:
@@ -1333,12 +1414,21 @@ class Repl[version <: Scalac.Versions]
       val process = scalac(path)(sources, out)
       (process.complete(), process.notices)
     else
-      if warmKey.lay(true)(_ != key) then
-        warm.let(_.retire())
-        warm = Warm(scalac.on(path))
+      def open(): Warm =
+        val fresh = Warm(scalac.on(path))
+        warm = fresh
         warmKey = key
+        fresh
 
-      val session = warm.vouch
+      // Reuse the open session only when its key still matches; otherwise retire it and open a
+      // fresh one. Phrased over the `Optional` rather than around it, so the session is a value we
+      // hold rather than one we have to prove is there.
+      val session = warm.lay(open()): existing =>
+        if warmKey.lay(true)(_ != key) then
+          existing.retire()
+          open()
+        else existing
+
       val result = session.compile(sources)
 
       // A session that died takes its key with it, so the next line opens a fresh one rather than
@@ -1376,7 +1466,7 @@ class Repl[version <: Scalac.Versions]
   // expression line. `onOutput` receives each chunk of the run's stdout as it appears (async mode).
   private def compile(imports: List[Text], code: Text, onOutput: Text => Unit)(rendered: => Optional[Text])
       (using Monitor, System, Probate)
-  :   (Built^{onOutput, rendered}) logs CompileEvent raises CompilerError raises AsyncError =
+  :   (Built^{onOutput, rendered}) logs CompileEvent raises Compiler.Error raises Async.Error =
 
     val name:    Text = layout.objectName(index)
     val source:  Text = layout.wrap(index, historyImports, imports, code)
@@ -1514,8 +1604,11 @@ class Repl[version <: Scalac.Versions]
       ( t"@scala.annotation.experimental private val ${ref}_shown: scala.Unit =",
         t"  { $put }" )
 
+  // `final val`, matching the probe in `Repl.resultType`: it is what gives a constant expression its
+  // singleton type, so the binding really has the precise type the result line reports — `42` is a
+  // `42`, not an `Int` that was described as one.
   private def expressionCode(name: Text, key: Text, line: Text): Text =
-    val lines: List[Text] = t"val $name = $line" :: renderInto(name, key)
+    val lines: List[Text] = t"final val $name = $line" :: renderInto(name, key)
     lines.join(t"\n")
 
   // Like `expressionCode`, but for a line that is just an existing identifier: the value is bound
@@ -1526,7 +1619,7 @@ class Repl[version <: Scalac.Versions]
   // (only the `inspect` renderer, which is itself `@experimental`, sits in that scope).
   private def echoCode(name: Text, key: Text, line: Text): Text =
     val bound: Text = t"${name}_echo"
-    val lines: List[Text] = t"private val $bound = $line" :: renderInto(bound, key)
+    val lines: List[Text] = t"private final val $bound = $line" :: renderInto(bound, key)
     lines.join(t"\n")
 
   // The probe object body for `/tasty <expr>`: it reflects `<expr>`'s typed AST with hyperbole's
@@ -1548,7 +1641,7 @@ class Repl[version <: Scalac.Versions]
   // x + 1` or `/tasty List(1, 2, 3).map(_ + 1)`. It compiles the probe above in the session scope;
   // the expression is only type-checked and reflected, never run. A blank argument prints usage.
   private def tasty(line: Text, onOutput: Text => Unit)(using Monitor, System, Probate)
-  :   (Built^{onOutput}) logs CompileEvent raises CompilerError raises AsyncError =
+  :   (Built^{onOutput}) logs CompileEvent raises Compiler.Error raises Async.Error =
 
     val expr: Text = line.skip(t"/tasty".length).trim
     if expr == t"" then Built.Complete(Outcome.Ran(Nil, Unset, t"Usage: /tasty <expression>\n"))
@@ -1563,7 +1656,7 @@ class Repl[version <: Scalac.Versions]
   // then compiled directly. The wrapper is neither run nor added to `history`, so it does not pollute
   // the session — only `index` advances, to keep the object name unique.
   private def bytecode(line: Text)(using Monitor, System, Probate)
-  :   Built logs CompileEvent raises CompilerError raises AsyncError = Built.Complete:
+  :   Built logs CompileEvent raises Compiler.Error raises Async.Error = Built.Complete:
     val code: Text = line.skip(t"/bytecode".length).trim
     if code == t"" then Outcome.Ran(Nil, Unset, t"Usage: /bytecode <expression or definition>\n")
     else
@@ -1597,7 +1690,7 @@ class Repl[version <: Scalac.Versions]
   private def definitionOrStatement
     ( line: Text, key: Text, context: List[Text], onOutput: Text => Unit )
     ( using Monitor, System, Probate )
-  :   (Built^{onOutput}) logs CompileEvent raises CompilerError raises AsyncError =
+  :   (Built^{onOutput}) logs CompileEvent raises Compiler.Error raises Async.Error =
 
     given LocalClasspath = classpath
 
@@ -1629,7 +1722,7 @@ class Repl[version <: Scalac.Versions]
           case complete => complete
 
   private def evaluate(line: Text, onOutput: Text => Unit)(using Monitor, System, Probate)
-  :   (Built^{onOutput}) logs CompileEvent raises CompilerError raises AsyncError =
+  :   (Built^{onOutput}) logs CompileEvent raises Compiler.Error raises Async.Error =
 
     given LocalClasspath = classpath
 
@@ -1650,23 +1743,28 @@ class Repl[version <: Scalac.Versions]
   private def expressionFirst
     ( line: Text, key: Text, context: List[Text], onOutput: Text => Unit )
     ( using Monitor, System, Probate )
-  :   (Built^{onOutput}) logs CompileEvent raises CompilerError raises AsyncError =
+  :   (Built^{onOutput}) logs CompileEvent raises Compiler.Error raises Async.Error =
 
     given LocalClasspath = classpath
 
-    val syntax: Optional[Syntax] = safely(Repl.resultType(context, line))
-    val tpe:    Optional[Text]   = syntax.let(renderType)
+    val result0: Optional[Repl.ResultType] = safely(Repl.resultType(context, line))
+    val tpe:     Optional[Repl.TypeText]   = result0.let(typeText)
 
     // A line that is just an existing identifier (it type-checks, so it resolves) is echoed under
     // that same name — no fresh `val`, no new numbered result. Otherwise the binding name is the
     // result type's base name, lowercased and made unique in scope (`list`, `list2`, …), falling
     // back to `resN` when no letter-initial type name is available. Collision-checking the name
     // (`freeBindingName`) consults the reflected wrapper members — no compiler run.
-    val echo: Boolean = syntax.present && Repl.isBareIdentifier(line)
+    //
+    // The name comes from the WIDENED type, not the precise one displayed: a result typed `42` is
+    // an `Int` by any other name, and `42` is not one an identifier can be made from.
+    val echo: Boolean = result0.present && Repl.isBareIdentifier(line)
 
     val name: Text =
       if echo then line.trim
-      else tpe.let(Repl.baseName(_)).let(freeBindingName).or(t"res${result.toString.tt}")
+      else
+        result0.let { r => Repl.baseName(r.widened) }.let(freeBindingName)
+        . or(t"res${result.toString.tt}")
 
     // Try the line as an expression first; anything else fails to parse as `val <name> = …` and
     // falls back to the definition/statement path. A bare identifier is inspected directly
@@ -1694,7 +1792,8 @@ class Repl[version <: Scalac.Versions]
           // `resN = () : scala.Unit` noise. A `val`/`var` DEFINITION of `Unit` type is handled by
           // `valDefinition`, which does NOT suppress, so its binding is still confirmed (`x = () :
           // scala.Unit`), matching the Scala REPL's `val x: Unit = ()`.
-          val unit: Boolean = tpe.let(_ == t"scala.Unit").or(false) || ran.value.let(_ == t"()").or(false)
+          val unit: Boolean =
+            tpe.let(_.text == t"scala.Unit").or(false) || ran.value.let(_ == t"()").or(false)
 
           if unit then ran.copy(value = Unset, name = Unset, tpe = Unset)
           else ran.copy(name = name, tpe = tpe)
@@ -1705,19 +1804,19 @@ class Repl[version <: Scalac.Versions]
   // type are shown. The type comes from typechecking `{ <definition>; <name> }` (never run).
   private def valDefinition(line: Text, bound: Text, key: Text, context: List[Text], onOutput: Text => Unit)
       (using Monitor, System, Probate)
-  :   (Built^{onOutput}) logs CompileEvent raises CompilerError raises AsyncError =
+  :   (Built^{onOutput}) logs CompileEvent raises Compiler.Error raises Async.Error =
 
     given LocalClasspath = classpath
 
-    val tpe: Optional[Text] =
-      safely(Repl.resultType(context, t"{ $line\n$bound }")).let(renderType)
+    val tpe: Optional[Repl.TypeText] =
+      safely(Repl.resultType(context, t"{ $line\n$bound }")).let(typeText)
 
     val lazyVal: Boolean =
       line.trim.cut(t" ").takeWhile { word => word != t"val" && word != t"var" }.has(t"lazy")
 
     if lazyVal then
       mapRan(compile(contextImports(line), line, onOutput)(Unset)):
-        ran => ran.copy(output = t"$bound${tpe.let { each => t": $each" }.or(t"")}\n")
+        ran => ran.copy(output = t"$bound${tpe.let { each => t": ${each.plain}" }.or(t"")}\n")
     else
       val inspectedLines: List[Text] = line :: renderInto(bound, key)
       val inspected: Text = inspectedLines.join(t"\n")
@@ -1732,7 +1831,7 @@ class Repl[version <: Scalac.Versions]
   // members via the history import. Imports create no members, so they are
   // re-injected into every line instead.
   private def ensureSeeded()(using Monitor, System, Probate)
-  :   Optional[Outcome] logs CompileEvent raises CompilerError raises AsyncError =
+  :   Optional[Outcome] logs CompileEvent raises Compiler.Error raises Async.Error =
 
     if seeded || prelude.seedTasty.isEmpty then Unset
     else
@@ -1843,11 +1942,11 @@ class Repl[version <: Scalac.Versions]
          t"  [$mark] ${setting.name} — ${setting.description}"
 
   // The path (or URL) text of a classpath entry, for the `/classpath` listing.
-  private def classpathEntryText(entry: ClasspathEntry): Text = entry match
-    case ClasspathEntry.Directory(path) => path
-    case ClasspathEntry.Jar(path)       => path
-    case ClasspathEntry.Url(url)        => url
-    case ClasspathEntry.JavaRuntime     => t"[java runtime]"
+  private def classpathEntryText(entry: Classpath.Entry): Text = entry match
+    case Classpath.Entry.Directory(path) => path
+    case Classpath.Entry.Jar(path)       => path
+    case Classpath.Entry.Url(url)        => url
+    case Classpath.Entry.JavaRuntime     => t"[java runtime]"
 
   // `/classpath` lists every entry on the REPL's current classpath — the base classpath (the scala
   // library, soundness, …) plus any JARs or directories added with `/classload`.
@@ -1879,10 +1978,10 @@ class Repl[version <: Scalac.Versions]
         if !path.existent() then
           Outcome.Ran(Nil, Unset, t"No such file or directory: ${path.encode}\n")
         else
-          val entry: ClasspathEntry.Directory | ClasspathEntry.Jar =
+          val entry: Classpath.Entry.Directory | Classpath.Entry.Jar =
             if path.encode.ends(t".jar") || path.encode.ends(t".zip")
-            then ClasspathEntry.Jar(path.encode)
-            else ClasspathEntry.Directory(path.encode)
+            then Classpath.Entry.Jar(path.encode)
+            else Classpath.Entry.Directory(path.encode)
 
           if extraEntries.has(entry) then
             Outcome.Ran(Nil, Unset, t"Already on the classpath: ${path.encode}\n")
@@ -1906,7 +2005,7 @@ class Repl[version <: Scalac.Versions]
   // settings) — and returns the run DEFERRED (`Built`), so `react` can hold the compiler mutex only
   // for this phase and execute the object load off it. `onOutput` streams the run's stdout.
   private def build(line: Text, onOutput: Text => Unit)(using Monitor, System, Probate)
-  :   (Built^{onOutput}) logs CompileEvent raises CompilerError raises AsyncError =
+  :   (Built^{onOutput}) logs CompileEvent raises Compiler.Error raises Async.Error =
 
     // A submission can change the session scope (a new definition, import, or `/set`), so any
     // cached member lists may be stale; drop them.
@@ -1931,7 +2030,7 @@ class Repl[version <: Scalac.Versions]
   // callers (and the test suite) that want the fused result; `react` instead splits the two phases
   // to run off the mutex. Single-threaded callers need no mutex.
   def interpret(line: Text)(using Monitor, System, Probate)
-  :   Outcome logs CompileEvent raises CompilerError raises AsyncError =
+  :   Outcome logs CompileEvent raises Compiler.Error raises Async.Error =
 
     build(line, _ => ()) match
       case Built.Complete(outcome) => outcome
@@ -2070,7 +2169,7 @@ class Repl[version <: Scalac.Versions]
         // interpolated types, so it needs no semantic rendering — but for the web (`Html`) its ANSI is
         // stripped and HTML-escaped, since the diagnostics slot there is trusted HTML (see the web
         // front-end), not plain text.
-        val trace: Text = StackTraceRender.render(error)
+        val trace: Text = StackTraceRender.render(error)(using loader)
         val rendered: Text = if render == Repl.Rendering.Html then SemanticRender.htmlPlain(trace) else trace
         Repl.Reply.Threw(id, output, rendered, tokens)
 

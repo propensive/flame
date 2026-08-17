@@ -131,10 +131,10 @@ class Sessions[version <: Scalac.Versions]
   // TCP path binds a raw `ServerSocket` directly (exactly as the domain-socket path below binds a
   // raw NIO channel), keeping the byte-framed protocol wire-identical to the coaxial client.
   def serve(port: Port over Tcp)(using Monitor, System, Probate)
-  :   SocketService logs CompileEvent raises BindError =
+  :   Socket.Service logs CompileEvent raises Bind.Error =
     val server: jn.ServerSocket =
       try jn.ServerSocket(port.number)
-      catch case _: ji.IOException => abort(BindError(BindError.Reason.PortInUse))
+      catch case _: ji.IOException => abort(Bind.Error(Bind.Error.Reason.PortInUse))
 
     @volatile var listening: Boolean = true
 
@@ -155,7 +155,7 @@ class Sessions[version <: Scalac.Versions]
     // Vouched pure: the stop closure captures the accept task, whose capabilities outlive the
     // service (the caller `stop()`s it inside the same `supervise` scope).
     Sessions.vouchPure:
-      SocketService: () =>
+      Socket.Service: () =>
         listening = false
         safely(server.close())
         safely(task.await())
@@ -165,7 +165,7 @@ class Sessions[version <: Scalac.Versions]
   // expose its streams for the bidirectional, asynchronously-written protocol this needs, so the
   // accept loop runs directly over an NIO channel.
   def serve(socketPath: Text)(using Monitor, System, Probate)
-  :   SocketService logs CompileEvent =
+  :   Socket.Service logs CompileEvent =
     val address: jn.UnixDomainSocketAddress = jn.UnixDomainSocketAddress.of(socketPath.s).nn
 
     val channel: jnc.ServerSocketChannel =
@@ -192,7 +192,7 @@ class Sessions[version <: Scalac.Versions]
     // Vouched pure: the stop closure captures the accept task, whose capabilities outlive the
     // service (the caller `stop()`s it inside the same `supervise` scope).
     Sessions.vouchPure:
-      SocketService: () =>
+      Socket.Service: () =>
         listening = false
         safely(channel.close())
         safely(task.await())

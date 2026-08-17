@@ -78,7 +78,10 @@ case class WebReply
      tokens:      List[WebToken],
      completions: List[WebCompletion] = Nil,
      incomplete:  Boolean = false,
-     name:        Text = t"" )
+     name:        Text = t"",
+     // The type the singleton `tpe` widens to, empty unless `tpe` is a singleton; shown dimmed
+     // after a `<:`, mirroring the CLI (see `Repl.TypeText`).
+     base:        Text = t"" )
 
 // The JSON REST API's request/response bodies (served alongside the browser UI and WebSocket — see
 // the `/api/…` routes in `serveHttp`). Flat case classes, so jacinta derives their JSON codecs
@@ -99,7 +102,8 @@ case class ApiResult
      tpe:         Text = t"",
      output:      Text = t"",
      name:        Text = t"",
-     diagnostics: Text = t"" )
+     diagnostics: Text = t"",
+     base:        Text = t"" )   // the type `tpe` widens to, when `tpe` is a singleton
 
 // The browser-side editor and styling. No `$` (it would interpolate) and `\n` is written
 // `\\n` so the served script carries a real newline escape. Selects its two controls by
@@ -143,6 +147,9 @@ val replScript: Text = t"""
     ".tok-term { color: #9cdcfe; }",
     ".tok-symbol { color: #d4d4d4; }",
     ".tok-parens { color: #ffd700; }",
+    // A singleton's base type: keeps the ordinary token colours, dimmed, so it is legible as the
+    // same syntax but clearly subordinate to the precise type it qualifies.
+    ".widened { opacity: 0.55; }",
     ".tok-error { color: #f48771; text-decoration: underline; }",
     ".tok-unparsed { color: #6a9955; }",
     // A `/`-command line is highlighted specially (see `makeSpans`): the command word in gold, and its
@@ -371,6 +378,11 @@ val replScript: Text = t"""
       if (msg.tpe)
         line += "<span class='tok-symbol'>:</span> "
               + "<span class='tok-typal'>" + escapeHtml(msg.tpe) + "</span>";
+      // A singleton's base type: the same type colouring, dimmed, so it reads as context about the
+      // type rather than as part of it.
+      if (msg.base)
+        line += "<span class='widened'><span class='tok-symbol'>&lt;:</span> "
+              + "<span class='tok-typal'>" + escapeHtml(msg.base) + "</span></span>";
       html += "<div class='result'>" + line + "</div>";
     }
     // Diagnostics are server-rendered, trusted HTML (types re-rendered through stenography in
@@ -804,8 +816,9 @@ private def webCompletions(items: List[Repl.CompletionItem]): List[WebCompletion
 private def resultReply(seq: Int, reply: Repl.Reply): WebReply = reply match
   case Repl.Reply.Ran(_, value, output, tpe, name, diagnostics, highlight) =>
     WebReply
-     ( t"result", seq, value.or(t""), tpe.or(t""), output, diagnostics, webTokens(highlight),
-       name = name.or(t"") )
+     ( t"result", seq, value.or(t""), tpe.let(_.text).or(t""), output, diagnostics,
+       webTokens(highlight),
+       name = name.or(t""), base = tpe.let(_.base).or(t"") )
 
   case Repl.Reply.Rejected(_, diagnostics, highlight) =>
     WebReply(t"error", seq, t"", t"", t"", diagnostics, webTokens(highlight))
@@ -838,7 +851,9 @@ private def outputReply(seq: Int, chunk: Text): WebReply =
 // render in `Rendering.Inspect`), so it is safe to serialize straight to JSON.
 private def apiResult(reply: Repl.Reply): ApiResult = reply match
   case Repl.Reply.Ran(_, value, output, tpe, name, diagnostics, _) =>
-    ApiResult(t"ran", value.or(t""), tpe.or(t""), output, name.or(t""), plain(diagnostics))
+    ApiResult
+     ( t"ran", value.or(t""), tpe.let(_.text).or(t""), output, name.or(t""), plain(diagnostics),
+       base = tpe.let(_.base).or(t"") )
 
   case Repl.Reply.Threw(_, output, diagnostics, _) =>
     ApiResult(t"error", output = output, diagnostics = plain(diagnostics))

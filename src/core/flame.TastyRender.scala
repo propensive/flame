@@ -38,7 +38,7 @@ import hyperbole.*
 import iridescence.*
 import prepositional.*
 
-// Renders a hyperbole `TastyTree` (the typed AST produced by the `syntax` macro) to a coloured,
+// Renders a hyperbole `Tasty.Tree` (the typed AST produced by the `syntax` macro) to a coloured,
 // truecolor-ANSI table, for the REPL's `/tasty` command. Called by name from the generated probe
 // object each `/tasty` line compiles — so it must be plain (non-`@experimental`) and reachable by
 // the fully-qualified name `flame.TastyRender.render`, exactly as the REPL reaches `ReplBridge`.
@@ -65,7 +65,7 @@ object TastyRender:
     def outline:        Color in Srgb = hex(0x928374)
     def accented:       Color in Srgb = hex(0xff6633)
 
-  // The tree's `Teletypeable` (from hyperbole, in `TastyTree`'s implicit scope) renders the escritoire
+  // The tree's `Teletypeable` (from hyperbole, in `Tasty.Tree`'s implicit scope) renders the escritoire
   // table; `render(termcap)` flattens the styled `Teletype` to truecolor ANSI text — which the CLI
   // prints verbatim through the REPL's `output` channel.
-  def render(tree: TastyTree): Text = tree.teletype.render(xtermTrueColorTermcap)
+  def render(tree: Tasty.Tree): Text = tree.teletype.render(xtermTrueColorTermcap)

@@ -43,7 +43,7 @@ import soundness.*
 import proscenium.compat.*
 
 import classloaders.threadContextClassloader
-import filesystemBackends.virtualMachine
+import filesystemBackends.virtualMachineFilesystem
 import filesystemOptions.createNonexistentParents.enabled
 import filesystemOptions.overwritePreexisting.disabled
 import interfaces.paths.pathOnLinux
@@ -197,7 +197,7 @@ object Tests extends Suite(m"Flame Tests"):
           repl.interpret(t"object Foo { object Bar }")
           repl.interpret(t"Foo.Bar")
       . assert:
-          case Repl.Outcome.Ran(_, _, _, _, tpe) => tpe == t"Foo.Bar.type"
+          case Repl.Outcome.Ran(_, _, _, _, tpe) => tpe.let(_.text) == t"Foo.Bar.type"
           case _                                 => false
 
       test(m"an object's result binds a name from the object, not from the `.type` suffix"):
@@ -208,6 +208,96 @@ object Tests extends Suite(m"Flame Tests"):
       . assert:
           case Repl.Outcome.Ran(_, _, _, name, _) => name == t"bar"
           case _                                  => false
+
+      // A refinement, like a type argument or a capture set, decorates a base type without changing
+      // which type it is, so the binding is still named after what it refines.
+      test(m"a refined type binds a name from the type it refines"):
+        supervise:
+          Repl().interpret(t"\"\".asInstanceOf[String { type Foo = Any }]")
+      . assert:
+          case Repl.Outcome.Ran(_, _, _, name, _) => name == t"string"
+          case _                                  => false
+
+      // An infix type ALIAS does not name a type — Soundness's `X is Y` expands to
+      // `Y { type Self = X }`, so the binding is named after the trait on the right, not after `is`.
+      test(m"an infix `is` type binds a name from the trait, not from the alias"):
+        supervise:
+          val repl = Repl()
+          repl.interpret(t"infix type is[S, T] = T { type Self = S }")
+          repl.interpret(t"trait Barable { type Self }")
+          repl.interpret(t"null.asInstanceOf[Int is Barable]")
+      . assert:
+          case Repl.Outcome.Ran(_, _, _, name, _) => name == t"barable"
+          case _                                  => false
+
+      // `by`/`in` qualify what is already to their left, so they step left and reach the same `is`.
+      test(m"a qualified infix type binds a name from the trait it qualifies"):
+        supervise:
+          val repl = Repl()
+          repl.interpret(t"infix type is[S, T] = T { type Self = S }")
+          repl.interpret(t"infix type by[T, R] = T { type Operand = R }")
+          repl.interpret(t"trait Barable { type Self; type Operand }")
+          repl.interpret(t"null.asInstanceOf[Int is Barable by String]")
+      . assert:
+          case Repl.Outcome.Ran(_, _, _, name, _) => name == t"barable"
+          case _                                  => false
+
+      // An expression line is bound as a `final val`, so a constant keeps its singleton type rather
+      // than being widened by the REPL's own binding — `42` is a `42`, not an `Int`.
+      test(m"an integer literal reports its singleton type"):
+        supervise:
+          Repl().interpret(t"42")
+      . assert:
+          case Repl.Outcome.Ran(_, _, _, _, tpe) => tpe.let(_.text) == t"42"
+          case _                                 => false
+
+      test(m"a string literal reports its singleton type"):
+        supervise:
+          Repl().interpret(t"\"hello\"")
+      . assert:
+          case Repl.Outcome.Ran(_, _, _, _, tpe) => tpe.let(_.text) == t"\"hello\""
+          case _                                 => false
+
+      // A singleton also reports the type it widens to, which the front-ends show dimmed after a
+      // `<:` — the result IS a `42`, and a `42` is an `Int`.
+      test(m"a singleton type carries the base type it widens to"):
+        supervise:
+          Repl().interpret(t"42")
+      . assert:
+          case Repl.Outcome.Ran(_, _, _, _, tpe) => tpe.let(_.base) == t"Int"
+          case _                                 => false
+
+      test(m"a non-singleton type carries no base type"):
+        supervise:
+          Repl().interpret(t"List(1, 2)")
+      . assert:
+          case Repl.Outcome.Ran(_, _, _, _, tpe) => tpe.let(_.base).absent
+          case _                                 => false
+
+      // …but the NAME comes from the widened type, since `42` is not one an identifier can be made
+      // from — so precision in the type costs nothing in the naming.
+      test(m"a singleton-typed result is still named from its widened base type"):
+        supervise:
+          Repl().interpret(t"42")
+      . assert:
+          case Repl.Outcome.Ran(_, _, _, name, _) => name == t"int"
+          case _                                  => false
+
+      // The REPL reports only the widening the USER's code performs: an ordinary `val` widens, so
+      // this stays `Int` — it is the probe's own widening that was misinformation.
+      test(m"a plain `val` of a constant still reports the widened type"):
+        supervise:
+          Repl().interpret(t"val n = 40 + 2")
+      . assert:
+          case Repl.Outcome.Ran(_, _, _, _, tpe) => tpe.let(_.text) == t"Int"
+          case _                                 => false
+
+      test(m"a `val` annotated with a singleton type reports that type"):
+        supervise:
+          Repl().interpret(t"val n: 42 = 42")
+      . assert:
+          case Repl.Outcome.Ran(_, _, _, _, tpe) => tpe.let(_.text) == t"42"
+          case _                                 => false
 
       test(m"a `def` returning a session-defined type shows no wrapper object in its signature"):
         supervise:
@@ -290,7 +380,7 @@ object Tests extends Suite(m"Flame Tests"):
           Repl().interpret(t"val x = 40 + 2")
       . assert:
           case Repl.Outcome.Ran(_, value, _, name, tpe) =>
-            value == t"42" && name == t"x" && tpe == t"Int"
+            value == t"42" && name == t"x" && tpe.let(_.text) == t"Int"
           case _ => false
 
       // `List(1, 2, 3)` in a REPL line is the STDLIB list (the REPL compiles user code with the
@@ -631,6 +721,41 @@ object Tests extends Suite(m"Flame Tests"):
         Repl.tokenize(t"val x = 1\nval y = 2").map(_.text).join
       . assert(_.contains(t"\n"))
 
+    // The client derives one `--flag` per setting from `Repl.settings`, so the two cannot drift; the
+    // flags the user asked for by name are the ones this list must keep providing.
+    suite(m"settings flags"):
+      // Asserted as a SUPERSET, so that adding a setting is not a test failure — only LOSING one is.
+      // (Written the other way round, this failed the moment `jsr45` was added, which is exactly the
+      // change it should have been indifferent to.)
+      test(m"the documented settings are all addressable by name"):
+        Repl.settings.map(_.name).stdlib.toSet
+      . assert(Set(t"experimental", t"explain", t"explicit-nulls", t"deprecation", t"feature",
+            t"new-syntax", t"postfixOps", t"implicitConversions", t"reflectiveCalls", t"dynamics",
+            t"existentials", t"strictEquality", t"adhocExtensions", t"unsafeNulls",
+            t"captureChecking", t"saferExceptions", t"pureFunctions", t"namedTuples", t"modularity",
+            t"betterFors", t"erasedDefinitions", t"genericNumberLiterals").subsetOf(_))
+
+      test(m"`experimental` and `feature` are compiler settings, so `--experimental`/`--feature` map to /set"):
+        Repl.settings.filter { s => s.name == t"experimental" || s.name == t"feature" }
+         . map(_.kind)
+      . assert(_ == List(Repl.Kind.Set, Repl.Kind.Set))
+
+      test(m"a setting name is always a usable flag name"):
+        Repl.settings.map(_.name).filter: name =>
+          name == t"" || name.s.exists { char => char.isWhitespace || char == '=' }
+      . assert(_ == List())
+
+      // `-Xjsr45` is what lets `StackTraceRender`'s resolver expand a REPL line's inline chain, and
+      // it is a compiler option, so it must be a `/set` (not a `/language`) setting.
+      test(m"`jsr45` is a compiler setting"):
+        Repl.settings.filter(_.name == t"jsr45").map(_.kind)
+      . assert(_ == List(Repl.Kind.Set))
+
+      test(m"no setting name collides with an existing flag"):
+        Repl.settings.map(_.name).filter: name =>
+          Set(t"port", t"host", t"session", t"set", t"language", t"basic").has(name)
+      . assert(_ == List())
+
     suite(m"REPL TCP server"):
       given Scalac[3.9, Universe.Classfile] = Scalac(Nil)
 
@@ -644,9 +769,11 @@ object Tests extends Suite(m"Flame Tests"):
           finally
             socket.close()
             service.stop()
+      // The type is the SINGLETON `2`, not `Int`: an expression line is bound as a `final val`, so a
+      // constant expression keeps the constant type the compiler folds it to (see `Repl.resultType`).
       . assert:
           case Repl.Reply.Ran(_, value, _, tpe, _, _, _) =>
-            value.let(_ == t"2").or(false) && tpe.let(_.contains(t"Int")).or(false)
+            value.let(_ == t"2").or(false) && tpe.let(_.text == t"2").or(false)
 
           case _ =>
             false
@@ -698,10 +825,13 @@ object Tests extends Suite(m"Flame Tests"):
           val sessions = Sessions()
           val a = sessions.create()
           val b = sessions.create()
-          sessions.session(a).vouch.interpret(t"val marker = 111")
+          def session(name: Text) =
+            sessions.session(name).or(panic(m"the session just created is missing"))
+
+          session(a).interpret(t"val marker = 111")
           ( a != b && sessions.names.has(a) && sessions.names.has(b),
-            sessions.session(a).vouch.interpret(t"marker"),
-            sessions.session(b).vouch.interpret(t"marker") )
+            session(a).interpret(t"marker"),
+            session(b).interpret(t"marker") )
       . assert:
           case (true, Repl.Outcome.Ran(_, _, _, _, _), Repl.Outcome.Rejected(_)) => true
           case _                                                                  => false
