@@ -235,7 +235,8 @@ class Sessions[version <: Scalac.Versions]
        (encode(Repl.Reply.Failed(0, t"the request could not be parsed"))):
 
         case Repl.Request.Tokenize(id, code) =>
-          encode(Repl.Reply.Tokenized(id, Repl.tokenize(code), Repl.incomplete(code)))
+          encode(Repl.Reply.Tokenized(id, Repl.tokenize(code), Repl.incomplete(code),
+              Repl.classify(code) == Repl.Verdict.Language))
 
         case Repl.Request.Submit(id, code) =>
           session(currentName).lay(encode(Repl.Reply.Failed(id, t"no active session"))): repl =>

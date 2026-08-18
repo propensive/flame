@@ -44,12 +44,15 @@ import scala.quoted.*
 // opaque `List`/`Set`/`Map`. `compat` restores the stdlib-shaped operations on them, and `sci` names
 // the stdlib collections the Dotty compiler API — which flame drives directly — speaks throughout.
 import scala.collection.immutable as sci
+import scala.collection.mutable as scm
 
 import proscenium.compat.*
 
 // Dotty parser internals, used (aliased, to avoid clashing with Soundness names) only to
-// decide whether a line is a syntactically-incomplete prefix — see `Repl.incomplete`.
+// probe a line syntactically — whether it is an incomplete prefix (`Repl.incomplete`) and
+// whether/where it stops parsing as Scala at all (`Repl.classify`).
 import dotty.tools.dotc.core.Contexts as DottyContexts
+import dotty.tools.dotc.interfaces as DottyInterfaces
 import dotty.tools.dotc.parsing.Parsers as DottyParsers
 import dotty.tools.dotc.reporting.StoreReporter as DottyStoreReporter
 import dotty.tools.dotc.util.SourceFile as DottySourceFile
@@ -202,7 +205,9 @@ object Repl:
   // Harlequin tokenization of the submitted line. Serialized as JSON with a `kind`
   // discriminator.
   enum Reply:
-    case Tokenized(id: Int, highlight: List[Token], incomplete: Boolean)
+    // `language` is `classify`'s verdict: the code reads as natural language rather than Scala,
+    // so the front-end may route it to an assistant instead of submitting it for evaluation.
+    case Tokenized(id: Int, highlight: List[Token], incomplete: Boolean, language: Boolean)
     case Completed(id: Int, completions: List[CompletionItem])
 
     case Ran(id: Int, value: Optional[Text], output: Text, tpe: Optional[TypeText],
@@ -267,18 +272,267 @@ object Repl:
   // error) is not — it submits and the compiler reports the problem.
   def incomplete(code: Text): Boolean =
     code.s.trim.nn.length > 0 && {
-      val source    = DottySourceFile.virtual("<incomplete>", code.s)
-      val reporter  = DottyStoreReporter()
-      val context   = DottyContexts.ContextBase().initialCtx.fresh.setReporter(reporter).withSource(source)
-      var needsMore = false
-
-      reporter.withIncompleteHandler((_, _) => needsMore = true) {
-        DottyParsers.Parser(source)(using context).blockStatSeq()
-        ()
-      }
-
-      needsMore && !reporter.hasErrors
+      val outcome = probe(code)
+      outcome.needsMore && !outcome.errors
     }
+
+  // The parser's verdict on `code`, shared by `incomplete` and `classify`: whether it asked for
+  // more input at EOF (an incomplete prefix), whether it reported a real syntax error, and the
+  // offset of the first error. The position matters to `classify`: prose fails in its first word
+  // or two, while typo'd Scala parses deep before failing, so it separates "not Scala at all"
+  // from "Scala with a slip".
+  private case class Probe(needsMore: Boolean, errors: Boolean, firstError: Int)
+
+  private def probe(code: Text): Probe =
+    val source    = DottySourceFile.virtual("<incomplete>", code.s)
+    val reporter  = DottyStoreReporter()
+    val context   = DottyContexts.ContextBase().initialCtx.fresh.setReporter(reporter).withSource(source)
+    var needsMore = false
+
+    reporter.withIncompleteHandler((_, _) => needsMore = true) {
+      DottyParsers.Parser(source)(using context).blockStatSeq()
+      ()
+    }
+
+    var errors     = false
+    var firstError = code.s.length
+
+    reporter.removeBufferedMessages(using context).foreach: diagnostic =>
+      if diagnostic.level >= DottyInterfaces.Diagnostic.ERROR then
+        errors = true
+        if diagnostic.pos.exists && diagnostic.pos.start < firstError
+        then firstError = diagnostic.pos.start
+
+    Probe(needsMore, errors, firstError)
+
+  // How a submitted line should be treated: as Scala (`Code`) — including malformed Scala, which
+  // runs and surfaces its error — or as natural language (`Language`), which a front-end may hand
+  // to an assistant instead of the compiler. Anything ambiguous is `Code`, so bare identifiers
+  // (`help`) and Soundness's infix idioms (`x is Positive`, `2 of 5`) evaluate as they always did.
+  enum Verdict:
+    case Code, Language
+
+  // The word tiers of the lexical classifier (see `lexicalScores`). `strongWords` are English
+  // function words essentially never used as Scala identifiers. `weakWords` are the prepositions
+  // and copulas Soundness idiomatically uses as infix methods (`x is Positive`, `2 of 5`,
+  // `sorted by name`), so alone they signify nothing and count only beside a strong word; the
+  // tier also absorbs the Scala keywords that double as everyday English (`this`, `if` would be
+  // misleading here — those live in the keyword tiers below, weighted low for the same reason).
+  // `hardKeywords` are distinctly Scala; `softKeywords` read as code but also occur in prose
+  // (`what does this match`), so they count less.
+  private val strongWords: sci.Set[String] = sci.Set
+    ("the", "an", "what", "how", "why", "who", "whose", "whom", "please", "could", "would",
+     "should", "you", "your", "yours", "me", "my", "mine", "does", "did", "done", "are", "were",
+     "was", "am", "we", "us", "our", "ours", "they", "them", "their", "theirs", "he", "she",
+     "him", "her", "hers", "his", "there", "hello", "thanks", "thank")
+
+  private val weakWords: sci.Set[String] = sci.Set
+    ("is", "of", "by", "in", "on", "to", "at", "as", "and", "or", "from", "has", "have", "had",
+     "be", "been", "being", "it", "its", "that", "this", "not", "no", "but", "so", "with",
+     "when", "can", "will", "into", "over", "under", "all", "any", "some", "more", "than")
+
+  private val hardKeywords: sci.Set[String] = sci.Set
+    ("val", "var", "def", "trait", "enum", "extension", "given", "import", "export", "package",
+     "yield", "sealed", "override", "implicit", "lazy", "private", "protected", "abstract",
+     "final", "derives", "using", "extends", "super", "opaque", "inline", "transparent", "infix")
+
+  private val softKeywords: sci.Set[String] = sci.Set
+    ("if", "then", "else", "do", "while", "for", "new", "case", "match", "object", "class",
+     "type", "catch", "try", "finally", "throw", "return", "true", "false", "null")
+
+  // The characters that read as code when they appear outside a string literal. Deliberately
+  // excludes the punctuation prose also uses — `,`, `.`, `?`, `!`, quotes — with selections
+  // (`foo.bar`) and trailing `?` handled as their own features instead.
+  private val symbolChars: String = "=<>+-*/%&|!^~#\\$(){}[]:;@_"
+
+  // A word containing an apostrophe in contraction position (`don't`, `it's`, `t'appelles`) — but
+  // not a character literal's trailing quote, which scans into its word (`'a'` yields `a'`).
+  private def contraction(word: String): Boolean =
+    var index = word.indexOf('\'')
+    if index < 0 then index = word.indexOf('’')
+    val after = word.length - index - 1
+    index >= 1 && after >= 1 && (index >= 2 || after >= 2)
+
+  // A word with a non-ASCII letter: prose in a language the word tiers cannot see. (Unicode
+  // identifiers are legal Scala, but vanishingly rare at a REPL prompt next to this.)
+  private def accented(word: String): Boolean =
+    var i     = 0
+    var found = false
+
+    while i < word.length && !found do
+      if word.charAt(i) > 127 && jl.Character.isLetter(word.charAt(i)) then found = true
+      i += 1
+
+    found
+
+  // An uppercase letter after the first character alongside a lowercase one: camelCase, or a
+  // library name like `ListBuffer` — code-shaped either way.
+  private def mixedCase(word: String): Boolean =
+    var upperLater = false
+    var lower      = false
+    var i          = 0
+
+    while i < word.length do
+      val ch = word.charAt(i)
+      if i > 0 && jl.Character.isUpperCase(ch) then upperLater = true
+      if jl.Character.isLowerCase(ch) then lower = true
+      i += 1
+
+    upperLater && lower
+
+  // The parser-free lexical evidence for `classify`, from one scan of `code`: the prose-shaped
+  // score, the code-shaped score, and how many strong-tier English words contributed. The scan
+  // collects the alphabetic words (letters plus apostrophes, with string-literal contents
+  // skipped), which separator characters lie between them, and the code-shaped characters; the
+  // features are then: strong/weak/keyword word hits, contractions, accented words, camelCase,
+  // symbol density, `foo.bar` selections, long runs of whitespace-separated bare words (prose is
+  // one long run; Scala's grammar rarely tolerates four), and a trailing question mark. Input of
+  // one or two words, or with a leading space (the escape hatch), is summarily code.
+  private def lexicalScores(code: Text): (Int, Int, Int) =
+    val text: String = code.s
+
+    if text.length == 0 || text.charAt(0) == ' ' || text.charAt(0) == '\t' then (0, 10, 0) else
+      val words    = scm.ArrayBuffer[String]()
+      val bare     = scm.ArrayBuffer[Boolean]()  // whitespace-only separation from the previous word
+      var symbols  = 0
+      var dotted   = 0
+      var strings  = 0
+      var sepClean = true
+      var i        = 0
+
+      while i < text.length do
+        val ch = text.charAt(i)
+
+        if jl.Character.isLetter(ch) then
+          val start = i
+
+          while i < text.length
+                && (jl.Character.isLetter(text.charAt(i))
+                    || text.charAt(i) == '\'' || text.charAt(i) == '’')
+          do i += 1
+
+          words += text.substring(start, i).nn
+          bare += sepClean
+          sepClean = true
+        else
+          if ch == '"' then     // skip a string literal: its content is not the user's own prose
+            strings += 1
+            i += 1
+            while i < text.length && text.charAt(i) != '"' do
+              if text.charAt(i) == '\\' then i += 1
+              i += 1
+          else if !jl.Character.isWhitespace(ch) then
+            if symbolChars.indexOf(ch.toInt) >= 0 then symbols += 1
+
+            if ch == '.' && i > 0 && i + 1 < text.length
+               && jl.Character.isLetterOrDigit(text.charAt(i - 1))
+               && jl.Character.isLetter(text.charAt(i + 1))
+            then dotted += 1
+
+          if !jl.Character.isWhitespace(ch) then sepClean = false
+          i += 1
+
+      val count = words.length
+
+      if count <= 2 then (0, 10, 0) else
+        // runs(k): the length of the maximal whitespace-only-separated run of words containing
+        // word k, from the `bare` flags.
+        val runs = new scala.Array[Int](count)
+        var from = 0
+        var k    = 1
+
+        while k <= count do
+          if k == count || !bare(k) then
+            var j = from
+
+            while j < k do
+              runs(j) = k - from
+              j += 1
+
+            from = k
+          k += 1
+
+        var longest = 0
+        k = 0
+
+        while k < count do
+          if runs(k) > longest then longest = runs(k)
+          k += 1
+
+        def strongAt(k: Int): Boolean =
+          k >= 0 && k < count && strongWords.contains(words(k).toLowerCase.nn)
+
+        var prose     = 0
+        var codeish   = symbols.min(8) + 2*dotted.min(3) + strings.min(2)
+        var strong    = 0
+        var accents   = 0
+        var camels    = 0
+
+        k = 0
+
+        while k < count do
+          val word  = words(k)
+          val lower = word.toLowerCase.nn
+
+          if strongWords.contains(lower) then
+            strong += 1
+            prose  += 3
+          else if contraction(word) then prose += 3
+          else if weakWords.contains(lower) then
+            if strongAt(k - 1) || strongAt(k + 1) then prose += 1
+          else if hardKeywords.contains(lower) then codeish += 2
+          else if softKeywords.contains(lower) then codeish += 1
+
+          if accents < 2 && accented(word) then
+            accents += 1
+            prose   += 3
+
+          if camels < 3 && mixedCase(word) then
+            camels  += 1
+            codeish += 2
+
+          k += 1
+
+        prose += (if longest >= 7 then 6 else if longest >= 5 then 4
+                  else if longest == 4 then 3 else 0)
+
+        val trimmed = text.trim.nn
+
+        if trimmed.length > 1 && trimmed.charAt(trimmed.length - 1) == '?'
+           && jl.Character.isLetter(trimmed.charAt(trimmed.length - 2))
+        then prose += 2
+
+        (prose, codeish, strong)
+
+  // The parser-free code-vs-language score: positive when `code` reads more like prose than like
+  // Scala. One linear scan, so a front-end can run it synchronously on every keystroke as the
+  // provisional verdict before the server's `classify` (which refines it with the parser's
+  // evidence) arrives. Strongly negative for short input and for a leading space, which always
+  // read as code.
+  def proseScore(code: Text): Int =
+    val (prose, codeish, _) = lexicalScores(code)
+    prose - codeish
+
+  // Whether `code` is Scala (`Code`) — even Scala with a typo, which should run and surface its
+  // error — or natural language (`Language`), which a front-end may route to an assistant. The
+  // lexical evidence is refined by the parser's: cleanly-parsing input is code unless it leans on
+  // strong English words (prose can parse "by accident", as a bare infix chain, but such a chain
+  // has no strong English words); input the parser rejects almost immediately leans language,
+  // while an error deep into the line reads as code with a slip. Anything ambiguous — including
+  // everything of one or two words — is `Code`, preserving the REPL's existing behaviour; a
+  // `/`-command or a leading space (the escape hatch for a misclassified line) is always `Code`.
+  def classify(code: Text): Verdict =
+    if code.s.trim.nn.length == 0 || code.starts(t"/") then Verdict.Code else
+      val (prose, codeish, strong) = lexicalScores(code)
+      val outcome                  = probe(code)
+
+      val score =
+        if !outcome.errors then prose - codeish - (if strong == 0 then 3 else 0)
+        else
+          val fraction = outcome.firstError.toDouble/code.length.max(1)
+          prose - codeish + (if fraction < 0.25 then 2 else if fraction > 0.6 then -1 else 0)
+
+      if score >= 3 then Verdict.Language else Verdict.Code
 
   private def project(source: SourceCode): List[Token] =
     // `SourceCode.lines` is a frozen `Array`, so it crosses to a `List` through its readable view.

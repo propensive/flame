@@ -721,6 +721,110 @@ object Tests extends Suite(m"Flame Tests"):
         Repl.tokenize(t"val x = 1\nval y = 2").map(_.text).join
       . assert(_.contains(t"\n"))
 
+    // `classify` decides whether a line is handed to the compiler or (in a front-end) to an
+    // assistant. Everything ambiguous defaults to `Code`, so misclassifying code as language is
+    // the costly direction: the code corpus therefore leans on typo'd and malformed lines, and on
+    // the Soundness infix idioms built from English prepositions. No compiler session is needed —
+    // classification uses only the parser.
+    suite(m"code/language classification"):
+      def misclassified(expected: Repl.Verdict, samples: List[Text]): List[Text] =
+        samples.filter { code => Repl.classify(code) != expected }
+
+      test(m"well-formed Scala classifies as code"):
+        misclassified(Repl.Verdict.Code, List
+          ( t"val x = 40 + 2",
+            t"var counter = 0",
+            t"def double(n: Int): Int = n * 2",
+            t"def factorial(n: Int): Int = if n <= 1 then 1 else n * factorial(n - 1)",
+            t"List(1, 2, 3).map(_ + 1)",
+            t"xs.foldLeft(0)(_ + _)",
+            t"println(\"hello world\")",
+            t"import scala.collection.mutable.ListBuffer",
+            t"case class Point(x: Int, y: Int)",
+            t"object Config { val port = 8080 }",
+            t"trait Monoid[T] { def empty: T }",
+            t"for i <- 1 to 10 yield i * i",
+            t"val s = \"the quick brown fox jumps over the lazy dog\"",
+            t"List('a', 'b', 'c')",
+            t"enum Colour { case Red, Green, Blue }",
+            t"given Ordering[Int] = Ordering.Int.reverse",
+            t"extension (s: String) def shout: String = s.toUpperCase",
+            t"lazy val heavy = compute()",
+            t"throw new RuntimeException(\"boom\")",
+            t"while x < 10 do x += 1",
+            t"count += 1",
+            t"x match { case Some(y) => y; case None => 0 }" ))
+      . assert(_ == List())
+
+      test(m"Soundness infix idioms classify as code"):
+        misclassified(Repl.Verdict.Code, List
+          ( t"x is Positive",
+            t"2 of 5",
+            t"path in directory",
+            t"sorted by name",
+            t"value or default",
+            t"input as Text",
+            t"x max y min z" ))
+      . assert(_ == List())
+
+      test(m"typo'd or malformed Scala still classifies as code"):
+        misclassified(Repl.Verdict.Code, List
+          ( t"val x = 5 pritnln(x)",
+            t"prinltn(\"hello\")",
+            t"List(1, 2, 3).mpa(_ + 1)",
+            t"if x then y esle z",
+            t"def f(x: Int = x * 2",
+            t"val n: Int = \"forty\"",
+            t"impotr scala.collection",
+            t"List(1, 2, 3) foldLeft 0 (_ + _)" ))
+      . assert(_ == List())
+
+      test(m"natural-language input classifies as language"):
+        misclassified(Repl.Verdict.Language, List
+          ( t"what is the type of x",
+            t"how do I reverse a list",
+            t"please show me the last result",
+            t"why does this fail to compile",
+            t"can you explain the previous error",
+            t"what does this method do",
+            t"how are you",
+            t"what went wrong",
+            t"show me all the methods on a list",
+            t"is there a way to undo the last import",
+            t"why is this list empty",
+            t"please write a function that reverses a string",
+            t"what's the difference between a list and a vector",
+            t"how can I make this compile",
+            t"don't evaluate this",
+            t"what time is it",
+            t"explain the last error message",
+            t"why is x not defined",
+            t"what does the compiler mean by this",
+            t"how much memory does this session use" ))
+      . assert(_ == List())
+
+      test(m"short or ambiguous input defaults to code"):
+        misclassified(Repl.Verdict.Code, List
+          ( t"help",
+            t"exit",
+            t"list",
+            t"thanks",
+            t"hello",
+            t"x",
+            t"res1",
+            t"why?",
+            t"1 + 1",
+            t"val x =" ))
+      . assert(_ == List())
+
+      test(m"a leading space forces a prose-shaped line to classify as code"):
+        Repl.classify(t" what is the type of x")
+      . assert(_ == Repl.Verdict.Code)
+
+      test(m"a slash-command line classifies as code"):
+        Repl.classify(t"/set experimental")
+      . assert(_ == Repl.Verdict.Code)
+
     // The client derives one `--flag` per setting from `Repl.settings`, so the two cannot drift; the
     // flags the user asked for by name are the ones this list must keep providing.
     suite(m"settings flags"):

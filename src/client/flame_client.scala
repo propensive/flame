@@ -722,6 +722,16 @@ private def runRepl
   @volatile var incompleteFor: Optional[(Text, Boolean)] = Unset
   val incompletePending: TrieMap[Int, Text] = TrieMap()
 
+  // The server's verdict on whether the current line reads as natural language rather than Scala
+  // (`Repl.classify`), refined from the same `Tokenized` reply as `incompleteFor` and paired with
+  // the value it was computed for. Until it arrives, `Repl.proseScore`'s lexical evidence decides.
+  @volatile var languageFor: Optional[(Text, Boolean)] = Unset
+
+  // Hysteresis for the provisional verdict: once a line has flipped to reading as language, a
+  // lower score keeps it there (and vice versa), so the indicator doesn't flicker while a
+  // borderline line is being typed. Reset for each fresh input line.
+  @volatile var langMode: Boolean = false
+
   // Async mode (`/set async`): a submission whose result is not ready within the server's grace window
   // is answered with a `Pending` placeholder; the real reply arrives out-of-band later, carrying the
   // submission's id. `asyncPending` holds ids awaiting a fill; `asyncEntries` maps an id to its
@@ -754,6 +764,9 @@ private def runRepl
   // not Scala (the engine would parse `/clear`, `/quit`, … as incomplete Scala), so it always submits.
   def readyToSubmit(text: Text): Boolean =
     if text.starts(t"/") then true
+    // Prose is never an incomplete prefix: a line that reads as natural language submits on
+    // Enter, even when the parser (or the local heuristic) would have continued it.
+    else if naturalLanguage(text) then true
     else if text.contains(t"\n") then blankLastLine(text) && text.trim != t""
     else notIncomplete(text)
 
@@ -764,6 +777,22 @@ private def runRepl
     incompleteFor.lay(singleLineComplete(text)): verdict =>
       val (value, incomplete) = verdict
       if value == text then !incomplete else singleLineComplete(text)
+
+  // Whether `text` reads as natural language rather than Scala: the server's authoritative
+  // verdict for exactly this text once it has arrived, otherwise `Repl.proseScore`'s lexical
+  // evidence with hysteresis. A `/`-command is never language, and a leading space is the
+  // escape hatch that forces a misclassified line to evaluate as code.
+  def naturalLanguage(text: Text): Boolean =
+    if text.starts(t"/") || text.starts(t" ") || text.starts(t"\t") || text.trim == t"" then false
+    else
+      val local = Repl.proseScore(text) >= (if langMode then 1 else 3)
+
+      val verdict = languageFor.lay(local): known =>
+        val (value, language) = known
+        if value == text then language else local
+
+      langMode = verdict
+      verdict
 
   // Background reader: route replies by kind. A `tokenize` reply refines the live
   // highlight and posts a `Redraw`, so the refined colour appears as soon as the server
@@ -781,9 +810,13 @@ private def runRepl
       // Braced, so the assignment is a block rather than a named argument.
       data.lay({ live = false }): bytes =>
         safely(Bintel.read[Repl.Reply](bytes)).let:
-          case Repl.Reply.Tokenized(id, highlight, incomplete) =>
+          case Repl.Reply.Tokenized(id, highlight, incomplete, language) =>
             pending.remove(id).foreach(state.reconcile(_, highlight))
-            incompletePending.remove(id).foreach { value => incompleteFor = (value, incomplete) }
+
+            incompletePending.remove(id).foreach: value =>
+              incompleteFor = (value, incomplete)
+              languageFor = (value, language)
+
             terminal.events.put(Terminal.Info.Redraw)
 
           case Repl.Reply.Completed(id, items) =>
@@ -910,6 +943,7 @@ private def runRepl
     var tokens: List[Repl.Token] = Nil
     var lastValue: Text = t""
     var lastVersion: Int = -1
+    langMode = false
 
     // Record the live-highlight edit and fire an async server `tokenize` to refine it.
     def refresh(): Unit =
@@ -978,7 +1012,7 @@ private def runRepl
       // `paint` already flushes the block to the terminal (via `InlineRoot.flush`), so no explicit
       // `root.flush()` is needed here — and a second flush would be actively wrong, re-running the
       // inline shrink handling against an already-settled block.
-      paint(root, replPane(editor, tokens, ghost, rows, compLines))
+      paint(root, replPane(editor, tokens, ghost, rows, compLines, naturalLanguage(editor.value)))
 
     refresh()
     frame()
@@ -1213,6 +1247,12 @@ private def runRepl
             else t"${Repl.messages.noSession(name)}\n"
         else if line.starts(t"/") && !Repl.isCommand(line) then
           t"${Repl.messages.unknownCommand(line)}\n"
+        else if naturalLanguage(line) then
+          // The line reads as natural language, not Scala. The assistant that will eventually
+          // answer it is not wired up yet, so show a stub rather than compiling prose into a
+          // shower of syntax errors; the leading-space escape hatch covers a line that was meant
+          // to be code after all.
+          t"\e[2mThis reads as natural language, which flame cannot answer yet. To evaluate it as Scala, insert a space before it.\e[22m\n"
         else
           // A fresh id per submission so an async placeholder and its later out-of-band fill correlate
           // (submits are serialized — we block on the first reply before the next line — so first-reply
@@ -1269,13 +1309,16 @@ private def replPane
     tokens:    List[Repl.Token],
     ghost:     Text,
     rows:      Int,
-    compLines: List[Teletype] )
+    compLines: List[Teletype],
+    language:  Boolean )
 :   Pane =
 
   // A one-column empty spacer, so the editor sits one character in from each border edge.
   def edge: Pane = panel(minWidth = 1, maxWidth = 1)(())
 
-  val box = cadetBorder:
+  // The border colour doubles as the mode indicator: CadetBlue while the line reads as Scala,
+  // purple once it reads as natural language destined for an assistant rather than the compiler.
+  val box = colourBorder(if language then languageBorder else codeBorder):
     strip
      ( edge,
        panel(minHeight = rows, maxHeight = rows):
@@ -1313,17 +1356,21 @@ private case class TranscriptEntry
 private def replayBox(tokens: List[Repl.Token], rows: Int): Pane =
   def edge: Pane = panel(minWidth = 1, maxWidth = 1)(())
 
-  cadetBorder:
+  colourBorder(codeBorder):
     strip
      ( edge,
        panel(minHeight = rows, maxHeight = rows)(summon[Extent].put(colourful(tokens))),
        edge )
 
-// The editor box's border, drawn in CadetBlue. Mirrors ultimatum's `border` (rounded style),
-// but colours each glyph — the library's `border` renders its rules and corners uncoloured.
-private def cadetBorder(child: Pane): Pane =
-  val style  = BorderStyle.rounded
-  val colour = WebColors.CadetBlue
+// The editor box's usual border colour, and the one that replaces it while the line classifies
+// as natural language (see `replPane`).
+private val codeBorder:     Color in Srgb = WebColors.CadetBlue
+private val languageBorder: Color in Srgb = WebColors.MediumPurple
+
+// The editor box's border, drawn in the given colour. Mirrors ultimatum's `border` (rounded
+// style), but colours each glyph — the library's `border` renders its rules and corners uncoloured.
+private def colourBorder(colour: Color in Srgb)(child: Pane): Pane =
+  val style = BorderStyle.rounded
 
   def horizontalRule: Pane = panel(minHeight = 1, maxHeight = 1):
     val extent = summon[Extent]
@@ -1386,7 +1433,7 @@ private def replyText(reply: Repl.Reply): Text = reply match
   case Repl.Reply.Rejected(_, diagnostics, _)      => t"$diagnostics\n"
   case Repl.Reply.Crashed(_, diagnostics, _)       => t"$diagnostics\n"
   case Repl.Reply.Failed(_, message)               => t"$message\n"
-  case Repl.Reply.Tokenized(_, _, _)               => t""
+  case Repl.Reply.Tokenized(_, _, _, _)            => t""
   case Repl.Reply.Completed(_, _)                  => t""
   case Repl.Reply.Session(_, _, _)                 => t""
   case Repl.Reply.Pending(_)                       => t""
@@ -1395,7 +1442,7 @@ private def replyText(reply: Repl.Reply): Text = reply match
 // The request id every reply echoes — used to correlate an out-of-band async fill with the submission
 // (its `Pending` placeholder) it completes. (The enum's cases share the field but not an accessor.)
 private def replyId(reply: Repl.Reply): Int = reply match
-  case Repl.Reply.Tokenized(id, _, _)         => id
+  case Repl.Reply.Tokenized(id, _, _, _)      => id
   case Repl.Reply.Completed(id, _)            => id
   case Repl.Reply.Ran(id, _, _, _, _, _, _)   => id
   case Repl.Reply.Rejected(id, _, _)          => id
