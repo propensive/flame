@@ -923,7 +923,7 @@ private def runRepl
     transcript.each: entry =>
       val rows = LineEditor.cursorPosition(entry.text, entry.text.length, innerWidth)._1 + 1
       val staticRoot = InlineRoot(terminal)
-      paint(staticRoot, replayBox(entry.tokens, rows))
+      paint(staticRoot, replayBox(entry.tokens, rows, entry.language))
       staticRoot.finish()
       if entry.result != t"" then Out.print(entry.result)
 
@@ -964,7 +964,10 @@ private def runRepl
         // (each is a full typechecked compile on the server) instead of one per keystroke.
         ghostGen += 1
 
-        if editor.position == editor.value.length then
+        // A line that reads as natural language is destined for an assistant, not the compiler, so
+        // it gets no inline suggestion (and the request — a full typechecked compile of prose — is
+        // not worth making in the first place).
+        if editor.position == editor.value.length && !naturalLanguage(editor.value) then
           val gen      = ghostGen
           val value    = editor.value
           val position = editor.position
@@ -980,7 +983,9 @@ private def runRepl
     // the common stem of several (then "..."), shown only with the cursor at the line's end
     // and only while the latest reply still matches the value on screen.
     def ghost: Text =
-      if editor.value.length == 0 || editor.position != editor.value.length then t"" else
+      if editor.value.length == 0 || editor.position != editor.value.length
+         || naturalLanguage(editor.value)
+      then t"" else
         ghostReply.lay(t""): reply =>
           val (forValue, items) = reply
           if forValue != editor.value then t"" else
@@ -1005,14 +1010,18 @@ private def runRepl
       val innerWidth = (terminal.knownColumns - 4).max(1)
       val rows = LineEditor.cursorPosition(editor.value, editor.value.length, innerWidth)._1 + 1
 
+      // The verdict for this frame: prose is shown plain (no highlight, no ghost, no completions)
+      // in a purple box, since none of the compiler's help applies to it.
+      val language: Boolean = naturalLanguage(editor.value)
+
       val compLines: List[Teletype] =
-        if candidates.isEmpty then Nil
+        if language || candidates.isEmpty then Nil
         else completionTable(candidates.take(candidates.length.min(10)), terminal.knownColumns.max(1))
 
       // `paint` already flushes the block to the terminal (via `InlineRoot.flush`), so no explicit
       // `root.flush()` is needed here — and a second flush would be actively wrong, re-running the
       // inline shrink handling against an already-settled block.
-      paint(root, replPane(editor, tokens, ghost, rows, compLines, naturalLanguage(editor.value)))
+      paint(root, replPane(editor, tokens, ghost, rows, compLines, language))
 
     refresh()
     frame()
@@ -1109,6 +1118,12 @@ private def runRepl
 
             refresh()
             frame()
+
+          // Tab on a line that reads as natural language does nothing: there is nothing to complete
+          // in prose, and the request would be a wasted typechecked compile. (The `/session` and
+          // `/classload` cases above start with `/`, which never classifies as language.)
+          case Keypress.Tab if naturalLanguage(editor.value) =>
+            ()
 
           case Keypress.Tab =>
             val (advanced, shown) = completeAt(editor, duplex, completions)
@@ -1278,7 +1293,7 @@ private def runRepl
       // submission files its entry under `asyncId` so the out-of-band fill can update it in place (and
       // applies a fill that raced ahead of this point).
       if line != t"/clear" then
-        val entry = TranscriptEntry(line, tokens, result, asyncId.or(0))
+        val entry = TranscriptEntry(line, tokens, result, asyncId.or(0), naturalLanguage(line))
         transcript += entry
 
         asyncId.let: sid =>
@@ -1326,7 +1341,8 @@ private def replPane
          val cols = extent.width.max(1)
          // The ghost is shown faint after the line; it is not part of `editor.value`, so the
          // caret still sits at the cursor, with the suggestion trailing to its right.
-         extent.put(if ghost == t"" then colourful(tokens) else colourful(tokens)+e"$Faint($ghost)")
+         val line: Teletype = if language then plain(tokens) else colourful(tokens)
+         extent.put(if ghost == t"" then line else line+e"$Faint($ghost)")
          val (curRow, curCol) = LineEditor.cursorPosition(editor.value, editor.position, cols)
          extent.showCaret(curCol.z, curRow.z),
        edge )
@@ -1348,18 +1364,19 @@ private def replPane
 // async fill (arriving out-of-band after a `Pending` placeholder) can update the result in place; `id`
 // is 0 for synchronous entries, which never need locating.
 private case class TranscriptEntry
-   (text: Text, tokens: List[Repl.Token], var result: Text, id: Int = 0)
+   (text: Text, tokens: List[Repl.Token], var result: Text, id: Int = 0, language: Boolean = false)
 
 // A static (non-interactive) editor box for transcript replay: the same rounded border and
 // 1-column inner padding as `replPane`'s box, showing the highlighted line, but with no caret,
 // ghost, or completion pane. `rows` is the line's wrapped height at the current width.
-private def replayBox(tokens: List[Repl.Token], rows: Int): Pane =
+private def replayBox(tokens: List[Repl.Token], rows: Int, language: Boolean): Pane =
   def edge: Pane = panel(minWidth = 1, maxWidth = 1)(())
 
-  colourBorder(codeBorder):
+  colourBorder(if language then languageBorder else codeBorder):
     strip
      ( edge,
-       panel(minHeight = rows, maxHeight = rows)(summon[Extent].put(colourful(tokens))),
+       panel(minHeight = rows, maxHeight = rows):
+         summon[Extent].put(if language then plain(tokens) else colourful(tokens)),
        edge )
 
 // The editor box's usual border colour, and the one that replaces it while the line classifies
@@ -1588,6 +1605,11 @@ private def accentOf(accent: Text): Accent = accent match
 // definition, or a type parameter) or a `usage`. So italicising the `binding` role distinguishes
 // `foo`/`T` where introduced from where applied — as the styling policy Harlequin#1439 leaves to the
 // front-end. (A live-heuristic token has no role yet, so it is refined to italic by the server.)
+// A line that classifies as natural language, shown in the terminal's own colour: the compiler's
+// accents describe Scala, and applying them to prose (`the` as a keyword, `type` as a type) says
+// something untrue about it, so the box's purple border is the only styling it gets.
+private def plain(tokens: List[Repl.Token]): Teletype = e"${tokens.map(_.text).join}"
+
 private def colourful(tokens: List[Repl.Token]): Teletype =
   val text: Text = tokens.map(_.text).join
 
