@@ -11,7 +11,7 @@
 ┃                       │   │    │   ││   ╰─╯   ││   │ │   │ │   ││   ╰────╮                       ┃
 ┃                       ╰───╯    ╰───╯╰────╌╰───╯╰───╯ ╰───╯ ╰───╯╰────────╯                       ┃
 ┃                                                                                                  ┃
-┃    Flame, version 0.1.0.                                                                         ┃
+┃    Flame, version 0.1.1.                                                                         ┃
 ┃    © Copyright 2026 Jon Pretty, Propensive OÜ.                                                   ┃
 ┃                                                                                                  ┃
 ┃    The primary distribution site is:                                                             ┃

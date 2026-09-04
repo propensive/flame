@@ -39,7 +39,7 @@ object settings:
   // burdock externalizes a module only when the exact released jar bytes are on the launcher's
   // classpath, so a mismatch would silently fall back to inlining. Bump (and commit) per release;
   // etc/ci/release.sh refuses to release when this pin disagrees with its VERSION argument.
-  val flameVersion = sys.env.getOrElse("FLAME_VERSION", "0.1.0")
+  val flameVersion = sys.env.getOrElse("FLAME_VERSION", "0.1.1")
 
   val scalaOptions = Seq(
     // The fork's opt-in behaviours, enabled by name, exactly as the Soundness build enables
@@ -48,7 +48,13 @@ object settings:
     // maps (formerly `-Xjsr45` — flame's own code is heavily inlined Soundness code, so
     // without the maps a frame in one of flame's classes resolves to a synthetic line).
     "-Zalias-captures",
-    "-Zdiagnostic-givens",
+    // NOT `-Zdiagnostic-givens` (which fume and Soundness enable): flame puts frontier on the
+    // classpath so that REPL users get Soundness's missing-given advice, and under the flag
+    // frontier's catch-all `soundness.explainMissingContext` given turns a TENTATIVE implicit
+    // search — one made while a type parameter is still undetermined, as `join`'s `element`
+    // or `flatMap`'s `Reshapable by …` are — into a hard error instead of a failed candidate
+    // the compiler retries after inference. The REPL passes the flag per line (see
+    // `Repl.effectiveScalac`); flame's own sources compile without it.
     "-Zgiven-prefixes",
     "-Zinline-source-maps",
     "-Zopaque-mutability",
@@ -393,6 +399,13 @@ object flame extends Project:
   object core extends Component(), Publishing:
     def mvnDeps =
       settings.coreDeps :+ mvn"org.scala-lang:scala3-compiler_3:${settings.scalaVersion}"
+
+    // frontier — `soundness.explainMissingContext`, the `@internal.diagnostic` catch-all given
+    // that renders Soundness's missing-given advice — is a RUNTIME dependency only: it must be on
+    // the REPL session classpath (which is this module's runtime classpath), but it must NOT be on
+    // flame's own compile classpath, where the catch-all satisfies tentative implicit searches
+    // (`join`'s element type, `flatMap`'s reshaping) with `Any` and breaks ordinary code.
+    def runMvnDeps = Seq(settings.component("frontier-core"))
 
   // The interactive client library (`flame.runClient` and its helpers). NO LONGER an assembled app:
   // the `@main`/`externalize` entry point moved to the `launcher` module, so this is a plain library

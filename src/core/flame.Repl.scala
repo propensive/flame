@@ -761,7 +761,7 @@ object Repl:
        // synthetic lines for inlined instructions. A user's own line is usually a thin wrapper, and
        // the chain INTO Soundness is already recoverable from the Soundness classfiles, so the
        // default keeps `/bytecode` honest and this offers the deeper view on request.
-       Setting(t"jsr45", t"-Xjsr45",
+       Setting(t"jsr45", t"-Zinline-source-maps",
          t"expand inlined code in stack traces (makes /bytecode line numbers synthetic)", Set),
 
        // Plain `import language.*` features.
@@ -1517,6 +1517,19 @@ class Repl[version <: Scalac.Versions]
     val semantic: Scalac.Option[version] =
       Scalac.Option[version](t"-Zsemantic-diagnostics")
 
+    // The fork's opt-in behaviours that Soundness is compiled with (see the Soundness build's
+    // `settings.scalaOptions`), enabled for every line: user code is compiled against Soundness
+    // TASTy that assumes them — spreadable varargs, sealed given prefixes, capture-checking
+    // repairs — and `-Zdiagnostic-givens` is what surfaces Soundness's missing-given advice
+    // (frontier's `@internal.diagnostic` catch-all, `soundness.explainMissingContext`) as the
+    // message of a failed implicit search, in place of the compiler's own.
+    val fork: List[Scalac.Option[version]] =
+      List
+       ( t"-Zalias-captures", t"-Zdiagnostic-givens", t"-Zgiven-prefixes", t"-Zopaque-mutability",
+         t"-Zpure-iarrays", t"-Zretains-bounds", t"-Zretains-skolems", t"-Zspreadable-varargs",
+         t"-Zunboxed-pure-types", t"-Zunion-captures" )
+      . map(Scalac.Option[version](_))
+
     // A SEEDED session (one built from a `Repl[version] { ... }` block) compiles in experimental
     // mode throughout. Its seed object is a recompile of trees typed in the host's compilation,
     // whose language features (`genericNumberLiterals` among them) mark what they touch as
@@ -1527,7 +1540,7 @@ class Repl[version <: Scalac.Versions]
       if prelude.seedTasty.nil || experimentalOn then Nil
       else List(Scalac.Option[version](t"-experimental"))
 
-    val extras: List[Scalac.Option[version]] = List(quiet, semantic) + seeded + extra
+    val extras: List[Scalac.Option[version]] = List(quiet, semantic) + fork + seeded + extra
     Scalac(scalac.options + extras)
 
   // A line that has been COMPILED but not necessarily run. `compile` returns this so `react` can

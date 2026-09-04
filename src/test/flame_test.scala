@@ -11,7 +11,7 @@
 ┃                       │   │    │   ││   ╰─╯   ││   │ │   │ │   ││   ╰────╮                       ┃
 ┃                       ╰───╯    ╰───╯╰────╌╰───╯╰───╯ ╰───╯ ╰───╯╰────────╯                       ┃
 ┃                                                                                                  ┃
-┃    Flame, version 0.1.0.                                                                         ┃
+┃    Flame, version 0.1.1.                                                                         ┃
 ┃    © Copyright 2026 Jon Pretty, Propensive OÜ.                                                   ┃
 ┃                                                                                                  ┃
 ┃    The primary distribution site is:                                                             ┃
@@ -186,6 +186,43 @@ object Tests extends Suite(m"Flame Tests"):
           repl.react(0, t"import scala.collection.mutable.ListBuffer")
           diagnostics(repl.react(1, t"val b: ListBuffer[Int] = \"no\""))
       . assert { diag => diag.contains(t"ListBuffer[Int]") && !diag.contains(t"mutable.ListBuffer") }
+
+      // Soundness's missing-given advice (frontier's `explainMissingContext`, reached through
+      // `import soundness.*`) replaces the compiler's own "no given instance" message only when
+      // the line is compiled with the fork's `-Zdiagnostic-givens`, and only when frontier is on
+      // the session classpath — so this guards both.
+      test(m"a missing given is explained with Soundness's advice, naming candidate givens"):
+        supervise:
+          val repl = Repl()
+          repl.react(0, t"import soundness.*")
+          diagnostics(repl.react(1, t"summon[rudiments.DecimalConverter]"))
+      . assert { diag => diag.contains(t"decimalConverters.javaDecimalConverter") }
+
+      // The catch-all must not intrude on ordinary code: implicit searches the compiler retries
+      // after inference (`join`'s element type, `flatMap`'s reshaping) must still resolve.
+      // ASPIRATIONAL: with frontier on the classpath, a bare `join` (whose `element`/`textual`
+      // type parameters are fixed by the `Joinable.Source` given it finds) resolves that given at
+      // `Any` and then fails on `Any is Textual` — with or without `-Zdiagnostic-givens`. This is
+      // frontier's catch-all satisfying a search made before inference has run; reported upstream.
+      test(m"a bare join over mapped elements still resolves with the advice in scope"):
+        supervise:
+          val repl = Repl()
+          repl.react(0, t"/set experimental")
+          repl.react(1, t"import soundness.*")
+          repl.interpret(t"List(t\"a\", t\"b\").map(_.upper).join")
+      . aspire:
+          case Repl.Outcome.Ran(_, value, _, _, _) => value.let(_.contains(t"AB")).or(false)
+          case _                                   => false
+
+      test(m"flatMap still resolves with the advice in scope"):
+        supervise:
+          val repl = Repl()
+          repl.react(0, t"/set experimental")
+          repl.react(1, t"import soundness.*")
+          repl.interpret(t"List(1, 2).flatMap { n => List(n, n) }")
+      . assert:
+          case Repl.Outcome.Ran(_, value, _, _, _) => value.let(_.contains(t"List(1, 1, 2, 2)")).or(false)
+          case _                                   => false
 
       // The wrapper objects (`rs$line$N`, in the empty package) are session bookkeeping: no rendering
       // the user sees may name them — not the result line's type, a `def`'s signature, a diagnostic,
