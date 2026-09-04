@@ -46,7 +46,6 @@ import scala.quoted.*
 import scala.collection.immutable as sci
 import scala.collection.mutable as scm
 
-import proscenium.compat.*
 
 // Dotty parser internals, used (aliased, to avoid clashing with Soundness names) only to
 // probe a line syntactically — whether it is an incomplete prefix (`Repl.incomplete`) and
@@ -74,6 +73,8 @@ import inimitable.*
 import parasite.*
 import prepositional.*
 import rudiments.*
+import symbolism.*
+import denominative.dysasymptotics.linearSize
 import serpentine.*
 import stratiform.*
 import vacuous.*
@@ -102,8 +103,8 @@ object Repl:
         // inner scope and take precedence, just as a definition outranks a wildcard import.
         // (Otherwise a prior `val z` and a wildcard `import …*` that also binds `z` would
         // be two same-scope wildcard imports, and any use of `z` would be ambiguous.)
-        val wrapper = t"object ${objectName(index)}:" :: historyImports ::: body
-        (imports ::: wrapper).join(t"\n")
+        val wrapper = t"object ${objectName(index)}:" :: (historyImports + body)
+        (imports + wrapper).join(t"\n")
 
   trait Layout:
     def objectName(index: Int): Text
@@ -551,9 +552,9 @@ object Repl:
       case Nil          => Nil
       case head :: rest =>
         val separated: List[List[Token]] = rest.map: (line: List[Token]) =>
-          List(Token(t"\n", t"unparsed", Unset)) ::: line
+          List(Token(t"\n", t"unparsed", Unset)) + line
 
-        head ::: separated.flatten
+        head + separated.flat
 
   // Tab completions at character `offset` in `code`, from Harlequin's typechecked
   // pipeline (so it needs the session's `Scalac` and compile classpath). `context` is the
@@ -653,7 +654,7 @@ object Repl:
     val (prefix, context) = Lexis.context(code, offset.z)
     val found = prophesy.ScalaKeywords.pattern(context)
     val words = prefix.lay(found.keywords) { partial => found.keywords.filter(_.starts(partial)) }
-    val items = List.of(words.toList.stdlib.sortBy(_.s)).map(CompletionItem(_, t"keyword", t""))
+    val items = List.from(words.stdlib.toList.sortBy(_.s)).map(CompletionItem(_, t"keyword", t""))
 
     val binding =
       found.expectation == prophesy.KeywordPattern.Expectation.TermBinding
@@ -677,8 +678,8 @@ object Repl:
       val sig: List[Token] =
         tokenize(before).filter { tok => tok.accent != t"unparsed" && tok.text.trim != t"" }
 
-      if sig.isEmpty then (Unset, prefix) else
-        val last = sig.last
+      if sig.nil then (Unset, prefix) else
+        val last = sig.stdlib.last
         val text = last.text
         val closeBracket = text == t")" || text == t"]" || text == t"}"
 
@@ -700,7 +701,7 @@ object Repl:
           val preceding: Text =
             tokenize(code.keep(baseStart))
             . filter { tok => tok.accent != t"unparsed" && tok.text.trim != t"" }
-            . lastOption.map(_.text).getOrElse(t"")
+            . stdlib.lastOption.optional.let(_.text).or(t"")
 
           if infixExcluded.has(preceding) then (Unset, prefix) else (t"$base.", prefix)
 
@@ -826,12 +827,12 @@ object Repl:
       else ji.File(cwd.s, dirPart.s)
 
     val children: List[ji.File] = Optional(baseDir.listFiles).lay(Nil): array =>
-      List.of(sci.ArraySeq.unsafeWrapArray(array.nn).map(_.nn).toList)
+      List.from(sci.ArraySeq.unsafeWrapArray(array.nn).map(_.nn))
 
     children
      . filter { file => file.getName.nn.startsWith(prefix) }
      . filter { file => prefix.startsWith(".") || !file.getName.nn.startsWith(".") }
-     . pipe { files => List.of(files.stdlib.sortBy(_.getName.nn)) }
+     . pipe { files => List.from(files.stdlib.sortBy(_.getName.nn)) }
      . map: (file: ji.File) =>
          val name:  Text    = file.getName.nn.tt
          val isDir: Boolean = file.isDirectory
@@ -844,10 +845,10 @@ object Repl:
   // `/set <name>` entry so each is offered (and documented) in tab-completion.
   val slashCommands: List[(Text, Text)] =
     List(t"/context" -> t"show the imports currently in scope")
-    ::: List(t"/set async" -> t"evaluate submissions asynchronously (slow results arrive later)")
-    ::: settings.filter(_.kind == Kind.Set).map { setting => t"/set ${setting.name}" -> setting.description }
-    ::: List(t"/language" -> t"enable a Scala `language` feature (its argument is completed per session)")
-    ::: List
+    + List(t"/set async" -> t"evaluate submissions asynchronously (slow results arrive later)")
+    + settings.filter(_.kind == Kind.Set).map { setting => t"/set ${setting.name}" -> setting.description }
+    + List(t"/language" -> t"enable a Scala `language` feature (its argument is completed per session)")
+    + List
          ( t"/tasty"    -> t"show the rendered TASTy (typed AST) of an expression",
            t"/bytecode" -> t"show the JVM bytecode of an expression or definition",
            t"/unimport" -> t"remove an earlier import from scope (by the tokens it was imported with)",
@@ -863,11 +864,11 @@ object Repl:
   // commands (`/session`, `/clear`, `/quit`, `/disconnect`) belong to the front-end and are handled
   // before this check.
   lazy val commandTokens: Set[Text] =
-    slashCommands.map { (entry: (Text, Text)) => entry(0).cut(t" ").head }.toSet
+    Set.from(slashCommands.map { (entry: (Text, Text)) => entry(0).cut(t" ").stdlib.head }.stdlib)
 
   // True when `line` begins with a `/`-command the engine recognises. Used by both front-ends to give
   // the identical `unknown command` message (see `messages.unknownCommand`) for anything else.
-  def isCommand(line: Text): Boolean = commandTokens.has(line.cut(t" ").head)
+  def isCommand(line: Text): Boolean = commandTokens.has(line.cut(t" ").stdlib.head)
 
   // The user-facing status/notice lines that BOTH front-ends show, kept here so the CLI and the web
   // stay word-for-word identical. Each is a complete line, e.g. `/tasty` usage, already do); the
@@ -932,10 +933,10 @@ object Repl:
     val highlighted =
       Scala.highlight(t"${contextLines}final val __result = $code\nval __base = __result")
 
-    val tokens = List.from(highlighted.lines.readable).flatten
+    val tokens = List.from(highlighted.lines.readable).flat
 
     def typeOf(binding: Text): Optional[Syntax] =
-      tokens.find(_.text == binding).optional.let(_.meta).let(_.tpe)
+      tokens.seek(_.text == binding).let(_.meta).let(_.tpe)
 
     // A failed widening probe is not fatal: fall back to the precise type, which names no worse
     // than the old behaviour did.
@@ -959,8 +960,8 @@ object Repl:
       // Soundness's `X is Y` expands to `Y { type Self = X }`, so the type it actually names is its
       // RIGHT operand; its companions (`Foo is Addable by Bar`, `Text is Encodable in Bytes`) each
       // qualify what is already to their left, so they step left and reach the same `is`.
-      case Syntax.Application(Syntax.Simple(alias), operands, true) if operands.length == 2 =>
-        if alias.name == t"is" then base(operands.last) else base(operands.head)
+      case Syntax.Application(Syntax.Simple(alias), List(first, second), true) =>
+        if alias.name == t"is" then base(second) else base(first)
 
       // Decoration: type arguments, a structural refinement and a capture set each qualify a base
       // type without changing which type it is, so each is stepped through to what it decorates.
@@ -1110,7 +1111,7 @@ object Repl:
           if depth == 0 then (found, current, 1) else (found, t"$current(", depth + 1)
 
         case ((found, current, depth), ')') =>
-          if depth == 1 then (List(current) ::: found, t"", 0) else (found, t"$current)", depth - 1)
+          if depth == 1 then (List(current) + found, t"", 0) else (found, t"$current)", depth - 1)
 
         case ((found, current, depth), char) =>
           if depth > 0 then (found, t"$current$char", depth) else (found, current, depth)
@@ -1204,18 +1205,24 @@ class Repl[version <: Scalac.Versions]
   // which clears it. Filled under `mutex`; `@volatile` makes the submit-time clear visible
   // without re-entering the mutex.
   @volatile
+  @scala.caps.unsafe.untrackedCaptures
   private var completionCache: Map[Text, List[Repl.CompletionItem]] = Map()
 
-  // Semantic diagnostics (`-Xsemantic-diagnostics`): a shared `delicious.Reifier` unpickles the TASTy
+  // Semantic diagnostics (`-Zsemantic-diagnostics`): a shared `delicious.Reifier` unpickles the TASTy
   // embedded in error messages so their types re-render through stenography. It embeds a compiler, so
   // it is EXPENSIVE — built lazily, only when a diagnostic actually carries semantic markup, and
   // dropped when `/classload` changes the classpath (so a newly-loaded library's types reify too).
   @volatile
+  @scala.caps.unsafe.untrackedCaptures
   private var reifierCache: Optional[delicious.Reifier] = Unset
 
+  @scala.caps.unsafe.untrackedCaptures
   private var index:   Int        = 0
+  @scala.caps.unsafe.untrackedCaptures
   private var result:  Int        = 0
+  @scala.caps.unsafe.untrackedCaptures
   private var history: List[Text] = Nil
+  @scala.caps.unsafe.untrackedCaptures
   private var seeded:  Boolean     = false
 
   // Each wrapper object's exported member names (decoded), captured by reflection right
@@ -1223,27 +1230,32 @@ class Repl[version <: Scalac.Versions]
   // same name: all the history imports sit in a single scope, where two wildcard imports
   // both binding `x` make every use of `x` ambiguous — so each earlier wrapper's import
   // must exclude the names that a later wrapper re-defines (see `historyImports`).
+  @scala.caps.unsafe.untrackedCaptures
   private var historyMembers: Map[Text, Set[Text]] = Map()
 
   // The user's persistent imports. An `import` statement creates no member, so — unlike
   // the `val`/`def`/`class` definitions that later lines see through the history imports
   // — it would vanish after its own line. We accumulate the imports each line introduces
   // and re-inject them into every subsequent line, exactly as the prelude's imports are.
+  @scala.caps.unsafe.untrackedCaptures
   private var imports: List[Text] = Nil
 
   // The settings the user has switched on with `/set <name>` or `/language <name>`; each contributes
   // its scalac flag to every later line's compile (see `effectiveScalac`). Holds setting NAMES (keys
   // into `Repl.settings`), not the flags themselves.
+  @scala.caps.unsafe.untrackedCaptures
   private var enabledSettings: Set[Text] = Set()
 
   // JARs and directories the user has added with `/classload`. They are appended to every subsequent
   // line's COMPILE classpath (`classpath`, so a later line can `import` from them) and pushed onto the
   // RUN-time classloader's URLs (`replLoader`, so the loaded code can use them).
+  @scala.caps.unsafe.untrackedCaptures
   private var extraEntries: List[Classpath.Entry.Directory | Classpath.Entry.Jar] = Nil
 
   // Async mode (`/set async`): when on, a front-end evaluates each submission on a background worker,
   // acknowledging with a placeholder and delivering the real result out-of-band once it is ready, so a
   // slow computation never blocks the editor. A plain per-session boolean (not a compiler flag).
+  @scala.caps.unsafe.untrackedCaptures
   private var asyncMode: Boolean = false
   def asyncEnabled: Boolean = asyncMode
 
@@ -1285,11 +1297,11 @@ class Repl[version <: Scalac.Versions]
       val fields  = names(cls.getDeclaredFields)(_.getName.nn)
       val classes = names(cls.getDeclaredClasses)(_.getSimpleName.nn)
 
-      (methods ::: fields ::: classes)
+      (methods + fields + classes)
         .map { each => scala.reflect.NameTransformer.decode(each) }
         .filter { each => each.indexOf('$') < 0 }
         .map(_.tt)
-        .toSet
+        .pipe { names => Set.from(names.stdlib) }
 
     catch case _: Throwable => Set()
 
@@ -1300,7 +1312,7 @@ class Repl[version <: Scalac.Versions]
   // run. A name bound only by an IMPORT is deliberately reusable: the new binding shadows it
   // (standard REPL behaviour), exactly as `historyImports`' exclusions arrange between wrappers.
   private def freeBindingName(base: Text): Text =
-    val bound: Set[Text] = historyMembers.values.foldLeft(Set[Text]())(_ ++ _)
+    val bound: Set[Text] = historyMembers.values.fold(Set[Text]())(_ + _)
     def taken(candidate: Text): Boolean =
       Repl.allKeywords.has(candidate) || bound.has(candidate)
 
@@ -1319,15 +1331,17 @@ class Repl[version <: Scalac.Versions]
     val exports: List[Set[Text]] =
       history.map { (name: Text) => historyMembers.stdlib.getOrElse(name, Set()) }
 
-    history.zip(exports).zipWithIndex.map: (line, position) =>
+    val imports = history.zip(exports).stdlib.zipWithIndex.map: (line, position) =>
       val (name, members) = line
-      val later: Set[Text] = exports.drop(position + 1).fold(Set())(_ ++ _)
-      val hidden: List[Text] = List.of(members.intersect(later).stdlib.toList.sortBy(_.s))
+      val later: Set[Text] = exports.skip(position + 1).fold(Set())(_ + _)
+      val hidden: List[Text] = List.from(members.intersect(later).stdlib.toList.sortBy(_.s))
 
-      if hidden.isEmpty then t"import $name.{given, *}"
+      if hidden.nil then t"import $name.{given, *}"
       else
         val exclusions = hidden.map { (member: Text) => t"`$member` as _" }.join(t", ")
         t"import $name.{$exclusions, given, *}"
+
+    List.from(imports)
 
   // The compile classpath must come from the *same* loader the wrapper objects
   // are run against (`classloader`, below), not from `classloaders.threadContext`:
@@ -1344,7 +1358,7 @@ class Repl[version <: Scalac.Versions]
 
     // The `/classload` entries come last, so the base classpath (the scala library, soundness, …)
     // always resolves first and an added JAR only supplements it.
-    LocalClasspath((entries ::: extraEntries)*)
+    LocalClasspath((entries + extraEntries)*)
 
   // The shared reifier for semantic diagnostics, built lazily against the current classpath (its
   // types resolve there). `reifierCache` is cleared by `/classload`, so the next diagnostic rebuilds
@@ -1431,15 +1445,15 @@ class Repl[version <: Scalac.Versions]
     (history :+ layout.objectName(index)).each: (wrapper: Text) =>
       roots.each { (root: Text) => wildcard(t"$root$wrapper") }
 
-    (prelude.imports.map(_.tt) ::: imports).each: (statement: Text) =>
+    (prelude.imports.map(_.tt) + imports).each: (statement: Text) =>
       val body: Text = statement.trim.skip(t"import ".length).trim
       if body.ends(t".*") then wildcard(body.chomp(t".*", Rtl))
       else if body.contains(t"{") then
-        val prefix: Text = body.cut(t"{").head.trim.chomp(t".", Rtl)
-        body.cut(t"{").last.cut(t"}").head.cut(t",").map(_.trim).filter(_ != t"").each: selector =>
+        val prefix: Text = body.cut(t"{").stdlib.head.trim.chomp(t".", Rtl)
+        body.cut(t"{").stdlib.last.cut(t"}").stdlib.head.cut(t",").map(_.trim).filter(_ != t"").each: selector =>
           if selector == t"*" || selector == t"given" then wildcard(prefix)
           else
-            val name: Text = selector.cut(t"=>").head.trim  // a renamed import (`Foo => Bar`) keeps `Foo`
+            val name: Text = selector.cut(t"=>").stdlib.head.trim  // a renamed import (`Foo => Bar`) keeps `Foo`
             if name != t"" then directType(t"$prefix.$name")
       else directType(body)
 
@@ -1460,13 +1474,13 @@ class Repl[version <: Scalac.Versions]
        if result.widened == result.precise then Unset else renderType(result.widened) )
 
   // Renders `notices` to the reply's diagnostics string, re-rendering the types embedded in error
-  // messages through stenography when the compiler supplied semantic markup (`-Xsemantic-diagnostics`);
+  // messages through stenography when the compiler supplied semantic markup (`-Zsemantic-diagnostics`);
   // otherwise the plain messages. Types are abbreviated against the session's imports (`semanticImports`)
   // so they read as the user wrote them. The output targets THIS session's front-end (`render`):
   // coloured ANSI for `Inspect` (the CLI), HTML for `Html` (the web). The (expensive) reifier is built
   // only when some notice actually carries markup.
   private def renderDiagnostics(notices: List[Notice])(using System): Text =
-    if notices.isEmpty then t"" else
+    if notices.nil then t"" else
       given stenography.Imports = semanticImports
 
       val reifier: Optional[delicious.Reifier] =
@@ -1501,7 +1515,7 @@ class Repl[version <: Scalac.Versions]
     // with in-band markers carrying pickled TASTy, which `delicious` re-renders through stenography
     // (see `SemanticRender`). Harmless when unused — a plain consumer reads the marker-stripped message.
     val semantic: Scalac.Option[version] =
-      Scalac.Option[version](t"-Xsemantic-diagnostics")
+      Scalac.Option[version](t"-Zsemantic-diagnostics")
 
     // A SEEDED session (one built from a `Repl[version] { ... }` block) compiles in experimental
     // mode throughout. Its seed object is a recompile of trees typed in the host's compilation,
@@ -1510,11 +1524,11 @@ class Repl[version <: Scalac.Versions]
     // in turn marks the seed object itself, and a line that imports it needs the flag too. An
     // unseeded session is untouched, so `/set experimental` still gates experimental mode there.
     val seeded: List[Scalac.Option[version]] =
-      if prelude.seedTasty.isEmpty || experimentalOn then Nil
+      if prelude.seedTasty.nil || experimentalOn then Nil
       else List(Scalac.Option[version](t"-experimental"))
 
-    val extras: List[Scalac.Option[version]] = List(quiet, semantic) ::: seeded ::: extra
-    Scalac(scalac.options ::: extras)
+    val extras: List[Scalac.Option[version]] = List(quiet, semantic) + seeded + extra
+    Scalac(scalac.options + extras)
 
   // A line that has been COMPILED but not necessarily run. `compile` returns this so `react` can
   // ── The warm compiler session ────────────────────────────────────────────────────────────────
@@ -1571,6 +1585,7 @@ class Repl[version <: Scalac.Versions]
 
     // The stack trace of whatever killed the session thread, if anything did — see `compile`.
     @volatile
+    @scala.caps.unsafe.untrackedCaptures
     private var failure: Optional[StackTrace] = Unset
 
     // Compiles `sources` on the session thread and waits for the result. The `Process` never leaves
@@ -1650,7 +1665,9 @@ class Repl[version <: Scalac.Versions]
 
   // The live warm session, and the compiler arguments and classpath it was opened with — a change
   // to either retires it (see `Warm`).
+  @scala.caps.unsafe.untrackedCaptures
   private var warm: Optional[Warm] = Unset
+  @scala.caps.unsafe.untrackedCaptures
   private var warmKey: Optional[Text] = Unset
 
   // Compiles `sources` through the warm session, opening (or re-opening) it if the effective
@@ -1736,7 +1753,7 @@ class Repl[version <: Scalac.Versions]
       case CompileResult.Success =>
         index += 1
         history = history :+ name
-        historyMembers = historyMembers.updated(name, wrapperMembers(name))
+        historyMembers = historyMembers.define(name, wrapperMembers(name))
 
         Built.Deferred: () =>
           // Capture whatever the user's code prints to stdout. Scala's `println` writes to
@@ -1750,6 +1767,7 @@ class Repl[version <: Scalac.Versions]
 
           // Captures `onOutput` (impure), so its type is left to infer rather than pinned pure.
           val teeing = new ji.OutputStream:
+            @scala.caps.unsafe.untrackedCaptures
             private var streamed: Int = 0
             def write(byte: Int): Unit = captured.write(byte)
             override def write(bytes: scala.Array[Byte] | Null, off: Int, len: Int): Unit =
@@ -1799,10 +1817,10 @@ class Repl[version <: Scalac.Versions]
     val (parts, last, _) = clauses.s.foldLeft[(List[Text], Text, Int)]((List[Text](), t"", 0)):
       case ((parts, current, depth), char @ ('{' | '[' | '(')) => (parts, t"$current$char", depth + 1)
       case ((parts, current, depth), char @ ('}' | ']' | ')')) => (parts, t"$current$char", depth - 1)
-      case ((parts, current, 0),     ',')                      => (List(current.trim) ::: parts, t"", 0)
+      case ((parts, current, 0),     ',')                      => (List(current.trim) + parts, t"", 0)
       case ((parts, current, depth), char)                     => (parts, t"$current$char", depth)
 
-    val collected: List[Text] = List(last.trim) ::: parts
+    val collected: List[Text] = List(last.trim) + parts
     collected.reverse.filter { (part: Text) => part != t"" }
 
   // A persistent import whose ROOT names a session definition — `import Foo.Bar`, where `Foo` was
@@ -1818,13 +1836,13 @@ class Repl[version <: Scalac.Versions]
   // match the import as it was typed.
   private def qualifyImport(statement: Text): Text =
     val body: Text = importClause(statement)
-    val root: Text = body.cut(t".").head.trim
+    val root: Text = body.cut(t".").stdlib.head.trim
 
-    val owner: Option[Text] =
-      history.reverse.find { wrapper => historyMembers.stdlib.getOrElse(wrapper, Set()).has(root) }
+    val owner: Optional[Text] =
+      history.reverse.seek { wrapper => historyMembers.stdlib.getOrElse(wrapper, Set()).has(root) }
 
     owner match
-      case Some(wrapper) => t"import $wrapper.$body"
+      case wrapper: Text => t"import $wrapper.$body"
       case _             => statement
 
   // The user's persistent imports, in the form they must take outside the wrapper object.
@@ -1837,7 +1855,7 @@ class Repl[version <: Scalac.Versions]
     val repeated = importsIn(line)
     def keep(statement: Text): Boolean = !repeated.has(statement)
 
-    prelude.imports.map(_.tt).filter(keep) ::: imports.filter(keep).map(qualifyImport)
+    prelude.imports.map(_.tt).filter(keep) + imports.filter(keep).map(qualifyImport)
 
   // The two lines that render the value bound to `ref` and stash the rendering under `key` for
   // the outcome: an `@experimental` initializer (experimental mode is enabled just here, since
@@ -1965,9 +1983,9 @@ class Repl[version <: Scalac.Versions]
         compile(contextImports(line), line, onOutput)(Unset) match
           case deferred @ Built.Deferred(_) =>
             val introduced: List[Text] = importsIn(line)
-            imports = (imports ::: introduced).distinct
+            imports = (imports + introduced).distinct
 
-            if introduced.isEmpty then deferred else
+            if introduced.nil then deferred else
               val confirmed: Text =
                 introduced.map { (each: Text) => t"Imported ${importClause(each)}" }.join(t"", t"\n", t"\n")
 
@@ -1984,7 +2002,7 @@ class Repl[version <: Scalac.Versions]
 
     // The scope this line sees, for typing the result and for checking name collisions.
     val context: List[Text] =
-      (prelude.imports.map(_.tt) ::: sessionImports) ::: historyImports
+      (prelude.imports.map(_.tt) + sessionImports) + historyImports
 
     // A definition or declaration can never be an expression: go STRAIGHT to the definition/statement
     // path, skipping the result-type probe and the try-as-expression compile — two whole compiler
@@ -2066,7 +2084,7 @@ class Repl[version <: Scalac.Versions]
       safely(Repl.resultType(context, t"{ $line\n$bound }")).let(typeText)
 
     val lazyVal: Boolean =
-      line.trim.cut(t" ").takeWhile { word => word != t"val" && word != t"var" }.has(t"lazy")
+      line.trim.cut(t" ").stdlib.takeWhile { word => word != t"val" && word != t"var" }.contains(t"lazy")
 
     if lazyVal then
       mapRan(compile(contextImports(line), line, onOutput)(Unset)):
@@ -2087,7 +2105,7 @@ class Repl[version <: Scalac.Versions]
   private def ensureSeeded()(using Monitor, System, Probate)
   :   Optional[Outcome] logs CompileEvent raises Compiler.Error raises Async.Error =
 
-    if seeded || prelude.seedTasty.isEmpty then Unset
+    if seeded || prelude.seedTasty.nil then Unset
     else
       seeded = true
       val name:   Text       = layout.objectName(index)
@@ -2095,10 +2113,10 @@ class Repl[version <: Scalac.Versions]
       val errors: List[Text] =
         ReplModuleCompiler.compile(classpath)(name, out.encode)(prelude.seedTasty)
 
-      if errors.isEmpty then
+      if errors.nil then
         index += 1
         history = history :+ name
-        historyMembers = historyMembers.updated(name, wrapperMembers(name))
+        historyMembers = historyMembers.define(name, wrapperMembers(name))
         Outcome.Ran(Nil, Unset, t"")
       else
         Outcome.Rejected(errors.map(Notice(Importance.Error, t"<seed>", _, Unset)))
@@ -2118,13 +2136,13 @@ class Repl[version <: Scalac.Versions]
     val arg: Text = line.trim.skip(t"/unimport".length).trim
 
     if arg == t"" then
-      if imports.isEmpty then Outcome.Ran(Nil, Unset, t"No imports to remove\n")
+      if imports.nil then Outcome.Ran(Nil, Unset, t"No imports to remove\n")
       else
         val listing = imports.map { (each: Text) => t"  ${importClause(each)}" }.join(t"\n")
         Outcome.Ran(Nil, Unset, t"Imports in scope (remove with /unimport <tokens>):\n$listing\n")
     else
       val (removed, kept) = imports.partition { each => importKey(each) == importKey(arg) }
-      if removed.isEmpty then Outcome.Ran(Nil, Unset, t"No matching import to remove: $arg\n")
+      if removed.nil then Outcome.Ran(Nil, Unset, t"No matching import to remove: $arg\n")
       else
         imports = kept
         Outcome.Ran(Nil, Unset, t"Removed import: ${importClause(arg)}\n")
@@ -2169,16 +2187,16 @@ class Repl[version <: Scalac.Versions]
   // Toggles the setting of `kind` named `name`, gating experimental language features on `experimental`
   // being enabled; `label` names the category for the messages.
   private def toggle(kind: Kind, label: Text, name: Text, rest: List[Text]): Outcome =
-    Repl.settings.find { setting => setting.kind == kind && setting.name == name } match
-      case Some(setting) if setting.experimental && !enabledSettings.has(t"experimental") =>
+    Repl.settings.seek { setting => setting.kind == kind && setting.name == name } match
+      case setting: Repl.Setting if setting.experimental && !enabledSettings.has(t"experimental") =>
         Outcome.Ran(Nil, Unset, t"$name is experimental — enable it first with `/set experimental`\n")
 
-      case Some(setting) =>
+      case setting: Repl.Setting =>
         val enable: Boolean = enabledBy(rest)
-        if enable then enabledSettings += name else enabledSettings -= name
+        enabledSettings = if enable then enabledSettings + Set(name) else enabledSettings.except(Set(name))
         Outcome.Ran(Nil, Unset, t"$name ${if enable then t"enabled" else t"disabled"}\n")
 
-      case None =>
+      case _ =>
         val expOn = enabledSettings.has(t"experimental")
         val known: Text =
           Repl.settings
@@ -2207,7 +2225,7 @@ class Repl[version <: Scalac.Versions]
   private def showClasspath(using System): Outcome =
     val entries: List[Text] = classpath.entries.map(classpathEntryText)
     val listing: Text = entries.map { (each: Text) => t"  $each" }.join(t"\n")
-    Outcome.Ran(Nil, Unset, t"Classpath (${entries.length.toString.tt} entries):\n$listing\n")
+    Outcome.Ran(Nil, Unset, t"Classpath (${entries.size.toString.tt} entries):\n$listing\n")
 
   // `/classload <file>` adds a JAR file or a directory to the classpath — for BOTH the compiler (so a
   // later line can `import` from it and type-check against it) and the run-time classloader (so the
@@ -2249,8 +2267,8 @@ class Repl[version <: Scalac.Versions]
   // `/context` lists every import currently in scope — the prelude's baseline imports plus the
   // ones the user has added — so the session's namespace can be inspected without changing it.
   private def showContext: Outcome =
-    val all = prelude.imports.map(_.tt) ::: imports
-    if all.isEmpty then Outcome.Ran(Nil, Unset, t"No imports in scope\n")
+    val all = prelude.imports.map(_.tt) + imports
+    if all.nil then Outcome.Ran(Nil, Unset, t"No imports in scope\n")
     else
       val listing = all.map { (each: Text) => t"  import ${importClause(each)}" }.join(t"\n")
       Outcome.Ran(Nil, Unset, t"Imports in scope:\n$listing\n")
@@ -2311,7 +2329,7 @@ class Repl[version <: Scalac.Versions]
     // behaves as on a normal line — the client's token-based insertion keeps the command prefix);
     // other `/`-command lines complete against the engine's known commands, not the Scala compiler.
     val exprHead: Optional[Text] =
-      List(t"/tasty ", t"/bytecode ").find { (prefix: Text) => code.starts(prefix) }.getOrElse(Unset)
+      List(t"/tasty ", t"/bytecode ").seek { (prefix: Text) => code.starts(prefix) }
 
     if code.trim.starts(t"/unimport") then
       val arg = code.trim.skip(t"/unimport".length).trim
@@ -2322,7 +2340,7 @@ class Repl[version <: Scalac.Versions]
     // ones always, the experimental ones only once `experimental` is on (SESSION-aware, unlike the
     // static `slashCommands`). The partial is the token being typed after the `/language ` prefix.
     else if code.starts(t"/language ") then
-      val partial = code.keep(offset).cut(t" ").last
+      val partial = code.keep(offset).cut(t" ").stdlib.last
       Repl.languageCompletions(partial, enabledSettings.has(t"experimental"))
 
     // `/classload <partial>` completes its argument against the filesystem (see `classloadCompletions`).
@@ -2349,16 +2367,16 @@ class Repl[version <: Scalac.Versions]
     // The scope a compiled line would see: the prelude's and the user's persistent imports,
     // plus the prior wrapper objects' members and givens (as `import rs$line$N.{given, *}`).
     val context: List[Text] =
-      (prelude.imports.map(_.tt) ::: sessionImports) ::: historyImports
+      (prelude.imports.map(_.tt) + sessionImports) + historyImports
 
     // The full member list of `expr.`, compiled ONCE and cached under the base, so typing
     // further member characters (or backspacing) costs no recompilation. The base's type is
     // fixed within a line; the cache is cleared on the next submission (`interpret`). Shared
     // by member selection (`expr.partial`) and infix completion (`expr partial`).
     def members(base: Text): List[Repl.CompletionItem] =
-      completionCache.get(base).getOrElse:
+      completionCache.stdlib.get(base).getOrElse:
         val items = safely(Repl.complete(context, base, base.length, semanticImports)).or(Nil)
-        completionCache = completionCache.updated(base, items)
+        completionCache = completionCache.define(base, items)
         items
 
     Repl.memberBase(code, offset) match
@@ -2374,7 +2392,7 @@ class Repl[version <: Scalac.Versions]
             val matchKw  =
               if t"match".starts(prefix) then List(Repl.CompletionItem(t"match", t"keyword", t"")) else Nil
 
-            matchKw ::: matched
+            matchKw + matched
 
           // Otherwise prepend the keywords valid at this position (the compiler offers none)
           // to its name/definition completions. When prophesy reports that the grammar expects
@@ -2383,7 +2401,7 @@ class Repl[version <: Scalac.Versions]
           case _ =>
             val (keywords, binding) = Repl.keywordCompletions(code, offset)
             if binding then keywords
-            else keywords ::: mutex(safely(Repl.complete(context, code, offset, semanticImports)).or(Nil))
+            else keywords + mutex(safely(Repl.complete(context, code, offset, semanticImports)).or(Nil))
 
   // Typecheck-highlights, compiles, and runs `code`, returning a `Reply` with the highlighting, the
   // result value, its rendered type, and any diagnostics. Only COMPILATION and the session-state

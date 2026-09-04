@@ -44,7 +44,7 @@ import spectacular.*
 // instances are written for the prelude's opaque `List`/`Set`/`Map`, so a REPL line that evaluates
 // to a *stdlib* collection (which `List(1, 2, 3)` is, under the default predef the REPL compiles
 // user code with) has no `Inspectable` at all. A bare `value.inspect` in the wrapper then fails to
-// resolve, and the resulting error — pickled by `-Xsemantic-diagnostics` — takes the compile down
+// resolve, and the resulting error — pickled by `-Zsemantic-diagnostics` — takes the compile down
 // with it, so the line reports a compiler crash rather than its value.
 //
 // `render` is inlined into the compiled wrapper, where the value's static type and its instances

@@ -34,9 +34,10 @@ package flame
 
 import java.lang as jl
 
-import proscenium.compat.*
 
 import anticipation.*
+import denominative.*
+import denominative.dysasymptotics.linearSize
 // `stackTraceTeletype` must be named: it is a given, and a wildcard import does not bring givens into
 // scope. Without it, escapade's generic `Showable`-based `Teletypeable` still applies, so the trace
 // renders — silently unstyled, with no compile error. It lives under `digression.teletypeables`,
@@ -92,6 +93,6 @@ object StackTraceRender:
     // Drop the machinery above the user's outermost frame (reflection, the classloader, the engine,
     // the worker thread); keep the whole trace if no user frame is identifiable.
     val trimmed: StackTrace =
-      if last < 0 then trace else trace.dropRight(trace.frames.length - 1 - last)
+      if last < 0 then trace else trace.dropRight(trace.frames.size - 1 - last)
 
     trimmed.teletype.render(xtermTrueColorTermcap)

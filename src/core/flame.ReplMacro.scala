@@ -229,7 +229,7 @@ object ReplMacro:
     // `Prelude` holds the prelude's opaque lists, so the stdlib lists this file works in are
     // converted where they cross into it.
     val preludeExpr: Expr[Repl.Prelude] =
-      '{Repl.Prelude(proscenium.List.of($importsExpr), proscenium.List.of(${Expr(pickled)}))}
+      '{Repl.Prelude(proscenium.List.from($importsExpr), proscenium.List.from(${Expr(pickled)}))}
 
     ' {
         val repl: Repl[version] =

@@ -44,9 +44,9 @@ import scala.collection.concurrent.TrieMap
 import scala.collection.mutable as scm
 
 import soundness.*
+import dysasymptotics.linearSize
 
 // The stdlib-shaped operations on the prelude's opaque collections (Soundness #1693).
-import proscenium.compat.*
 
 import escapade.Faint
 import escapade.Italic
@@ -140,7 +140,7 @@ private def initialSettings(using Cli, Interpreter): List[Text] =
   def named(kind: Repl.Kind): List[Text] = flagged.filter(_.kind == kind).map(_.name)
 
   named(Repl.Kind.Set).map { (name: Text) => t"/set $name" }
-  ::: named(Repl.Kind.Language).map { (name: Text) => t"/language $name" }
+  + named(Repl.Kind.Language).map { (name: Text) => t"/language $name" }
 
 // The default TCP port for `flame listen` (a remote-reachable REPL server) and for `flame --host`
 // when no `--port` is given. Arbitrary, but stable so the two ends agree without configuration.
@@ -171,9 +171,9 @@ def runClient(): Unit =
         // taken, and reading them inside `command` would register none of them at all.
         val settings: List[Text]     = initialSettings
         val basic:    Boolean        = Basic().present
-        val host:     Optional[Text] = Host()
-        val port:     Int            = Port().or(defaultPort)
-        val session:  Optional[Text] = Session()
+        val host:     Optional[Text] = Host().value
+        val port:     Int            = Port().value.or(defaultPort)
+        val session:  Optional[Text] = Session().value
 
         // `flame --basic` — a minimal, self-contained, in-process synchronous REPL (no socket
         // server, no TUI). Checked before `--host`, so it never falls through to a remote/socket
@@ -190,7 +190,7 @@ def runClient(): Unit =
       // The read is OUTSIDE `command`: in completion mode `execute` returns without running its
       // block at all, so a flag read within it would never register and never be suggested.
       case Serve() :: _ =>
-        val port: Int = Port().or(8080)
+        val port: Int = Port().value.or(8080)
         command(httpServe(port))
 
       // `flame install` — install this command's tab-completions into the user's shell.
@@ -201,7 +201,7 @@ def runClient(): Unit =
       // socket), so a `flame --host` client on another machine can reach its sessions. Defaults to
       // `defaultPort`; a non-numeric `--port` also falls back to it.
       case Listen() :: _ =>
-        val port: Int = Port().or(defaultPort)
+        val port: Int = Port().value.or(defaultPort)
         command(serve(port))
 
       // Internal: the per-process UNIX-socket REPL server that `connectSocket`/`launchServer`
@@ -364,7 +364,7 @@ private def installCompletions()(using stdio: Stdio, service: DaemonService[?])(
   given Entrypoint = caps.unsafe.unsafeAssumePure(service)
 
   recover:
-    case error: InstallError =>
+    case error: exoskeleton.Install.Error =>
       Out.println(t"Could not install tab-completions")
       Exit.Fail(8)
 
@@ -394,7 +394,7 @@ private def serveSocket()(using Stdio, Monitor, Probate, System): Exit =
   // never lingers as a stale file a later client has to clean up.
   val removeSocket: Runnable = () =>
     recover:
-      case _: Path.Error | _: IoError => ()
+      case _: Path.Error | _: Io.Error => ()
     . protect:
       socketPath.as[Path on Linux].wipe()
       ()
@@ -407,7 +407,7 @@ private def serveSocket()(using Stdio, Monitor, Probate, System): Exit =
     // if the directory exists), unlike `Files.createDirectories`, so the directory (which persists
     // across processes) is created only when absent.
     recover:
-      case _: Path.Error | _: IoError => ()
+      case _: Path.Error | _: Io.Error => ()
     . protect:
       val directory = socketDirectory.as[Path on Linux]
       if !directory.existent() then directory.create[Directory]()
@@ -420,7 +420,7 @@ private def serveSocket()(using Stdio, Monitor, Probate, System): Exit =
     service.stop()
 
     recover:
-      case _: Path.Error | _: IoError => ()
+      case _: Path.Error | _: Io.Error => ()
     . protect:
       socketPath.as[Path on Linux].wipe()
 
@@ -452,7 +452,7 @@ private def serverClassloader(using System): Classloader =
   // launcher). Either way we fall back to the thread-context loader.
   try
     recover:
-      case _: Path.Error | _: IoError => threadContextClassloader
+      case _: Path.Error | _: Io.Error => threadContextClassloader
     . protect:
       val executable: Text = unsafely(System.properties.ethereal.script[Text]())
       val tmpDir: Path on Linux = temporaryDirectory/Uuid()
@@ -474,7 +474,7 @@ private def serverClassloader(using System): Classloader =
         case _ =>
           Nil
 
-      new Classloader(jn.URLClassLoader((url :: bootstrapUrls).toArray, threadContextClassloader.java))
+      new Classloader(jn.URLClassLoader((url :: bootstrapUrls).stdlib.toArray, threadContextClassloader.java))
   catch case _: Throwable => threadContextClassloader
 
 private def invalidPort(portNumber: Int)(using Stdio): Exit =
@@ -605,7 +605,7 @@ private def connectSocket(join: Optional[Text], initial: List[Text])
     if connectDomain(DomainSocket(path)) { _ => () }.absent
     then
       recover:
-        case _: Path.Error | _: IoError => ()
+        case _: Path.Error | _: Io.Error => ()
       . protect:
         path.as[Path on Linux].wipe()
     else live += path
@@ -691,10 +691,9 @@ private def runRepl
 
   // `duplex.source` blocks on its first socket read, so force the iterator lazily —
   // only once a request has been sent — otherwise it would deadlock before the editor
-  // even starts (the server sends nothing until it receives a message). `toProgression` is
-  // zephyrine's legacy view of the kernel read stream: one materialized chunk per refill
-  // (it was `toLazyList` before Soundness #1693 made it yield a `Chain`).
-  lazy val chunks: Iterator[Data] = duplex.source.toProgression.iterator
+  // even starts (the server sends nothing until it receives a message). `chunks` is zephyrine's
+  // iterator view of the kernel read stream: one materialized chunk per refill.
+  lazy val chunks: Iterator[Data]^ = duplex.source.chunks
   @volatile var live = true
 
   // Replies to session queries/switches (the server only sends a `Session` reply in answer to a
@@ -802,7 +801,7 @@ private def runRepl
     // Construct the reader here, not on the main thread: forcing `chunks`
     // (`duplex.source.toLazyList.iterator`) blocks until the first byte arrives, and the main
     // thread must stay free to render the editor and drive the event loop.
-    val frames: FrameReader = new FrameReader(chunks)
+    val frames: FrameReader^ = new FrameReader(chunks)
 
     while live do
       val data: Optional[Data] = frames.next()
@@ -1015,8 +1014,8 @@ private def runRepl
       val language: Boolean = naturalLanguage(editor.value)
 
       val compLines: List[Teletype] =
-        if language || candidates.isEmpty then Nil
-        else completionTable(candidates.take(candidates.length.min(10)), terminal.knownColumns.max(1))
+        if language || candidates.nil then Nil
+        else completionTable(candidates.keep(10), terminal.knownColumns.max(1))
 
       // `paint` already flushes the block to the terminal (via `InlineRoot.flush`), so no explicit
       // `root.flush()` is needed here — and a second flush would be actively wrong, re-running the
@@ -1190,7 +1189,7 @@ private def runRepl
           case Keypress.Enter
               if { val rest = editor.value.skip(editor.position); rest == t"" || rest.starts(t"\n") } =>
             val before: Text = editor.value.keep(editor.position)
-            val indent: Text = leadingWhitespace(before.cut(t"\n").last)
+            val indent: Text = leadingWhitespace(before.cut(t"\n").stdlib.last)
             val value:  Text = t"$before\n$indent${editor.value.skip(editor.position)}"
             editor = LineEditor(value, editor.position + 1 + indent.length, editor.mode)
             candidates = Nil
@@ -1209,7 +1208,7 @@ private def runRepl
     // Drop any open completion pane before finishing, so the frozen block is just the editor box
     // (the inline shrink holds the box's top and clears the pane below it); otherwise `finish`
     // would leave the listing frozen in the scrollback between the line and its result.
-    if candidates.nonEmpty then
+    if !candidates.nil then
       candidates = Nil
       frame()
 
@@ -1351,9 +1350,9 @@ private def replPane
   // trailing newline, which would scroll the panel and clip the first row). When the pane
   // shrinks or vanishes, the inline anchoring holds the box's top and clears the rows below it,
   // so the editor never moves; when there are no candidates the block is just the box.
-  if compLines.isEmpty then box
+  if compLines.nil then box
   else
-    val list = panel(minHeight = compLines.length, maxHeight = compLines.length):
+    val list = panel(minHeight = compLines.size, maxHeight = compLines.size):
       summon[Extent].put(compLines.join(e"\n"))
 
     stack(box, list)
@@ -1820,7 +1819,7 @@ private class LiveState:
 // own commands (shared with the web front-end via `Repl.slashCommands`) plus the client-only
 // ones. Keep the client-only entries in step with the dispatch in `converse`.
 private val slashCommands: List[(Text, Text)] =
-  Repl.slashCommands ::: List
+  Repl.slashCommands + List
     ( t"/clear"      -> t"clear the screen and forget the session history",
       t"/session"    -> t"switch to another session (or list them)",
       t"/disconnect" -> t"leave the session, keeping the server running",
@@ -1861,7 +1860,7 @@ private def leadingWhitespace(line: Text): Text =
 // Whether `text`'s last line — the text after its final newline — is blank. This is the "leave a
 // blank line at the end" trigger that submits a multi-line entry.
 private def blankLastLine(text: Text): Boolean =
-  text.contains(t"\n") && text.cut(t"\n").last.trim == t""
+  text.contains(t"\n") && text.cut(t"\n").stdlib.last.trim == t""
 
 // Drops a single trailing blank line (the final newline and any whitespace-only last line), so a
 // multi-line entry submitted by leaving a blank line renders tight everywhere it is shown or stored.
@@ -1928,17 +1927,18 @@ private def encode(request: Repl.Request): Data = unsafely(request.bintel)
 // server reads with `DataInputStream.readInt` + `readFully`.
 private def framed(data: Data): Data =
   val length: Int = data.length
-
-  val header: Data =
-    Array.of[Byte]
-     ( (length >>> 24).toByte, (length >>> 16).toByte, (length >>> 8).toByte, length.toByte )
-
-  header ++ data
+  val bytes: scala.Array[Byte] = new scala.Array[Byte](4 + length)
+  bytes(0) = (length >>> 24).toByte
+  bytes(1) = (length >>> 16).toByte
+  bytes(2) = (length >>> 8).toByte
+  bytes(3) = length.toByte
+  jl.System.arraycopy(Array.unsafeJvm(data), 0, bytes, 4, length)
+  Array.unsafeFrozen(bytes)
 
 // Reassembles length-prefixed frames from the (chunk-at-a-time) socket stream, keeping
 // a buffer across calls so a frame split over chunks — or several frames in one chunk —
 // is handled. `next()` yields one frame's body, or `Unset` when the stream ends.
-private class FrameReader(chunks: Iterator[Data]):
+private class FrameReader(chunks: Iterator[Data]^):
   private val buffer: scm.ArrayBuffer[Byte] = scm.ArrayBuffer()
 
   private def fill(count: Int): Boolean =

@@ -40,7 +40,6 @@ import _root_.java.nio.channels as jnc
 
 import soundness.*
 
-import proscenium.compat.*
 
 import classloaders.threadContextClassloader
 import filesystemBackends.virtualMachineFilesystem
@@ -345,7 +344,7 @@ object Tests extends Suite(m"Flame Tests"):
           val partial: Text = t"/classload /"
           Repl().completionsAt(partial, partial.length)
       . assert: items =>
-          items.nonEmpty
+          !items.nil
           && items.all(_.name.starts(t"/classload /"))  // whole-line `/classload <path>` candidates
           && items.exists(_.name.ends(t"/"))            // at least one directory (e.g. /usr/, /bin/)
 
@@ -613,7 +612,7 @@ object Tests extends Suite(m"Flame Tests"):
         supervise:
           Repl().interpret(t"val n: Int = \"forty\"")
       . assert:
-          case Repl.Outcome.Rejected(notices) => notices.nonEmpty
+          case Repl.Outcome.Rejected(notices) => !notices.nil
           case _                              => false
 
       test(m"a runtime exception is reported as Threw"):

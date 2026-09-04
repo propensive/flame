@@ -39,7 +39,6 @@ import hellenism.*
 import iridescence.*
 import mandible.*
 import prepositional.*
-import proscenium.compat.*
 import rudiments.*
 import vacuous.*
 
@@ -74,6 +73,6 @@ object BytecodeRender:
       classfile.methods
         .filter { method => !synthetic.has(method.name) }
         .map { method => (method.name, method.bytecode) }
-        .collect { case (name, code: Bytecode) => e"$Bold($name)\n${code.teletype}" }
+        .sweep { case (name, code: Bytecode) => e"$Bold($name)\n${code.teletype}" }
         .join(e"\n\n")
         .render(xtermTrueColorTermcap)

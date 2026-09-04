@@ -50,7 +50,7 @@ import delicious.*  // Markup, SemanticMessage, Reifier, `semantic` on Notice, `
 
 // Renders compiler notices for a REPL reply, re-rendering the TYPES embedded in each error message
 // through stenography and syntax-highlighting both them and any embedded CODE SAMPLES with harlequin.
-// Under `-Xsemantic-diagnostics` the compiler wraps every interpolated type of a message in in-band
+// Under `-Zsemantic-diagnostics` the compiler wraps every interpolated type of a message in in-band
 // markers carrying its pickled TASTy, and interpolated trees as `code` nodes; `delicious` parses that
 // into a `Markup` tree and its `Reifier` turns each type marker's TASTy back into a
 // `stenography.Syntax`. For the CLI (`Inspect`) the rendering is `delicious.ansi`'s `teletype` —
@@ -200,7 +200,7 @@ object SemanticRender:
         val word: Text = s.substring(start, i).nn.tt
         pieces += Piece.Word(e"$word", word.length)
 
-    List.of(pieces.result())
+    List.from(pieces.result())
 
   // Word-wraps a PLAIN (no semantic markup) message for the terminal, through the same flow — no
   // styling, so the wrapped Teletype's plain text is returned directly.

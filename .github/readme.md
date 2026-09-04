@@ -4,9 +4,22 @@
 loop. It was extracted from the [Soundness](https://soundness.dev/) monorepo into its own
 project, and now depends on the published Soundness release.
 
+## Installing
+
+```sh
+curl -fsSL https://flame.propensive.dev/ | sh
+```
+
+installs the `flame` executable for your platform (macOS or Linux, x64 or arm64) into
+`~/.local/bin` (or `$FLAME_INSTALL_DIR`), verifying it against the digest published with the
+release. Each [GitHub release](https://github.com/propensive/flame/releases) also carries the
+per-platform executables (including `flame-windows-x64.exe`), the `flame` polyglot bootstrap
+script, and the library jars. The first run fetches flame's externalized dependencies; later runs
+start instantly.
+
 ## Modules
 
-`core`, `web` and `client` are published to Maven Central under `dev.soundness` (as
+`core`, `web` and `client` are released to GitHub Releases under `dev.propensive` (as
 `flame-core`, `flame-web`, `flame-client`), using the same publishing settings as Soundness.
 
 - **`core`** — the REPL engine. It drives the Scala 3 compiler to evaluate input, so it
@@ -16,26 +29,44 @@ project, and now depends on the published Soundness release.
   `flame serve <port>` runs a REPL server; bare `flame` (over a per-process UNIX socket) connects.
 - **`launcher`** — the invocation point, alone in its own module: just
   `@main def repl = externalize(runClient())`. It depends on `client`/`core`/`web` as **published
-  Maven Central coordinates**, so Burdock's `externalize` records their Central jar hashes and the
-  repackager turns them into on-demand downloads rather than inlining them (see below).
+  coordinates** (resolved from `~/.ivy2/local`), so Burdock's `externalize` records their jar
+  hashes and the repackager turns them into on-demand downloads rather than inlining them (see
+  below).
 - **`test`** — a [Probably](https://github.com/propensive/probably) test suite.
 
 ## Building
 
 ```sh
-make run                     # publish libs locally, build & start the REPL (no Central needed)
+make run                     # publish libs locally, build & start the REPL (no release needed)
 make test                    # compile and run the test suite
-make release VERSION=X.Y.Z   # publish flame-core/-web/-client to Maven Central (signed)
-make flame                   # after a release: build the tiny self-fetching launcher
+make flame                   # assemble, repackage with Burdock, emit the `flame` executable
+make install                 # copy it to ~/.local/bin
+make release VERSION=X.Y.Z   # publish a release to GitHub Releases (see below)
 ```
+
+The build compiles with the [proscala](https://github.com/propensive/proscala) fork of the Scala
+compiler (the toolchain Soundness itself is built with), downloaded on demand from its GitHub
+release and cached under `~/.cache/soundness/proscala`.
 
 ## Dependencies
 
-Flame depends on the exact set of published Soundness components it needs (e.g.
-`dev.soundness:coaxial-core`, `harlequin-core`, `ethereal-core`, …) at version `0.61.0`,
-rather than the `soundness-all` umbrella — the umbrella pulls in every module, which
-introduces top-level name clashes (e.g. a linear-algebra `Vector` shadowing `scala.Vector`)
-under flame's `import soundness.*`.
+Soundness is released as per-component jars on GitHub Releases, each embedding its own POM. Run
+`make sync-releases VERSION=0.64.0` in a Soundness checkout to install a release into
+`~/.ivy2/local`, from which the build resolves the `dev.propensive:<library>-<component>`
+coordinates named in `build.mill`. Flame's `core` module (and so the REPL session classpath) takes
+a curated set of components: everything flame's own sources use, plus the everyday Soundness
+libraries a REPL user expects to reach through `import soundness.*`.
+
+## Releasing
+
+`make release VERSION=X.Y.Z` (with `flameVersion` in `build.mill` bumped to match) publishes one
+GitHub release in two ordered steps: first the three library jars, exactly as published locally,
+so that GitHub records the digests Burdock hashed at compile time; then — once those digests are
+indexed — the launcher is assembled and repackaged against them, and the script verifies that every
+library externalized to this release's URLs before uploading one executable per platform
+(`flame-{linux,macos}-{x64,arm64}`, `flame-windows-x64.exe`), the `flame` polyglot bootstrap
+script (ziggurat's `Xeq.dispatcher`), and the generated `install.sh` that
+`https://flame.propensive.dev/` redirects to.
 
 ## Native launcher (Burdock)
 
@@ -48,11 +79,11 @@ make flame
 ```
 
 assembles the launcher and runs `soundness.repackage`, which rewrites the JAR so that every
-dependency whose exact bytes are resolvable on Maven Central (via deps.dev) — now including
-`flame-core`, `flame-web` and `flame-client` — becomes an on-demand `Burdock-Require` download,
-while unpublished ones (e.g. the forked `scala3-compiler`) are inlined from the cache. This is why
-the libraries must be **released to Central first**: burdock keys on the published jar bytes, so a
-locally-built or `publishLocal` copy would be inlined rather than externalized.
+dependency whose exact bytes are resolvable — on Maven Central (via deps.dev) for third-party
+libraries, or as a release asset of the flame, Soundness or proscala repositories — becomes an
+on-demand `Burdock-Require` download, while anything unpublished is inlined from the cache. Until
+the flame libraries are released, a local `make flame` inlines them; `make release` is what
+externalizes them.
 
 ## License
 

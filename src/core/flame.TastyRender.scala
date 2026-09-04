@@ -34,7 +34,7 @@ package flame
 
 import anticipation.*
 import escapade.*, termcapDefinitions.xtermTrueColorTermcap
-import hyperbole.*
+import hyperbole.*, hyperbole.tastyTreeTeletypeable
 import iridescence.*
 import prepositional.*
 
@@ -65,7 +65,7 @@ object TastyRender:
     def outline:        Color in Srgb = hex(0x928374)
     def accented:       Color in Srgb = hex(0xff6633)
 
-  // The tree's `Teletypeable` (from hyperbole, in `Tasty.Tree`'s implicit scope) renders the escritoire
+  // The tree's `Teletypeable` (hyperbole's top-level `tastyTreeTeletypeable` given) renders the escritoire
   // table; `render(termcap)` flattens the styled `Teletype` to truecolor ANSI text — which the CLI
   // prints verbatim through the REPL's `output` channel.
   def render(tree: Tasty.Tree): Text = tree.teletype.render(xtermTrueColorTermcap)

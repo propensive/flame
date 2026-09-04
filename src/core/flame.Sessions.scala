@@ -38,7 +38,6 @@ import java.nio.channels as jnc
 
 import scala.caps
 
-import proscenium.compat.*
 
 import ambience.*
 import anthology.*
@@ -52,6 +51,9 @@ import hieroglyph.*
 import parasite.*
 import prepositional.*
 import rudiments.*
+import denominative.*
+import symbolism.*
+import denominative.dysasymptotics.linearSize
 import stratiform.*
 import turbulence.*
 import urticose.*
@@ -84,7 +86,7 @@ object Sessions:
     val loaded: Optional[List[Text]] =
       safely(cp"/nomenclature/animals.txt".read[Text].cut(t"\n").map(_.trim).filter(_ != t""))
 
-    loaded.let { list => if list.isEmpty then Unset else list }.or(fallback)
+    loaded.let { list => if list.nil then Unset else list }.or(fallback)
 
 class Sessions[version <: Scalac.Versions]
   ( render: Repl.Rendering = Repl.Rendering.Inspect )
@@ -100,9 +102,9 @@ class Sessions[version <: Scalac.Versions]
   def awaitQuit()(using Monitor): Unit = quit.attend()
 
   // Every session's name, sorted — for the startup display and `/session` tab-completion.
-  def names: List[Text] = lock(registry.keys.to(List).sorted)
+  def names: List[Text] = lock(List.from(registry.keys.stdlib.toList.sortBy(_.s)))
 
-  def session(name: Text): Optional[Repl[version]] = lock(registry.get(name).optional)
+  def session(name: Text): Optional[Repl[version]] = lock(registry.stdlib.get(name).optional)
 
   // Registers a fresh session under a random animal name not already in use (falling back to a
   // numbered suffix in the astronomically-unlikely event every animal is taken), and returns the name.
@@ -111,13 +113,13 @@ class Sessions[version <: Scalac.Versions]
       val free: List[Text] = Sessions.animals.filter { animal => !registry.stdlib.contains(animal) }
 
       val name: Text =
-        if free.nonEmpty then Random.global.shuffle(free).head else
+        if !free.nil then Random.global.shuffle(free).stdlib.head else
           var n = 2
-          val base = Random.global.shuffle(Sessions.animals).head
+          val base = Random.global.shuffle(Sessions.animals).stdlib.head
           while registry.stdlib.contains(t"$base$n") do n += 1
           t"$base$n"
 
-      registry = registry.updated(name, Repl.make[version](Repl.Prelude.empty, render))
+      registry = registry.define(name, Repl.make[version](Repl.Prelude.empty, render))
       name
 
   // Serializes a `Reply` to BinTEL body bytes; a valid reply always type-assigns, so this is total.

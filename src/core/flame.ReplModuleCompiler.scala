@@ -109,7 +109,7 @@ object ReplModuleCompiler:
         ReplModuleCompiler().newRun.compileUnits(ModuleUnit(moduleName.s, pickled.stdlib) :: Nil)
         messages
 
-    proscenium.List.of(driver.run())
+    proscenium.List.from(driver.run())
 
 // A purpose-built compiler (modelled on `scala.quoted.staging.QuoteCompiler`)
 // that takes a closed quoted block of definitions and emits a normal, importable
