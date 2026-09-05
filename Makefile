@@ -1,8 +1,12 @@
 # Build the invocation-point `launcher` module as a plain (clean, no shell-preamble) assembly JAR.
-# NOTE: `launcher` depends on flame-client (and, through it, flame-core and flame-web) as
-# PUBLISHED coordinates, resolved from ~/.ivy2/local (a `make run`/`make flame` publishes them
-# there) and externalized against the GitHub release during `make release`.
-assembly:
+# `launcher` depends on flame-client (and, through it, flame-core and flame-web) as PUBLISHED
+# coordinates resolved from ~/.ivy2/local, so the libraries are published there FIRST — otherwise
+# the launcher silently builds against whatever was last published (a release's jars, say, whose
+# bytes then externalize to that release's download, and local changes never reach the executable).
+# `clean flame.launcher` for the same reason as in `run`: the coordinate is fixed, so Mill's cached
+# resolution would not notice the fresh publish.
+assembly: publishLocal
+	./mill clean flame.launcher
 	./mill flame.launcher.assembly
 
 # Publish flame to GitHub Releases: the three library jars first, then — once their digests are
@@ -39,16 +43,9 @@ flame: flame.jar
 install: flame
 	cp flame ${HOME}/.local/bin/
 
-# Run the REPL locally WITHOUT a release: publish the libraries to ~/.ivy2 so the launcher's
-# published-coordinate deps resolve locally, assemble the launcher, and run it directly (no burdock
-# repackage, so the local library jars are simply bundled).
-#
-# `clean flame.launcher` first: the launcher's dependency on flame-client is a fixed COORDINATE,
-# so Mill's cached resolution does not notice a fresh publishLocal under the same version, and the
-# assembly silently bundles the previous jars.
-run: publishLocal
-	./mill clean flame.launcher
-	./mill show flame.launcher.assembly
+# Run the REPL locally WITHOUT a release: publish the libraries, assemble the launcher, and run it
+# directly (no burdock repackage, so the local library jars are simply bundled).
+run: assembly
 	java -jar out/flame/launcher/assembly.dest/out.jar
 
 # Build and run the web front-end (serves the REPL on http://localhost:8080/).
