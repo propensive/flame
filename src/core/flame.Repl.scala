@@ -841,22 +841,37 @@ object Repl:
 
   // The `/`-commands the engine itself recognises, with help text. Front-ends offer these
   // as completions when a line begins with `/`; the CLI appends its own client-only
-  // commands (`/disconnect`, `/quit`) to these. Every compiler setting contributes a
-  // `/set <name>` entry so each is offered (and documented) in tab-completion.
+  // commands (`/disconnect`, `/quit`) to these. `/set` is listed ONCE, with a trailing space,
+  // so that completing it leaves the cursor ready for its subcommand — which the next Tab
+  // completes from `setCompletions` — rather than every `/set <name>` crowding out the other
+  // commands in the listing.
   val slashCommands: List[(Text, Text)] =
-    List(t"/context" -> t"show the imports currently in scope")
-    + List(t"/set async" -> t"evaluate submissions asynchronously (slow results arrive later)")
-    + settings.filter(_.kind == Kind.Set).map { setting => t"/set ${setting.name}" -> setting.description }
-    + List(t"/language" -> t"enable a Scala `language` feature (its argument is completed per session)")
-    + List
-         ( t"/tasty"    -> t"show the rendered TASTy (typed AST) of an expression",
-           t"/bytecode" -> t"show the JVM bytecode of an expression or definition",
-           t"/unimport" -> t"remove an earlier import from scope (by the tokens it was imported with)",
-           t"/classpath" -> t"show the current classpath",
-           t"/classload" -> t"add a JAR file or directory to the classpath" )
+    List
+     ( t"/context"  -> t"show the imports currently in scope",
+       t"/set "     -> t"enable or disable a compiler setting or session mode (Tab lists them)",
+       t"/language" -> t"enable a Scala `language` feature (its argument is completed per session)",
+       t"/tasty"    -> t"show the rendered TASTy (typed AST) of an expression",
+       t"/bytecode" -> t"show the JVM bytecode of an expression or definition",
+       t"/unimport" -> t"remove an earlier import from scope (by the tokens it was imported with)",
+       t"/classpath" -> t"show the current classpath",
+       t"/classload" -> t"add a JAR file or directory to the classpath" )
 
+  // The `/set` subcommands, each as a WHOLE-LINE `/set <name>` item (so a front-end inserts it as
+  // it would a command) of kind `setting` — which the CLI renders with the same command/parameter
+  // colouring as the prompt gives a typed `/set <name>`.
+  val setSubcommands: List[(Text, Text)] =
+    List(t"async" -> t"evaluate submissions asynchronously (slow results arrive later)")
+    + settings.filter(_.kind == Kind.Set).map { setting => setting.name -> setting.description }
+
+  def setCompletions(prefix: Text): List[CompletionItem] =
+    setSubcommands.map { (name, help) => (t"/set $name", help) }
+     . filter { (name, _) => name.starts(prefix) }
+     . map { (name, help) => CompletionItem(name, t"setting", help) }
+
+  // Completions for a `/`-command line: past `/set `, its subcommands; otherwise the commands.
   def slashCompletions(prefix: Text): List[CompletionItem] =
-    slashCommands.filter { (name, _) => name.starts(prefix) }.map: (name, help) =>
+    if prefix.starts(t"/set ") then setCompletions(prefix)
+    else slashCommands.filter { (name, _) => name.starts(prefix) }.map: (name, help) =>
       CompletionItem(name, t"command", help)
 
   // The leading tokens of the `/`-commands the ENGINE recognises (`/set`, `/context`, `/tasty`, …),
@@ -2365,7 +2380,9 @@ class Repl[version <: Scalac.Versions]
     else exprHead match
       case head: Text => scalaCompletions(code.skip(head.length), (offset - head.length).max(0))
       case _ =>
-        if code.trim.starts(t"/") then Repl.slashCompletions(code.trim)
+        // Up to the cursor, untrimmed: the space after `/set` is what selects its subcommands.
+        if code.starts(t"/") then Repl.slashCompletions(code.keep(offset))
+        else if code.trim.starts(t"/") then Repl.slashCompletions(code.trim)
         else scalaCompletions(code, offset)
 
   // Ordinary Scala completions at `offset` in `code`: member selection (`expr.partial`), infix

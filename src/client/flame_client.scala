@@ -1485,6 +1485,7 @@ private def completionTable(items: List[Repl.CompletionItem], width: Int): List[
     case t"package"   => (t"▦", palette.scalaType)
     case t"keyword"   => (t"▸", palette.scalaKeyword)
     case t"command"   => (t"⌘", palette.scalaKeyword)
+    case t"setting"   => (t"⌘", palette.scalaKeyword)
     case _            => (t"·", palette.foreground)
 
   // The name column is as wide as the widest name (capped so the signature keeps room); the glyph
@@ -1500,7 +1501,12 @@ private def completionTable(items: List[Repl.CompletionItem], width: Int): List[
     val sig0:   Text = item.signature
     val sig:    Text = if sig0.length > sigCol then t"${sig0.keep(sigCol - 1)}…" else sig0
 
-    e"${colour}($glyph) ${colour}($padded) ${palette.scalaComment}($sig)"
+    // A command with an argument (`/set async`) is coloured exactly as the prompt colours it when
+    // typed: the command word in the keyword colour, its argument in the parameter colour.
+    val label: Teletype =
+      if name.starts(t"/") && name.contains(t" ") then commandTeletype(padded) else e"${colour}($padded)"
+
+    e"${colour}($glyph) $label ${palette.scalaComment}($sig)"
 
 // A `/`-command line whose ARGUMENT the SERVER completes (as opposed to the client completing the
 // command name locally against `slashCommands`): `/tasty`/`/bytecode` complete their argument as
@@ -1524,17 +1530,21 @@ private def completeAt
   // commands (`/tasty`, `/bytecode`), whose argument the server completes as ordinary Scala, so they
   // fall through to the server branch below.
   if editor.value.starts(t"/") && !completesAsScala(editor.value) then
-    slashCommands.filter { (name, _) => name.starts(editor.value) } match
-      case (name, _) :: Nil =>
+    // Past `/set `, the candidates are its subcommands (whole-line `/set <name>` items, of kind
+    // `setting`); before it, the commands — of which `/set ` is one, so `/set<Tab>` inserts the
+    // space and the NEXT Tab lists the subcommands.
+    val candidates: List[Repl.CompletionItem] =
+      if editor.value.starts(t"/set ") then Repl.setCompletions(editor.value)
+      else slashCommands.filter { (name, _) => name.starts(editor.value) }.map: (entry: (Text, Text)) =>
+        Repl.CompletionItem(entry(0), t"command", entry(1))
+
+    candidates match
+      case Repl.CompletionItem(name, _, _) :: Nil =>
         val none: List[Repl.CompletionItem] = Nil
         (LineEditor(name, name.length, editor.mode), none)
 
-      case matches =>
-        val items: List[Repl.CompletionItem] =
-          matches.map: (entry: (Text, Text)) =>
-            Repl.CompletionItem(entry(0), t"command", entry(1))
-
-        val prefix = longestCommonPrefix(matches.map { (entry: (Text, Text)) => entry(0) })
+      case items =>
+        val prefix = longestCommonPrefix(items.map(_.name))
 
         val advanced =
           if prefix.length > editor.value.length then LineEditor(prefix, prefix.length, editor.mode)
@@ -1616,15 +1626,7 @@ private def colourful(tokens: List[Repl.Token]): Teletype =
   // through the Harlequin accents: the command word itself keeps the keyword colour, and its
   // parameters (everything after the first space) are shown in a fainter, more-yellow colour, to set
   // them apart from the command.
-  if text.starts(t"/") then
-    val split: Int = text.s.indexOf(' ') match
-      case -1 => text.length
-      case n  => n
-
-    val command: Teletype = e"${palette.scalaKeyword}(${text.keep(split)})"
-    val params:  Text     = text.skip(split)
-
-    if params == t"" then command else e"$command$Faint(${commandParameter}($params))"
+  if text.starts(t"/") then commandTeletype(text)
   else
     tokens.map: (token: Repl.Token) =>
       // Invoked through the typeclass instance directly: `soundness.*` now also exports delicious's
@@ -1641,6 +1643,19 @@ private def colourful(tokens: List[Repl.Token]): Teletype =
 // The fainter, more-yellow colour used for the parameters of a `/`-command (see `colourful`),
 // dimmed further by `Faint` so the command word reads as the emphasis and its arguments recede.
 private val commandParameter: Color in Srgb = hex(0xd8a657)  // a muted yellow
+
+// A `/`-command line's colouring, shared by the prompt and the completion listing: the command
+// word in the keyword colour, and its parameters (everything after the first space) fainter and
+// more yellow, to set them apart from the command.
+private def commandTeletype(text: Text): Teletype =
+  val split: Int = text.s.indexOf(' ') match
+    case -1 => text.length
+    case n  => n
+
+  val command: Teletype = e"${palette.scalaKeyword}(${text.keep(split)})"
+  val params:  Text     = text.skip(split)
+
+  if params == t"" then command else e"$command$Faint(${commandParameter}($params))"
 
 // ── Live-highlight heuristic ────────────────────────────────────────────────
 // A single-character edit and the "kind" of a character, for guessing accents

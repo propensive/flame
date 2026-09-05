@@ -511,6 +511,20 @@ object Tests extends Suite(m"Flame Tests"):
           Repl().completionsAt(code, code.length).map(_.name)
       . assert(_.has(t"/set experimental"))
 
+      test(m"/s offers /set once, not one entry per setting"):
+        supervise:
+          val code = t"/s"
+          Repl().completionsAt(code, code.length).map(_.name)
+      . assert { names => names.has(t"/set ") && !names.has(t"/set async") }
+
+      test(m"/set followed by a space offers its subcommands as settings"):
+        supervise:
+          val code = t"/set "
+          Repl().completionsAt(code, code.length)
+      . assert: items =>
+          items.map(_.name).has(t"/set async") && items.map(_.name).has(t"/set experimental")
+          && items.all(_.kind == t"setting")
+
       test(m"a new definition invalidates the cached member completions"):
         supervise:
           val repl = Repl()
