@@ -185,6 +185,15 @@ object Tests extends Suite(m"Flame Tests"):
           diagnostics(repl.react(1, t"val b: ListBuffer[Int] = \"no\""))
       . assert { diag => diag.contains(t"ListBuffer[Int]") && !diag.contains(t"mutable.ListBuffer") }
 
+      // `soundness.Json` is `export jacinta.Json`, so the compiler names the type `jacinta.Json`; the
+      // reifier resolves the prelude's exports so it abbreviates as the user wrote it.
+      test(m"a type reached through a prelude's export abbreviates to its leaf name"):
+        supervise:
+          val repl = Repl()
+          repl.react(0, t"import soundness.*")
+          diagnostics(repl.react(1, t"val j: Json = 1"))
+      . assert { diag => diag.contains(t"Json") && !diag.contains(t"jacinta.Json") }
+
       // Soundness's missing-given advice (frontier's `explainMissingContext`, reached through
       // `import soundness.*`) replaces the compiler's own "no given instance" message only when
       // the line is compiled with the fork's `-Zdiagnostic-givens`, and only when frontier is on
