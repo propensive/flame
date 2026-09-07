@@ -187,7 +187,9 @@ object settings:
     "jacinta-core")
   . map(component)
 
-  val testDeps = Seq("probably-cli", "fulminate-core").map(component)
+  // probably-events carries `probably.Streamer`, the BinTEL event stream fume drives a suite
+  // through; without it fume falls back to a legacy run that no longer exists in 0.65.0.
+  val testDeps = Seq("probably-cli", "probably-events", "fulminate-core").map(component)
 
 // Exposes the fork compiler's `release/lib` jars (from a local build via `settings.scalaHome`, or
 // downloaded from the `settings.scalaRelease` GitHub release) as a Maven-layout repository,
@@ -444,6 +446,11 @@ object flame extends Project:
     // assembled JAR.
     def prependShellScript = ""
 
+  // The beneficence plugin runs on this module so that its `Suite` lands in the assembly's
+  // `META-INF/services/probably.Suite` index, which is how `fume run` (configured by
+  // .fume/config.tel) discovers it. `flame.runTests` is the plain-`java` fallback the shared CI
+  // workflow uses, driving `Tests.invoke` in-process.
   object test extends Component(core):
     def mvnDeps = settings.testDeps
+    def scalacPluginMvnDeps = Seq(mvn"dev.propensive:beneficence-plugin:${settings.soundnessVersion}")
     def finalMainClass = "flame.runTests"

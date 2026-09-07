@@ -53,15 +53,20 @@ web:
 	./mill flame.web.assembly
 	java -jar out/flame/web/assembly.dest/out.jar
 
-# Compile and run the test suite. Since Soundness 0.65.0 a probably `Suite` has no `main` (a host
-# drives it through `invoke`), so `flame.runTests` (src/test/flame_test_main.scala) is the plain-`java`
-# entry point, printing one line per test; `fume run -c <jar>` over the same assembly is the full
-# experience.
+# Compile and run the test suite with fume, which discovers the suite from the assembly named in
+# .fume/config.tel (relative to this directory). Extra selection terms go in TESTS, e.g.
+# `make test TESTS='tag:repl'`. `make test-plain` is the fume-less fallback the shared CI workflow
+# uses: `flame.runTests` (src/test/flame_test_main.scala) drives `Tests.invoke` in-process, since
+# a probably `Suite` has had no `main` of its own since Soundness 0.65.0.
 test:
+	./mill flame.test.assembly
+	fume run $(TESTS)
+
+test-plain:
 	./mill flame.test.assembly
 	java -cp out/flame/test/assembly.dest/out.jar flame.runTests
 
 dev:
 	./mill -w flame.client.compile
 
-.PHONY: assembly release publishLocal run web test dev install
+.PHONY: assembly release publishLocal run web test test-plain dev install
