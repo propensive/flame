@@ -1224,12 +1224,22 @@ class Repl[version <: Scalac.Versions]
   private var completionCache: Map[Text, List[Repl.CompletionItem]] = Map()
 
   // Semantic diagnostics (`-Zsemantic-diagnostics`): a shared `delicious.Reifier` unpickles the TASTy
-  // embedded in error messages so their types re-render through stenography. It embeds a compiler, so
-  // it is EXPENSIVE — built lazily, only when a diagnostic actually carries semantic markup, and
+  // embedded in error messages so their types re-render through stenography, and resolves the exports
+  // of the session's wildcard imports (`semanticImports`). It embeds a compiler, so it is EXPENSIVE —
+  // built lazily, the first time a type is rendered or a diagnostic carries semantic markup, and
   // dropped when `/classload` changes the classpath (so a newly-loaded library's types reify too).
   @volatile
   @scala.caps.unsafe.untrackedCaptures
   private var reifierCache: Optional[delicious.Reifier] = Unset
+
+  // The session's `stenography.Imports` (`semanticImports`), memoised against everything its
+  // textual build reads — the prelude's and the user's imports, and the wrapper objects — because
+  // resolving the exports of each wildcard scope through the reifier completes every declaration
+  // of that scope (several hundred `$package` classes for `soundness`) the first time. Dropped with
+  // `reifierCache` on `/classload`, since the exports resolve against the classpath.
+  @volatile
+  @scala.caps.unsafe.untrackedCaptures
+  private var importsCache: Optional[(List[Text], stenography.Imports)] = Unset
 
   @scala.caps.unsafe.untrackedCaptures
   private var index:   Int        = 0
@@ -1391,7 +1401,24 @@ class Repl[version <: Scalac.Versions]
   // `java.lang`, `scala.Predef`, `scala.collection.immutable`) and the REPL's own wrapper objects (so a
   // user-defined type shows unqualified) are seeded too. Every user-facing rendering of a type goes
   // through these: the result line, a `def`'s signature, completion signatures and diagnostics.
-  private def semanticImports: stenography.Imports =
+  //
+  // The import statements alone cannot say what a wildcard-imported scope EXPORTS, and Soundness's
+  // preludes are made of exports: `soundness.Json` is `export jacinta.Json`, so the type the compiler
+  // names is `jacinta.Json`, which no `soundness` prefix shortens. The reifier resolves the exports of
+  // every wildcard scope against the session classpath (`Reifier#imports`, Soundness #1959), adding
+  // each export's target to `direct`, so `Json` reads as `Json` under `import soundness.*` too.
+  private def semanticImports(using System): stenography.Imports =
+    val key: List[Text] = (prelude.imports.map(_.tt) + imports) + history :+ layout.objectName(index)
+
+    def rebuild: stenography.Imports =
+      val built = buildSemanticImports
+      importsCache = (key, built)
+      built
+
+    importsCache.lay(rebuild): (cachedKey, cached) =>
+      if cachedKey == key then cached else rebuild
+
+  private def buildSemanticImports(using System): stenography.Imports =
     import stenography.Designator
     // `stenography.Imports` holds stdlib sets, so these are `sci.Set`, not the prelude's opaque
     // `Set` — the seam is explicit since `scala` left `-Yimports`.
@@ -1472,18 +1499,18 @@ class Repl[version <: Scalac.Versions]
             if name != t"" then directType(t"$prefix.$name")
       else directType(body)
 
-    stenography.Imports(designators, direct)
+    semanticReifier.imports(designators, direct)
 
   // Renders a resolved type for DISPLAY (a result line's `: type`, a `def`'s return type), abbreviated
   // against the session's imports so it reads as the user wrote it — the same abbreviation the
   // diagnostics use, rather than the fully-qualified `Syntax.qualified`.
-  private def renderType(syntax: Syntax): Text = syntax.text(using semanticImports)
+  private def renderType(syntax: Syntax)(using System): Text = syntax.text(using semanticImports)
 
   // A probed result type, rendered for display. A SINGLETON type carries the type it widens to as
   // well: the two differ exactly when the precise type is narrower than its base — `42` against
   // `Int` — which is the case worth annotating, and equality of the two `Syntax` trees is what says
   // so. Everything else (`List[Int]`, a refined `String { … }`) widens to itself and is shown alone.
-  private def typeText(result: Repl.ResultType): Repl.TypeText =
+  private def typeText(result: Repl.ResultType)(using System): Repl.TypeText =
     Repl.TypeText
      ( renderType(result.precise),
        if result.widened == result.precise then Unset else renderType(result.widened) )
@@ -2296,6 +2323,7 @@ class Repl[version <: Scalac.Versions]
             replLoader.append(entry.javaUrl)  // make it visible to already-running code too
             completionCache = Map()           // the set of resolvable names has changed
             reifierCache = Unset              // rebuild the diagnostics reifier with the new classpath
+            importsCache = Unset              // its exports resolve against the classpath too
             Outcome.Ran(Nil, Unset, t"Added to the classpath: ${path.encode}\n")
 
   // `/context` lists every import currently in scope — the prelude's baseline imports plus the
