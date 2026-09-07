@@ -79,8 +79,8 @@ import serpentine.*
 import stratiform.*
 import vacuous.*
 
-import filesystemBackends.virtualMachineFilesystem
-import interfaces.paths.pathOnLinux
+import filesystemBackends.javaBaseFilesystem
+import pathInterfaces.pathOnLinux
 import stenography.Syntax
 
 object Repl:
@@ -1493,14 +1493,20 @@ class Repl[version <: Scalac.Versions]
   // otherwise the plain messages. Types are abbreviated against the session's imports (`semanticImports`)
   // so they read as the user wrote them. The output targets THIS session's front-end (`render`):
   // coloured ANSI for `Inspect` (the CLI), HTML for `Html` (the web). The (expensive) reifier is built
-  // only when some notice actually carries markup.
+  // only when some notice actually carries markup — and when it is, the imports are resolved through
+  // it (`Reifier#imports`, Soundness #1959), which extends the direct imports with the targets of the
+  // `export` aliases in every wildcard-imported scope, so a type reached through a prelude's export
+  // (`jacinta.Json` under `import soundness.*`) renders by its leaf name, as the user would write it.
   private def renderDiagnostics(notices: List[Notice])(using System): Text =
     if notices.nil then t"" else
-      given stenography.Imports = semanticImports
-
       val reifier: Optional[delicious.Reifier] =
         if notices.exists { (notice: Notice) => notice.markup.present } then semanticReifier
         else Unset
+
+      val imports: stenography.Imports = semanticImports
+
+      given stenography.Imports =
+        reifier.lay(imports) { (reifier: delicious.Reifier) => reifier.imports(imports.designators, imports.direct) }
 
       SemanticRender.render(notices, reifier, render == Repl.Rendering.Html)
 

@@ -40,7 +40,7 @@ import soundness.*
 import perihelion.*
 import perihelion.given
 
-import doms.html.whatwg.*
+import htmlDoms.whatwg.*
 import Control.*
 
 import charEncoders.utf8Encoder
@@ -49,7 +49,7 @@ import formatting.compactJsonFormatting
 import logging.silentLogging
 import probates.awaitProbate
 import strategies.throwUnsafely
-import systems.javaSystem
+import systems.javaBaseSystem
 import temporaryDirectories.systemTemporaryDirectory
 import threading.virtualThreading
 import webserverErrorPages.minimalErrorPage

@@ -59,24 +59,24 @@ import profanity.Interrupt
 
 import backstops.silentBackstop
 import classloaders.threadContextClassloader
-import executives.completions
-import filesystemBackends.virtualMachineFilesystem
-import filesystemOptions.createNonexistentParents.enabled
-import filesystemOptions.deleteRecursively.disabled
-import filesystemOptions.overwritePreexisting.disabled
+import executives.completionsExecutive
+import filesystemBackends.javaBaseFilesystem
+import filesystemOptions.createNonexistentParents
+import filesystemOptions.deleteOnlyEmpty
+import filesystemOptions.failOnPreexisting
 import harlequin.Accent
 // `border` is the one ultimatum layout combinator the `soundness` umbrella does not re-export —
 // `panel`, `stack`, `strip`, `layout` and `paint` all are — so it is named directly from its own
 // package rather than reached through the umbrella.
 import ultimatum.border
-import interfaces.paths.pathOnLinux
+import pathInterfaces.pathOnLinux
 import internetAccess.online
 import interpreters.posixInterpreter
 import logging.silentLogging
 import probates.cancelProbate
-import socketBackends.virtualMachineSockets
+import socketBackends.javaBaseSockets
 import supervisors.globalSupervisor
-import systems.javaSystem
+import systems.javaBaseSystem
 import temporaryDirectories.systemTemporaryDirectory
 import threading.platformThreading
 
@@ -357,7 +357,7 @@ private def installCompletions()(using stdio: Stdio, service: DaemonService[?])(
 :   Exit =
 
   import errorDiagnostics.stackTracesDiagnostics
-  import workingDirectories.javaWorkingDirectory
+  import workingDirectories.javaBaseWorkingDirectory
 
   // The `DaemonService` (which extends `Entrypoint`) carries the daemon's tracked capabilities; seal
   // it to the pure `Entrypoint` the completions installer wants — it outlives this one call.
@@ -892,7 +892,7 @@ private def runRepl
   // so the box stays put rather than jumping — no reserved-height workaround needed. Early in a
   // session the block sits mid-screen (wherever the cursor is); once output fills the screen it
   // naturally rides the bottom, scrolling like any REPL. It also governs the static replay boxes.
-  given InlineAnchoring = InlineAnchoring.Inline
+  given InlineAnchoring = InlineAnchoring.Flow
 
   // Resize hysteresis: each `WindowSize` bumps this generation and schedules a settle check;
   // only the latest generation, once no newer resize has arrived, redraws — so a drag that

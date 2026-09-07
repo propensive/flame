@@ -53,10 +53,13 @@ web:
 	./mill flame.web.assembly
 	java -jar out/flame/web/assembly.dest/out.jar
 
-# Compile and run the test suite.
+# Compile and run the test suite. Since Soundness 0.65.0 a probably `Suite` has no `main` (a host
+# drives it through `invoke`), so `flame.runTests` (src/test/flame_test_main.scala) is the plain-`java`
+# entry point, printing one line per test; `fume run -c <jar>` over the same assembly is the full
+# experience.
 test:
 	./mill flame.test.assembly
-	java -cp out/flame/test/assembly.dest/out.jar flame.Tests
+	java -cp out/flame/test/assembly.dest/out.jar flame.runTests
 
 dev:
 	./mill -w flame.client.compile

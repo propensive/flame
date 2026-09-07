@@ -31,7 +31,7 @@ object settings:
   // to use its `release/lib` jars directly (fork-developer mode).
   val scalaHome = sys.env.getOrElse("SOUNDNESS_SCALA_HOME", "")
 
-  val soundnessVersion = "0.64.0"
+  val soundnessVersion = "0.65.0"
 
   // The version flame's OWN library modules (`flame-core`, `flame-web`, `flame-client`) are
   // released under, AND the version the `launcher` module resolves them at. Kept as a single value
@@ -39,7 +39,7 @@ object settings:
   // burdock externalizes a module only when the exact released jar bytes are on the launcher's
   // classpath, so a mismatch would silently fall back to inlining. Bump (and commit) per release;
   // etc/ci/release.sh refuses to release when this pin disagrees with its VERSION argument.
-  val flameVersion = sys.env.getOrElse("FLAME_VERSION", "0.1.1")
+  val flameVersion = sys.env.getOrElse("FLAME_VERSION", "0.1.2")
 
   val scalaOptions = Seq(
     // The fork's opt-in behaviours, enabled by name, exactly as the Soundness build enables
@@ -402,9 +402,11 @@ object flame extends Project:
 
     // frontier — `soundness.explainMissingContext`, the `@internal.diagnostic` catch-all given
     // that renders Soundness's missing-given advice — is a RUNTIME dependency only: it must be on
-    // the REPL session classpath (which is this module's runtime classpath), but it must NOT be on
-    // flame's own compile classpath, where the catch-all satisfies tentative implicit searches
-    // (`join`'s element type, `flatMap`'s reshaping) with `Any` and breaks ordinary code.
+    // the REPL session classpath (which is this module's runtime classpath), but flame's own
+    // sources have no use for it at compile time. (Before Soundness 0.65.0 it also had to be kept
+    // OFF the compile classpath, where the catch-all satisfied tentative implicit searches —
+    // `join`'s element type, `flatMap`'s reshaping — with `Any`; Soundness #1944 made the candidate
+    // always fail, so that hazard is gone, but there is still no reason to compile against it.)
     def runMvnDeps = Seq(settings.component("frontier-core"))
 
   // The interactive client library (`flame.runClient` and its helpers). NO LONGER an assembled app:
@@ -444,4 +446,4 @@ object flame extends Project:
 
   object test extends Component(core):
     def mvnDeps = settings.testDeps
-    def finalMainClass = "flame.Tests"
+    def finalMainClass = "flame.runTests"
