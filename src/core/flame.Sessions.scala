@@ -122,6 +122,15 @@ class Sessions[version <: Scalac.Versions]
       registry = registry.define(name, Repl.make[version](Repl.Prelude.empty, render))
       name
 
+  // Registers a fresh session under the given `name` — the one a client asked for with `--session`
+  // or `/session` — unless one of that name already exists. `true` when it was created.
+  def open(name: Text): Boolean =
+    lock:
+      if registry.stdlib.contains(name) then false
+      else
+        registry = registry.define(name, Repl.make[version](Repl.Prelude.empty, render))
+        true
+
   // Serializes a `Reply` to BinTEL body bytes; a valid reply always type-assigns, so this is total.
   private def encode(reply: Repl.Reply): Data = unsafely(reply.bintel)
 
@@ -269,10 +278,16 @@ class Sessions[version <: Scalac.Versions]
             encode(Repl.Reply.Completed(id, repl.completionsAt(code, offset)))
 
         case Repl.Request.Session(id, name) =>
-          // Empty name only reports; a known name switches. Always reply `Session` with the (possibly
-          // unchanged) current session — the client detects a failed switch by the name not matching.
-          if name != t"" && session(name).present then current = name
-          encode(Repl.Reply.Session(id, currentName, names))
+          // Empty name only reports; a known name switches; an unknown one is STARTED under that
+          // name and switched to, so `flame --session work` opens `work` if nobody has yet. The
+          // reply says which happened, and carries the (possibly unchanged) current session.
+          val created: Boolean = name != t"" && open(name)
+          if name != t"" then current = name
+          encode(Repl.Reply.Session(id, currentName, names, created))
+
+        case Repl.Request.SessionList(id) =>
+          // Report only — no `currentName`, so a bare probe (a tab-completion) creates nothing.
+          encode(Repl.Reply.SessionList(id, names))
 
         case Repl.Request.Quit(_) =>
           quit.offer(()) yet Unset

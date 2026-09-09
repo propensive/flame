@@ -1091,8 +1091,57 @@ object Tests extends Suite(m"Flame Tests"):
             channel.close()
             service.stop()
       . assert:
-          case Repl.Reply.Session(_, name, names) => name != t"" && names.has(name)
-          case _                                  => false
+          case Repl.Reply.Session(_, name, names, false) => name != t"" && names.has(name)
+          case _                                         => false
+
+      // Naming a session that does not exist STARTS it under that name (`flame --session work`),
+      // reported as `created`; naming it again merely switches.
+      test(m"a Session request naming an unknown session starts it under that name"):
+        supervise:
+          val tcpPort = Port[Tcp]()
+          val service = Sessions().serve(tcpPort)
+          val socket  = jn.Socket("localhost", tcpPort.number)
+
+          try
+            val first  = exchange(socket, Repl.Request.Session(1, t"work"))
+            val second = exchange(socket, Repl.Request.Session(2, t"work"))
+            (first, second)
+          finally
+            socket.close()
+            service.stop()
+      . assert:
+          case (Repl.Reply.Session(1, t"work", names, true), Repl.Reply.Session(2, t"work", _, false)) =>
+            names.has(t"work")
+
+          case _ =>
+            false
+
+      // A `SessionList` request only reports; it must not create a session (as an empty `Session`
+      // request would through the connection's lazy current session), so a `--session` completion
+      // can enumerate the joinable sessions without leaving throwaways behind.
+      test(m"a SessionList request lists sessions without creating one"):
+        supervise:
+          val tcpPort = Port[Tcp]()
+          val service = Sessions().serve(tcpPort)
+          val socket  = jn.Socket("localhost", tcpPort.number)
+
+          try
+            val before = exchange(socket, Repl.Request.SessionList(1))
+            val second = exchange(socket, Repl.Request.SessionList(2))
+            exchange(socket, Repl.Request.Session(3, t"work"))
+            val after  = exchange(socket, Repl.Request.SessionList(4))
+            (before, second, after)
+          finally
+            socket.close()
+            service.stop()
+      . assert:
+          case ( Repl.Reply.SessionList(1, Nil),
+                 Repl.Reply.SessionList(2, Nil),
+                 Repl.Reply.SessionList(4, names) ) =>
+            names == List(t"work")
+
+          case _ =>
+            false
 
       test(m"a completion request returns matching completions"):
         supervise:

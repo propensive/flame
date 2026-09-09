@@ -35,6 +35,7 @@ package flame
 import java.io as ji
 import java.lang as jl
 import java.net as jn
+import java.nio.channels as jnc
 import java.util.concurrent as juc
 
 import scala.caps
@@ -131,16 +132,59 @@ private inline def command
 private def flaggedSettings(using Cli, Interpreter): List[Repl.Setting] =
   settingFlags.filter { (_, flag) => flag().present }.map { (setting, _) => setting }
 
-// The `/set`/`/language` commands to run on startup, one per setting flag given. Compiler settings
-// are applied FIRST, so `--experimental` unlocks the experimental `--language` features named
-// alongside it — `/language captureChecking` is rejected until `/set experimental` has run.
-private def initialSettings(using Cli, Interpreter): List[Text] =
-  val flagged: List[Repl.Setting] = flaggedSettings
-
+// The commands to run on startup: the `/set`/`/language` settings named by flags and by the
+// workspace's `config.tel` (see `Workspace`), then a `/classload` per configured classpath entry.
+// Compiler settings are applied FIRST, so `--experimental` unlocks the experimental `--language`
+// features named alongside it — `/language captureChecking` is rejected until `/set experimental`
+// has run — and the classpath last, once the compiler is configured. A setting named by both a flag
+// and the file is applied once.
+private def startupCommands(flagged: List[Repl.Setting], workspace: Workspace.Config): List[Text] =
   def named(kind: Repl.Kind): List[Text] = flagged.filter(_.kind == kind).map(_.name)
+  def distinct(names: List[Text]): List[Text] = List.from(names.stdlib.distinct)
 
-  named(Repl.Kind.Set).map { (name: Text) => t"/set $name" }
-  + named(Repl.Kind.Language).map { (name: Text) => t"/language $name" }
+  distinct(named(Repl.Kind.Set) + workspace.sets).map { (name: Text) => t"/set $name" }
+  + distinct(named(Repl.Kind.Language) + workspace.languages).map { (name: Text) => t"/language $name" }
+  + workspace.classpath.map { (entry: Text) => t"/classload $entry" }
+
+// Reads `-s`/`--session`, its operand completing to the names of the sessions on the live local
+// servers — so `flame --session <TAB>` (or `--session=<TAB>`) offers the sessions that can be
+// joined. The suggestions are gathered LAZILY, only when a completion actually lands on the
+// operand: the `Discoverable` closes over nothing tracked and probes the sockets itself.
+private def sessionFlag()(using Cli, Interpreter): Optional[Text] =
+  given discoverable: (Text is Discoverable) = (_, _) => liveSessionNames().map(Suggestion(_))
+  Session().value
+
+// The names of every session on every live local REPL server: each per-process socket in the
+// socket directory is asked (with an empty `Session` request, which reports without switching —
+// and, since a connection's own session is created lazily, leaves no throwaway session behind) and
+// a socket that refuses is skipped. A short timeout keeps a wedged server from stalling the shell.
+private def liveSessionNames(): List[Text] =
+  def ask(path: Text): List[Text] =
+    var channel: jnc.SocketChannel | Null = null
+
+    try
+      channel = jnc.SocketChannel.open(jn.UnixDomainSocketAddress.of(path.s).nn).nn
+
+      val out = ji.DataOutputStream(jnc.Channels.newOutputStream(channel).nn)
+      val body = encode(Repl.Request.SessionList(0))
+      out.writeInt(body.length)
+      out.write(body.mutable(using Unsafe))
+      out.flush()
+
+      val in     = ji.DataInputStream(jnc.Channels.newInputStream(channel).nn)
+      val length = in.readInt()
+      val bytes  = new scala.Array[Byte](length)
+      in.readFully(bytes)
+
+      safely(Bintel.read[Repl.Reply](bytes.immutable(using Unsafe))).lay(Nil):
+        case Repl.Reply.SessionList(_, names) => names
+        case _                                => Nil
+
+    catch case _: Exception => Nil
+    finally if channel != null then channel.close()
+
+  val names: List[Text] = socketPaths(socketDirectory).bind[List[Text], Text, List[Text]](ask)
+  List.from(names.stdlib.distinct)
 
 // The default TCP port for `flame listen` (a remote-reachable REPL server) and for `flame --host`
 // when no `--port` is given. Arbitrary, but stable so the two ends agree without configuration.
@@ -152,6 +196,11 @@ val defaultPort: Int = 4319
 // and the repackager turns them into on-demand `Burdock-Require` downloads instead of inlining them.
 def runClient(): Unit =
   cli:
+    // The project's `.pyrocosm/flame/config.tel`, resolved from the INVOCATION's working directory
+    // (each daemon client has its own), never the daemon process's. Its startup settings, classpath
+    // and connection defaults are folded into every launch below.
+    val workspace: Workspace.Config = Workspace.config(summon[Cli].workingDirectory.directory())
+
     arguments match
       // `flame -<flag>…` — the terminal REPL with options: `-s NAME` joins a session, `--host HOST`
       // (with optional `--port`) connects to a remote server (`flame listen`), and the settings flags
@@ -169,11 +218,11 @@ def runClient(): Unit =
         // so that all of them register and are offered together for `flame --<TAB>`. Reading them
         // lazily — at the point each is needed — would register only those on the branch actually
         // taken, and reading them inside `command` would register none of them at all.
-        val settings: List[Text]     = initialSettings
+        val settings: List[Text]     = startupCommands(flaggedSettings, workspace)
         val basic:    Boolean        = Basic().present
-        val host:     Optional[Text] = Host().value
-        val port:     Int            = Port().value.or(defaultPort)
-        val session:  Optional[Text] = Session().value
+        val host:     Optional[Text] = Host().value.or(workspace.host)
+        val port:     Int            = Port().value.or(workspace.port).or(defaultPort)
+        val session:  Optional[Text] = sessionFlag().or(workspace.session)
 
         // `flame --basic` — a minimal, self-contained, in-process synchronous REPL (no socket
         // server, no TUI). Checked before `--host`, so it never falls through to a remote/socket
@@ -190,7 +239,7 @@ def runClient(): Unit =
       // The read is OUTSIDE `command`: in completion mode `execute` returns without running its
       // block at all, so a flag read within it would never register and never be suggested.
       case Serve() :: _ =>
-        val port: Int = Port().value.or(8080)
+        val port: Int = Port().value.or(workspace.port).or(8080)
         command(httpServe(port))
 
       // `flame install` — install this command's tab-completions into the user's shell.
@@ -201,7 +250,7 @@ def runClient(): Unit =
       // socket), so a `flame --host` client on another machine can reach its sessions. Defaults to
       // `defaultPort`; a non-numeric `--port` also falls back to it.
       case Listen() :: _ =>
-        val port: Int = Port().value.or(defaultPort)
+        val port: Int = Port().value.or(workspace.port).or(defaultPort)
         command(serve(port))
 
       // Internal: the per-process UNIX-socket REPL server that `connectSocket`/`launchServer`
@@ -211,9 +260,9 @@ def runClient(): Unit =
         command(serveSocket())
 
       // `flame` — the terminal REPL (connects to, or starts, a background socket server). Bare `flame`
-      // starts a new session.
+      // starts a new session, with whatever the workspace's `config.tel` asks for.
       case Nil =>
-        command(connectSocket(Session(), Nil))
+        command(connectSocket(sessionFlag().or(workspace.session), startupCommands(Nil, workspace)))
 
 
       case _ =>
@@ -868,15 +917,14 @@ private def runRepl
           case reply =>
             submits.put(reply)
 
-  // Start this connection's session: join the one named by `-s`/`--session` if it exists, otherwise
-  // let the server assign a fresh animal name. Show the resulting session, noting when a requested
-  // name was not found (the server then started a new one instead).
+  // Start this connection's session: join the one named by `-s`/`--session` — which the server
+  // STARTS under that name if it does not exist yet — or, with no name, let the server assign a
+  // fresh animal name. Show the resulting session, noting when it was newly started by name.
   val joinName: Text = join.or(t"")
   duplex.send(zephyrine.Stream(framed(encode(Repl.Request.Session(nextId.getAndIncrement, joinName)))))
 
   safely(sessionReplies.take().nn).let: reply =>
-    if joinName != t"" && reply.name != joinName
-    then Out.println(Repl.messages.joinFailed(joinName, reply.name))
+    if reply.created then Out.println(Repl.messages.started(reply.name))
     else Out.println(Repl.messages.session(reply.name))
 
   // Apply the startup settings from `--set`/`--language` by submitting each as a command to the
@@ -1267,12 +1315,14 @@ private def runRepl
           Out.print(t"\e[2J\e[3J\e[H")
           t""
         else if line == t"/session" || line.starts(t"/session ") then
-          // Switch this connection to another session (server-side, per connection) — or, with no
-          // argument, report the current session and the ones available.
+          // Switch this connection to another session (server-side, per connection), starting it
+          // under that name if it does not exist — or, with no argument, report the current session
+          // and the ones available.
           val name = line.skip(t"/session".length).trim
           duplex.send(zephyrine.Stream(framed(encode(Repl.Request.Session(nextId.getAndIncrement, name)))))
           safely(sessionReplies.take().nn).lay(t"No response from the server\n"): reply =>
             if name == t"" then t"${Repl.messages.sessionList(reply.name, reply.names)}\n"
+            else if reply.created then t"${Repl.messages.started(reply.name)}\n"
             else if reply.name == name then t"${Repl.messages.switched(reply.name)}\n"
             else t"${Repl.messages.noSession(name)}\n"
         else if line.starts(t"/") && !Repl.isCommand(line) then
@@ -1476,7 +1526,8 @@ private def replyText(reply: Repl.Reply): Text = reply match
   case Repl.Reply.Failed(_, message)               => t"$message\n"
   case Repl.Reply.Tokenized(_, _, _, _, _)         => t""
   case Repl.Reply.Completed(_, _)                  => t""
-  case Repl.Reply.Session(_, _, _)                 => t""
+  case Repl.Reply.Session(_, _, _, _)              => t""
+  case Repl.Reply.SessionList(_, _)                => t""
   case Repl.Reply.Pending(_)                       => t""
   case Repl.Reply.Output(_, _)                     => t""
 
@@ -1490,7 +1541,8 @@ private def replyId(reply: Repl.Reply): Int = reply match
   case Repl.Reply.Threw(id, _, _, _)          => id
   case Repl.Reply.Crashed(id, _, _)           => id
   case Repl.Reply.Failed(id, _)               => id
-  case Repl.Reply.Session(id, _, _)           => id
+  case Repl.Reply.Session(id, _, _, _)        => id
+  case Repl.Reply.SessionList(id, _)          => id
   case Repl.Reply.Pending(id)                 => id
   case Repl.Reply.Output(id, _)               => id
 

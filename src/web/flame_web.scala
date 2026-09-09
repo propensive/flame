@@ -983,10 +983,13 @@ def serveHttp(port: Int, quit: Promise[Unit])(using Monitor, System, Probate, Cl
             val name = code.skip(t"/session".length).trim
             val message: Text =
               if name == t"" then Repl.messages.sessionList(current.get.nn, sessions.names)
-              else if sessions.session(name).present then
+              else if sessions.open(name) then
+                // Unknown, so started under that name (as the CLI's `--session`/`/session` do).
+                current.set(name)
+                Repl.messages.started(name)
+              else
                 current.set(name)
                 Repl.messages.switched(name)
-              else Repl.messages.noSession(name)
 
             WebReply(t"result", request.seq, t"", t"", message, t"", Nil).in[Json].show
 

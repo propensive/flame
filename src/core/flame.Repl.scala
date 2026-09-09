@@ -208,9 +208,13 @@ object Repl:
     case Tokenize(id: Int, code: Text)
     case Complete(id: Int, code: Text, offset: Int)
     case Quit(id: Int)
-    // Switch this connection to the session named `name`, or — when `name` is empty — just report the
-    // current session and the list of all sessions (used on connect and to refresh tab-completion).
+    // Switch this connection to the session named `name`, starting it under that name if it does not
+    // exist; when `name` is empty, start (or keep) this connection's own session and report it.
     case Session(id: Int, name: Text)
+    // List every session's name WITHOUT touching this connection's current session — so a
+    // `--session` tab-completion can enumerate the joinable sessions without leaving a throwaway
+    // one behind (which a `Session` request's lazy current-session creation would).
+    case SessionList(id: Int)
 
   // A reply to a connected client, echoing the request's `id`. `highlight` is the
   // Harlequin tokenization of the submitted line. Serialized as JSON with a `kind`
@@ -240,8 +244,11 @@ object Repl:
     // front-end shows output as it appears rather than only in the final reply. Carries the same `id`.
     case Output(id: Int, chunk: Text)
     // The connection's current session `name`, plus `names` — every session on the server (for the
-    // startup display and `/session` tab-completion).
-    case Session(id: Int, name: Text, names: List[Text])
+    // startup display and `/session` tab-completion) — and whether the request just `created` the
+    // session it named (rather than switching to an existing one).
+    case Session(id: Int, name: Text, names: List[Text], created: Boolean)
+    // Every session's name, in answer to a `SessionList` request; touches no current session.
+    case SessionList(id: Int, names: List[Text])
 
   // Pure anchors for the top-level wire enums, on the same footing as the leaf codecs above, so
   // `Bintel.read[Request]`/`[Reply]` (whose context bound requires a pure instance) resolves.
@@ -962,10 +969,8 @@ object Repl:
       t"Session $name — available: ${names.join(t", ")}"
 
     def switched(name: Text): Text = t"Switched to session $name"
+    def started(name: Text): Text = t"Started session $name"
     def noSession(name: Text): Text = t"No session named '$name'"
-
-    def joinFailed(requested: Text, started: Text): Text =
-      t"No session named '$requested' — started session $started"
 
     def unknownCommand(line: Text): Text = t"Unknown command: $line"
 
@@ -2049,8 +2054,8 @@ class Repl[version <: Scalac.Versions]
   // `Stdio` provider (see `ReplStdio`), so `Out.println` prints as `println` does. Only in an
   // EXPERIMENTAL compile: flame (like every Soundness library) is built with experimental language
   // features, which mark its definitions `@experimental`, so a line compiled without the flag may
-  // not so much as import the provider — and could not name `Stdio` or `Out` either, so it loses
-  // nothing by going without.
+  // not so much as import the provider — and could not name `Stdio` or `Out` either (the trait
+  // `Stdio` itself is marked), so it loses nothing by going without.
   private def ambientImports: List[Text] =
     if experimentalCompile then List(t"import flame.ReplStdio.provider") else Nil
 
