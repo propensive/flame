@@ -86,7 +86,8 @@ val Install = Subcommand("install", "install tab-completions into the shell")
 val Listen = Subcommand("listen", "serve the terminal REPL over TCP, for remote clients")
 val Port = Flag[Int]("port", false, List('p'), "a TCP port — the web front-end, or a remote REPL server")
 val Host = Flag[Text]("host", false, List('H'), "connect to a flame REPL server running on this host")
-val Session = Flag[Text]("session", false, List('s'), "join an existing REPL session by name")
+val Join = Flag[Text]("join", false, List('j'), "join an existing REPL session by name")
+val Create = Flag[Text]("create", false, List('c'), "create a new REPL session with the given name")
 val Basic = Flag[Unit]("basic", false, Nil, "run a minimal, in-process, synchronous line-based REPL")
 
 // One flag per `/set`/`/language` setting, so every setting is enabled by name —
@@ -146,13 +147,67 @@ private def startupCommands(flagged: List[Repl.Setting], workspace: Workspace.Co
   + distinct(named(Repl.Kind.Language) + workspace.languages).map { (name: Text) => t"/language $name" }
   + workspace.classpath.map { (entry: Text) => t"/classload $entry" }
 
-// Reads `-s`/`--session`, its operand completing to the names of the sessions on the live local
-// servers — so `flame --session <TAB>` (or `--session=<TAB>`) offers the sessions that can be
-// joined. The suggestions are gathered LAZILY, only when a completion actually lands on the
-// operand: the `Discoverable` closes over nothing tracked and probes the sockets itself.
-private def sessionFlag()(using Cli, Interpreter): Optional[Text] =
+// How a launch chooses its session: create a fresh one under a made-up name (the default, when
+// neither flag is given), JOIN a named existing one (`--join`), or CREATE a named new one
+// (`--create`). `Invalid` carries the message for a misuse — both flags at once, or a flag with no
+// name — caught before any connection is attempted.
+enum SessionIntent:
+  case Default
+  case Join(name: Text)
+  case Create(name: Text)
+  case Invalid(message: Text)
+
+  // The requested name, for a failure message; empty for `Default`/`Invalid`.
+  def requestedName: Text = this match
+    case SessionIntent.Join(name)   => name
+    case SessionIntent.Create(name) => name
+    case _                          => t""
+
+// Reads `--join`, its operand completing to the names of the sessions on the live local servers —
+// so `flame --join <TAB>` (or `--join=<TAB>`) offers the sessions that can be joined. The
+// suggestions are gathered LAZILY, only when a completion lands on the operand; the `Discoverable`
+// closes over nothing tracked and probes the sockets itself. Returns the flag handle so the caller
+// can see both whether the flag appeared and its operand.
+private def joinFlag()(using Cli, Interpreter): Prospective[Text] =
   given discoverable: (Text is Discoverable) = (_, _) => liveSessionNames().map(Suggestion(_))
-  Session().value
+  Join()
+
+// Whether a flag TOKEN appears in the raw arguments, in any spelling — `--long`, `--long=value`,
+// `-s`, or a short flag with an attached value (`-sVALUE`). Used to detect a flag given WITHOUT a
+// value, which the parsed operand alone cannot distinguish from an absent flag.
+private def flagGiven(arguments: List[Argument], long: Text, short: Char): Boolean =
+  arguments.exists: (argument: Argument) =>
+    val text: Text = argument()
+    text == long || text.starts(t"$long=") || text == t"-$short"
+    || (text.starts(t"-$short") && !text.starts(t"--"))
+
+// Resolves the session intent from the `--join`/`--create` flags and the workspace config. The
+// flags win; only when NEITHER flag appears is the config consulted (its own `join`/`create`
+// keys). A flag present without a name, or both a join and a create at once, is `Invalid`.
+private def sessionIntent
+   ( arguments: List[Argument],
+     join:      Prospective[Text],
+     create:    Prospective[Text],
+     workspace: Workspace.Config )
+:   SessionIntent =
+  // A value flag reports `present` only once its operand PARSES (`Prospective.present` is
+  // `value.present`), so a bare `--join` with no name would look absent and silently fall through
+  // to the default. Presence is therefore read from the raw arguments — the flag TOKEN in any of
+  // its forms — and the name from the parsed operand, so a flag with no name is a caught error.
+  val joinGiven:   Boolean = flagGiven(arguments, t"--join", 'j')
+  val createGiven: Boolean = flagGiven(arguments, t"--create", 'c')
+
+  if joinGiven && createGiven then
+    SessionIntent.Invalid(t"Specify only one of --join and --create")
+  else if joinGiven then
+    join.value.lay(SessionIntent.Invalid(t"--join requires a session name"))(SessionIntent.Join(_))
+  else if createGiven then
+    create.value.lay(SessionIntent.Invalid(t"--create requires a session name"))(SessionIntent.Create(_))
+  else (workspace.join, workspace.create) match
+    case (join: Text, create: Text) => SessionIntent.Invalid(t"config.tel names both a join and a create session")
+    case (join: Text, _)            => SessionIntent.Join(join)
+    case (_, create: Text)          => SessionIntent.Create(create)
+    case _                          => SessionIntent.Default
 
 // The names of every session on every live local REPL server: each per-process socket in the
 // socket directory is asked (with an empty `Session` request, which reports without switching —
@@ -222,15 +277,19 @@ def runClient(): Unit =
         val basic:    Boolean        = Basic().present
         val host:     Optional[Text] = Host().value.or(workspace.host)
         val port:     Int            = Port().value.or(workspace.port).or(defaultPort)
-        val session:  Optional[Text] = sessionFlag().or(workspace.session)
+        // Both flags are read (registering them, and `--join`'s completion) before any branch.
+        val intent:   SessionIntent  = sessionIntent(arguments, joinFlag(), Create(), workspace)
 
         // `flame --basic` — a minimal, self-contained, in-process synchronous REPL (no socket
         // server, no TUI). Checked before `--host`, so it never falls through to a remote/socket
-        // connection; it still honours the startup settings.
+        // connection; it still honours the startup settings. `--join`/`--create` do not apply to
+        // its single in-process session, so they are simply ignored here.
         if basic then command(basicRepl(settings))
-        else host match
-          case host: Text => command(connectRemote(host, port, session, settings))
-          case _          => command(connectSocket(session, settings))
+        else intent match
+          case SessionIntent.Invalid(message) => command(sessionArgError(message))
+          case intent => host match
+            case host: Text => command(connectRemote(host, port, intent, settings))
+            case _          => command(connectSocket(intent, settings))
 
       // `flame serve [--port N | -p N]` — the web front-end (default port 8080). `Port()` registers
       // the flag (so it is offered in tab-completion) and reads its value; the pure `Int`
@@ -262,7 +321,9 @@ def runClient(): Unit =
       // `flame` — the terminal REPL (connects to, or starts, a background socket server). Bare `flame`
       // starts a new session, with whatever the workspace's `config.tel` asks for.
       case Nil =>
-        command(connectSocket(sessionFlag().or(workspace.session), startupCommands(Nil, workspace)))
+        sessionIntent(Nil, Join(), Create(), workspace) match
+          case SessionIntent.Invalid(message) => command(sessionArgError(message))
+          case intent => command(connectSocket(intent, startupCommands(Nil, workspace)))
 
 
       case _ =>
@@ -564,6 +625,12 @@ private def failedToLaunch(using Stdio): Exit =
   Out.println(t"Could not start a REPL server")
   Exit.Fail(3)
 
+// Reports a misuse of `--join`/`--create` (both at once, or a flag with no name) and fails, without
+// attempting any connection.
+private def sessionArgError(message: Text)(using Stdio): Exit =
+  Out.println(message)
+  Exit.Fail(2)
+
 // Starts a REPL server in the background — a detached `flame serve-socket` process on its
 // own per-process domain socket — waits for it to bind, and connects to it. Because
 // the server is a separate process it outlives this client, so the same session can
@@ -642,7 +709,7 @@ private def socketPaths(directory: Text): List[Text] =
 // Connects to a per-process UNIX domain socket. With no server running, launches one
 // in the background and attaches to it (so `flame` alone is a self-contained REPL,
 // reconnectable later); with exactly one, connects to it; with several, lists them.
-private def connectSocket(join: Optional[Text], initial: List[Text])
+private def connectSocket(intent: SessionIntent, initial: List[Text])
     (using Stdio, Monitor, Probate, Console, Environment, System)
 :   Exit =
   // Probe every socket file: a connectable one is live; one that refuses (a crashed or
@@ -662,10 +729,10 @@ private def connectSocket(join: Optional[Text], initial: List[Text])
   live.to(List) match
     case Nil =>
       Out.println(t"Starting a REPL server…")
-      launchServer()(converse(join, initial)(_)).or(failedToLaunch)
+      launchServer()(converse(intent, initial)(_)).or(failedToLaunch)
 
     case path :: Nil =>
-      connectDomain(DomainSocket(path))(converse(join, initial)(_)).or(unreachableSocket(path))
+      connectDomain(DomainSocket(path))(converse(intent, initial)(_)).or(unreachableSocket(path))
 
     case paths =>
       Out.println(t"Several REPL servers are running:")
@@ -681,7 +748,7 @@ private def connectSocket(join: Optional[Text], initial: List[Text])
 // with `-s`/`--session`. The transport differs from `connectSocket` (a TCP endpoint rather than a
 // local UNIX domain socket), but the conversation — the `converse`/`runRepl` loop — is identical, so
 // a remote session behaves exactly like a local one.
-private def connectRemote(host: Optional[Text], portNumber: Int, join: Optional[Text], initial: List[Text])
+private def connectRemote(host: Optional[Text], portNumber: Int, intent: SessionIntent, initial: List[Text])
     (using Stdio, Monitor, Probate, Console, Environment, System)
 :   Exit =
   host.lay(missingHost): hostText =>
@@ -690,11 +757,11 @@ private def connectRemote(host: Optional[Text], portNumber: Int, join: Optional[
         case Hostname.Error(_, _) => invalidHost(hostText)
       . protect:
           val endpoint: Endpoint[Tcp.Port] = hostText.as[Hostname] on port
-          connect(endpoint)(converse(join, initial)(_)).or(unreachableRemote(hostText, portNumber))
+          connect(endpoint)(converse(intent, initial)(_)).or(unreachableRemote(hostText, portNumber))
 
 // The read/edit/print loop. The server's reply is printed verbatim. Ctrl+C/Ctrl+D
 // dismiss the line editor (`Question.Error`) and end the session.
-private def converse(join: Optional[Text], initial: List[Text])(duplex: Duplex)
+private def converse(intent: SessionIntent, initial: List[Text])(duplex: Duplex)
     (using Stdio, Monitor, Probate, Console, Environment)
 :   Exit =
   // The kitty keyboard protocol (applied by `interactive`) makes the terminal report
@@ -714,8 +781,7 @@ private def converse(join: Optional[Text], initial: List[Text])(duplex: Duplex)
 
   . protect:
       interactive: terminal ?=>
-        runRepl(duplex, state, pending, nextId, submits, completions, join, initial)
-        Exit.Ok
+        runRepl(duplex, state, pending, nextId, submits, completions, intent, initial)
 
 // One REPL input line is an inline block at the bottom of the console — a bordered,
 // live-highlighted editor with, when completions are active, a pane below it listing
@@ -731,10 +797,10 @@ private def runRepl
     nextId:      juc.atomic.AtomicInteger,
     submits:     juc.LinkedBlockingQueue[Repl.Reply],
     completions: juc.LinkedBlockingQueue[List[Repl.CompletionItem]],
-    join:        Optional[Text],
+    intent:      SessionIntent,
     initial:     List[Text] )
   ( using terminal: Terminal, monitor: Monitor )
-:   Unit =
+:   Exit =
 
   given Stdio = terminal.stdio
 
@@ -748,6 +814,7 @@ private def runRepl
   // Replies to session queries/switches (the server only sends a `Session` reply in answer to a
   // `Session` request, so this queue is drained 1:1 by whoever sent the request).
   val sessionReplies: juc.LinkedBlockingQueue[Repl.Reply.Session] = juc.LinkedBlockingQueue()
+  val sessionListReplies: juc.LinkedBlockingQueue[Repl.Reply.SessionList] = juc.LinkedBlockingQueue()
 
   // Inline autosuggestion ("ghost text"): on each edit we ask the server (with a non-zero
   // id, to distinguish from a Tab completion's id 0) for completions at the cursor; the
@@ -882,6 +949,9 @@ private def runRepl
           case reply: Repl.Reply.Session =>
             sessionReplies.put(reply)
 
+          case reply: Repl.Reply.SessionList =>
+            sessionListReplies.put(reply)
+
           // The placeholder ack for an async submission: note its id, then unblock the waiting submit
           // (which shows the "evaluating" panel). The real reply follows later with the same id.
           case reply @ Repl.Reply.Pending(id) =>
@@ -917,25 +987,40 @@ private def runRepl
           case reply =>
             submits.put(reply)
 
-  // Start this connection's session: join the one named by `-s`/`--session` — which the server
-  // STARTS under that name if it does not exist yet — or, with no name, let the server assign a
-  // fresh animal name. Show the resulting session, noting when it was newly started by name.
-  val joinName: Text = join.or(t"")
-  duplex.send(zephyrine.Stream(framed(encode(Repl.Request.Session(nextId.getAndIncrement, joinName)))))
+  // Start this connection's session per the launch intent: create a fresh one (a made-up name),
+  // JOIN a named existing one (`--join`), or CREATE a named new one (`--create`). A `--join` of a
+  // missing session or a `--create` of a taken name is an error that ends the client before the
+  // editor opens (`earlyExit`); the server never creates a session on either failure path.
+  var earlyExit: Optional[Exit] = Unset
+
+  val request: Repl.Request = intent match
+    case SessionIntent.Join(name)   => Repl.Request.Join(nextId.getAndIncrement, name)
+    case SessionIntent.Create(name) => Repl.Request.Create(nextId.getAndIncrement, name)
+    case _                          => Repl.Request.Session(nextId.getAndIncrement, t"")
+
+  duplex.send(zephyrine.Stream(framed(encode(request))))
 
   safely(sessionReplies.take().nn).let: reply =>
-    if reply.created then Out.println(Repl.messages.started(reply.name))
-    else Out.println(Repl.messages.session(reply.name))
+    reply.outcome match
+      case Repl.SessionOutcome.Created => Out.println(Repl.messages.started(reply.name))
+      case Repl.SessionOutcome.Joined  => Out.println(Repl.messages.session(reply.name))
+      case Repl.SessionOutcome.Missing =>
+        Out.println(Repl.messages.noSession(intent.requestedName)); earlyExit = Exit.Fail(10)
+      case Repl.SessionOutcome.Exists =>
+        Out.println(Repl.messages.sessionExists(intent.requestedName)); earlyExit = Exit.Fail(10)
+      case _ => ()
 
   // Apply the startup settings from `--set`/`--language` by submitting each as a command to the
   // session, printing its confirmation (`X enabled`) below the banner. Synchronous — async mode
-  // is off at startup — so each reply lands on `submits` in order.
-  initial.each: command =>
+  // is off at startup — so each reply lands on `submits` in order. Skipped when the session could
+  // not be established.
+  if earlyExit.absent then initial.each: command =>
     duplex.send(zephyrine.Stream(framed(encode(Repl.Request.Submit(nextId.getAndIncrement, command)))))
     safely(submits.take().nn).let { reply => Out.print(replyText(reply)) }
 
   val events = terminal.eventIterator()
-  var running = true
+  // A failed `--join`/`--create` leaves nothing to edit: skip straight past the loop to the exit.
+  var running = earlyExit.absent
 
   // The inline block's rendering policy (ultimatum). `Inline` renders the editor RELATIVE to the
   // cursor, so each line's block appears exactly where output has flowed to — right after the
@@ -1136,8 +1221,8 @@ private def runRepl
 
           // `/session <name>` completes against the server's live session list (queried fresh here).
           case Keypress.Tab if editor.value.starts(t"/session ") =>
-            duplex.send(zephyrine.Stream(framed(encode(Repl.Request.Session(nextId.getAndIncrement, t"")))))
-            val names:   List[Text] = safely(sessionReplies.take().nn).lay(Nil)(_.names)
+            duplex.send(zephyrine.Stream(framed(encode(Repl.Request.SessionList(nextId.getAndIncrement)))))
+            val names:   List[Text] = safely(sessionListReplies.take().nn).lay(Nil)(_.names)
             val partial: Text       = editor.value.skip(t"/session ".length)
             val matches: List[Text] = names.filter(_.starts(partial)).map { (name: Text) => t"/session $name" }
 
@@ -1322,9 +1407,8 @@ private def runRepl
           duplex.send(zephyrine.Stream(framed(encode(Repl.Request.Session(nextId.getAndIncrement, name)))))
           safely(sessionReplies.take().nn).lay(t"No response from the server\n"): reply =>
             if name == t"" then t"${Repl.messages.sessionList(reply.name, reply.names)}\n"
-            else if reply.created then t"${Repl.messages.started(reply.name)}\n"
-            else if reply.name == name then t"${Repl.messages.switched(reply.name)}\n"
-            else t"${Repl.messages.noSession(name)}\n"
+            else if reply.outcome == Repl.SessionOutcome.Created then t"${Repl.messages.started(reply.name)}\n"
+            else t"${Repl.messages.switched(reply.name)}\n"
         else if line.starts(t"/") && !Repl.isCommand(line) then
           t"${Repl.messages.unknownCommand(line)}\n"
         else if naturalLanguage(line) then
@@ -1378,8 +1462,10 @@ private def runRepl
                 asyncReplay = true
                 terminal.events.put(Terminal.Info.Redraw)
 
-  // The loop has exited (Ctrl+D/C, Escape, /quit, or a closed stream): stop the reader.
+  // The loop has exited (Ctrl+D/C, Escape, /quit, or a closed stream), or the session could not be
+  // established at all: stop the reader and report the exit.
   live = false
+  earlyExit.or(Exit.Ok)
 
 // The inline block: a bordered editor box showing the live-highlighted line with its
 // caret, and — when completions are active — a pane below it listing them, which

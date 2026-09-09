@@ -55,10 +55,12 @@ import pathInterfaces.pathOnLinux
 //                               # `.pyrocosm`), wherever `flame` is launched; one entry per line
 //   port 4319                   # `--port`
 //   host build.example.com      # `--host`
-//   session shared              # `--session`
+//   join shared                 # `--join`: join this session if it exists
+//   create scratch              # `--create`: start a new session with this name
 //
 // `set`, `language` and `classpath` are ADDITIVE with the flags (a flag and a line naming the same
-// setting enable it once); `port`, `host` and `session` are defaults a flag overrides. A file that
+// setting enable it once); `port`, `host`, `join` and `create` are defaults a flag overrides (and
+// naming both a `join` and a `create` is an error, exactly as passing both flags is). A file that
 // fails to parse is treated as absent — `flame` never requires one to exist — and, since `flame`
 // runs as a daemon, a parsed file is cached against its modification time and size, so an edit is
 // honoured by the very next launch.
@@ -69,7 +71,8 @@ object Workspace:
       classpath: List[Text] = Nil,
       port:      Optional[Int]  = Unset,
       host:      Optional[Text] = Unset,
-      session:   Optional[Text] = Unset )
+      join:      Optional[Text] = Unset,
+      create:    Optional[Text] = Unset )
 
   val empty: Config = Config()
 
@@ -132,4 +135,5 @@ object Workspace:
          classpath = atoms(t"classpath").map(absolute),
          port      = atoms(t"port").prim.let { (text: Text) => safely(text.as[Int]) },
          host      = atoms(t"host").prim,
-         session   = atoms(t"session").prim )
+         join      = atoms(t"join").prim,
+         create    = atoms(t"create").prim )

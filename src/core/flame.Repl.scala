@@ -200,6 +200,17 @@ object Repl:
     import strategies.throwUnsafely
     Tel.DecodableDerivation.derived[ScopeBinding]
 
+  // What a session request did — the `outcome` a `Reply.Session` carries, so the client can tell
+  // success from failure. `Join`/`Create` (from `--join`/`--create`) each have a failure the other
+  // lacks: joining a session that does not exist (`Missing`), or creating one whose name is taken
+  // (`Exists`); a bare launch always `Created`s a fresh one. Transmitted as one of these text
+  // tokens (a bare enum of singleton cases does not derive a Tel codec cleanly), matched by value.
+  object SessionOutcome:
+    val Created: Text = t"created"
+    val Joined:  Text = t"joined"
+    val Missing: Text = t"missing"
+    val Exists:  Text = t"exists"
+
   // A request from a connected client. `id` is echoed in the reply so the client
   // can re-associate replies that arrive out of order (a fast `tokenize` may
   // overtake a slow `submit`). Serialized as JSON with a `kind` discriminator.
@@ -210,7 +221,14 @@ object Repl:
     case Quit(id: Int)
     // Switch this connection to the session named `name`, starting it under that name if it does not
     // exist; when `name` is empty, start (or keep) this connection's own session and report it.
+    // This is the `/session` command's request and the bare-launch default.
     case Session(id: Int, name: Text)
+    // Join the EXISTING session `name` (from `--join`), or fail with `SessionOutcome.Missing` if
+    // there is none — never creating one.
+    case Join(id: Int, name: Text)
+    // Create a NEW session `name` (from `--create`), or fail with `SessionOutcome.Exists` if the
+    // name is already taken — never switching to the existing one.
+    case Create(id: Int, name: Text)
     // List every session's name WITHOUT touching this connection's current session — so a
     // `--session` tab-completion can enumerate the joinable sessions without leaving a throwaway
     // one behind (which a `Session` request's lazy current-session creation would).
@@ -244,9 +262,10 @@ object Repl:
     // front-end shows output as it appears rather than only in the final reply. Carries the same `id`.
     case Output(id: Int, chunk: Text)
     // The connection's current session `name`, plus `names` — every session on the server (for the
-    // startup display and `/session` tab-completion) — and whether the request just `created` the
-    // session it named (rather than switching to an existing one).
-    case Session(id: Int, name: Text, names: List[Text], created: Boolean)
+    // startup display and `/session` tab-completion) — and the request's `outcome`, which the client
+    // uses to distinguish a create from a join and to detect a failed `--join`/`--create` (one of
+    // the `SessionOutcome` tokens).
+    case Session(id: Int, name: Text, names: List[Text], outcome: Text)
     // Every session's name, in answer to a `SessionList` request; touches no current session.
     case SessionList(id: Int, names: List[Text])
 
@@ -971,6 +990,7 @@ object Repl:
     def switched(name: Text): Text = t"Switched to session $name"
     def started(name: Text): Text = t"Started session $name"
     def noSession(name: Text): Text = t"No session named '$name'"
+    def sessionExists(name: Text): Text = t"A session named '$name' already exists"
 
     def unknownCommand(line: Text): Text = t"Unknown command: $line"
 

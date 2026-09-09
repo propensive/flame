@@ -278,12 +278,31 @@ class Sessions[version <: Scalac.Versions]
             encode(Repl.Reply.Completed(id, repl.completionsAt(code, offset)))
 
         case Repl.Request.Session(id, name) =>
-          // Empty name only reports; a known name switches; an unknown one is STARTED under that
-          // name and switched to, so `flame --session work` opens `work` if nobody has yet. The
-          // reply says which happened, and carries the (possibly unchanged) current session.
-          val created: Boolean = name != t"" && open(name)
+          // Empty name only reports (the bare-launch default creates one lazily through
+          // `currentName`); a known name switches; an unknown one is STARTED under that name and
+          // switched to. The `/session` command and the bare launch use this.
+          val wasAbsent: Boolean = current.absent
+          val created: Boolean = if name == t"" then wasAbsent else open(name)
           if name != t"" then current = name
-          encode(Repl.Reply.Session(id, currentName, names, created))
+          val outcome = if created then Repl.SessionOutcome.Created else Repl.SessionOutcome.Joined
+          encode(Repl.Reply.Session(id, currentName, names, outcome))
+
+
+        case Repl.Request.Join(id, name) =>
+          // `--join`: switch to `name` only if it exists; otherwise report `Missing` and touch
+          // nothing (NOT `currentName`, which would create a throwaway session on the failure path).
+          if session(name).present then
+            current = name
+            encode(Repl.Reply.Session(id, name, names, Repl.SessionOutcome.Joined))
+          else encode(Repl.Reply.Session(id, current.or(t""), names, Repl.SessionOutcome.Missing))
+
+        case Repl.Request.Create(id, name) =>
+          // `--create`: start `name` only if it is free; otherwise report `Exists` and switch to
+          // nothing, so a name clash is an error rather than a silent join.
+          if open(name) then
+            current = name
+            encode(Repl.Reply.Session(id, name, names, Repl.SessionOutcome.Created))
+          else encode(Repl.Reply.Session(id, current.or(t""), names, Repl.SessionOutcome.Exists))
 
         case Repl.Request.SessionList(id) =>
           // Report only — no `currentName`, so a bare probe (a tab-completion) creates nothing.

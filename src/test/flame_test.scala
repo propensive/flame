@@ -1091,11 +1091,14 @@ object Tests extends Suite(m"Flame Tests"):
             channel.close()
             service.stop()
       . assert:
-          case Repl.Reply.Session(_, name, names, false) => name != t"" && names.has(name)
-          case _                                         => false
+          case Repl.Reply.Session(_, name, names, Repl.SessionOutcome.Created) =>
+            name != t"" && names.has(name)
 
-      // Naming a session that does not exist STARTS it under that name (`flame --session work`),
-      // reported as `created`; naming it again merely switches.
+          case _ =>
+            false
+
+      // Naming a session that does not exist STARTS it under that name (`/session work`), reported
+      // as `Created`; naming it again merely switches (`Joined`).
       test(m"a Session request naming an unknown session starts it under that name"):
         supervise:
           val tcpPort = Port[Tcp]()
@@ -1110,8 +1113,58 @@ object Tests extends Suite(m"Flame Tests"):
             socket.close()
             service.stop()
       . assert:
-          case (Repl.Reply.Session(1, t"work", names, true), Repl.Reply.Session(2, t"work", _, false)) =>
+          case ( Repl.Reply.Session(1, t"work", names, Repl.SessionOutcome.Created),
+                 Repl.Reply.Session(2, t"work", _, Repl.SessionOutcome.Joined) ) =>
             names.has(t"work")
+
+          case _ =>
+            false
+
+      // `--create work` starts a new session; a second `--create work` must FAIL (name taken),
+      // reported as `Exists` without switching.
+      test(m"a Create request starts a new session, and fails if the name is taken"):
+        supervise:
+          val tcpPort = Port[Tcp]()
+          val service = Sessions().serve(tcpPort)
+          val socket  = jn.Socket("localhost", tcpPort.number)
+
+          try
+            val first  = exchange(socket, Repl.Request.Create(1, t"work"))
+            val second = exchange(socket, Repl.Request.Create(2, t"work"))
+            (first, second)
+          finally
+            socket.close()
+            service.stop()
+      . assert:
+          case ( Repl.Reply.Session(1, t"work", _, Repl.SessionOutcome.Created),
+                 Repl.Reply.Session(2, _, _, Repl.SessionOutcome.Exists) ) =>
+            true
+
+          case _ =>
+            false
+
+      // `--join work` joins an existing session; joining one that does not exist must FAIL
+      // (`Missing`) and create nothing.
+      test(m"a Join request joins an existing session, and fails if there is none"):
+        supervise:
+          val tcpPort = Port[Tcp]()
+          val service = Sessions().serve(tcpPort)
+          val socket  = jn.Socket("localhost", tcpPort.number)
+
+          try
+            val missing = exchange(socket, Repl.Request.Join(1, t"work"))
+            exchange(socket, Repl.Request.Create(2, t"work"))
+            val joined  = exchange(socket, Repl.Request.Join(3, t"work"))
+            val names   = exchange(socket, Repl.Request.SessionList(4))
+            (missing, joined, names)
+          finally
+            socket.close()
+            service.stop()
+      . assert:
+          case ( Repl.Reply.Session(1, _, _, Repl.SessionOutcome.Missing),
+                 Repl.Reply.Session(3, t"work", _, Repl.SessionOutcome.Joined),
+                 Repl.Reply.SessionList(4, sessions) ) =>
+            sessions == List(t"work")
 
           case _ =>
             false
