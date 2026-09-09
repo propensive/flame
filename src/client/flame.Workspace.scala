@@ -57,6 +57,7 @@ import pathInterfaces.pathOnLinux
 //   host build.example.com      # `--host`
 //   join shared                 # `--join`: join this session if it exists
 //   create scratch              # `--create`: start a new session with this name
+//   history 1000                # keep up to this many prompt-history entries (default 100)
 //
 // `set`, `language` and `classpath` are ADDITIVE with the flags (a flag and a line naming the same
 // setting enable it once); `port`, `host`, `join` and `create` are defaults a flag overrides (and
@@ -72,7 +73,8 @@ object Workspace:
       port:      Optional[Int]  = Unset,
       host:      Optional[Text] = Unset,
       join:      Optional[Text] = Unset,
-      create:    Optional[Text] = Unset )
+      create:    Optional[Text] = Unset,
+      history:   Optional[Int]  = Unset )
 
   val empty: Config = Config()
 
@@ -91,6 +93,28 @@ object Workspace:
         if candidate.existent() then candidate else dir.parent.let(recur(_))
 
       recur(directory.as[Path on Linux])
+
+  // The prompt-history configuration governing `directory`: the `history` FILE (only when a
+  // `.pyrocosm/flame` directory already exists at or above `directory` — flame never creates it),
+  // and the entry `limit` (the config's `history` value, or 100). `flame` appends to and loads from
+  // the file (see `flame.History`); when there is no such directory, history is not persisted.
+  case class HistoryConfig(file: Optional[Text], limit: Int)
+
+  // The `.pyrocosm/flame/history` path if a `.pyrocosm/flame` directory exists at or above
+  // `directory`, resolved upwards exactly as `locate` finds `config.tel`. The FILE itself need not
+  // exist yet; the DIRECTORY must (its presence is how a project opts into history persistence).
+  def historyPath(directory: Text): Optional[Text] =
+    safely:
+      def recur(dir: Path on Linux): Optional[Path on Linux] =
+        val candidate = dir / Name[Linux](t".pyrocosm") / Name[Linux](t"flame")
+        if candidate.existent() then candidate else dir.parent.let(recur(_))
+
+      recur(directory.as[Path on Linux]).let { dir => (dir / Name[Linux](t"history")).encode }
+
+  // The history configuration for `directory`, combining the resolved file path with the config's
+  // entry limit (default 100).
+  def historyConfig(directory: Text): HistoryConfig =
+    HistoryConfig(historyPath(directory), config(directory).history.or(100))
 
   // Two separately-scoped `safely` regions (the filesystem read, then the TEL parse), as fume's
   // reader does: one region's tactic would be captured by both the path reader and the TEL
@@ -136,4 +160,5 @@ object Workspace:
          port      = atoms(t"port").prim.let { (text: Text) => safely(text.as[Int]) },
          host      = atoms(t"host").prim,
          join      = atoms(t"join").prim,
-         create    = atoms(t"create").prim )
+         create    = atoms(t"create").prim,
+         history   = atoms(t"history").prim.let { (text: Text) => safely(text.as[Int]) } )

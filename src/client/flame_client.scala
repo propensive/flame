@@ -256,6 +256,12 @@ def runClient(): Unit =
     // and connection defaults are folded into every launch below.
     val workspace: Workspace.Config = Workspace.config(summon[Cli].workingDirectory.directory())
 
+    // The prompt-history file and entry limit for this project (see `flame.History`): resolved from
+    // the same invocation working directory, and Unset (no persistence) unless a `.pyrocosm/flame`
+    // directory exists at or above it.
+    val history: Workspace.HistoryConfig =
+      Workspace.historyConfig(summon[Cli].workingDirectory.directory())
+
     arguments match
       // `flame -<flag>…` — the terminal REPL with options: `-s NAME` joins a session, `--host HOST`
       // (with optional `--port`) connects to a remote server (`flame listen`), and the settings flags
@@ -288,8 +294,8 @@ def runClient(): Unit =
         else intent match
           case SessionIntent.Invalid(message) => command(sessionArgError(message))
           case intent => host match
-            case host: Text => command(connectRemote(host, port, intent, settings))
-            case _          => command(connectSocket(intent, settings))
+            case host: Text => command(connectRemote(host, port, intent, settings, history))
+            case _          => command(connectSocket(intent, settings, history))
 
       // `flame serve [--port N | -p N]` — the web front-end (default port 8080). `Port()` registers
       // the flag (so it is offered in tab-completion) and reads its value; the pure `Int`
@@ -323,7 +329,7 @@ def runClient(): Unit =
       case Nil =>
         sessionIntent(Nil, Join(), Create(), workspace) match
           case SessionIntent.Invalid(message) => command(sessionArgError(message))
-          case intent => command(connectSocket(intent, startupCommands(Nil, workspace)))
+          case intent => command(connectSocket(intent, startupCommands(Nil, workspace), history))
 
 
       case _ =>
@@ -709,7 +715,7 @@ private def socketPaths(directory: Text): List[Text] =
 // Connects to a per-process UNIX domain socket. With no server running, launches one
 // in the background and attaches to it (so `flame` alone is a self-contained REPL,
 // reconnectable later); with exactly one, connects to it; with several, lists them.
-private def connectSocket(intent: SessionIntent, initial: List[Text])
+private def connectSocket(intent: SessionIntent, initial: List[Text], history: Workspace.HistoryConfig)
     (using Stdio, Monitor, Probate, Console, Environment, System)
 :   Exit =
   // Probe every socket file: a connectable one is live; one that refuses (a crashed or
@@ -729,10 +735,10 @@ private def connectSocket(intent: SessionIntent, initial: List[Text])
   live.to(List) match
     case Nil =>
       Out.println(t"Starting a REPL server…")
-      launchServer()(converse(intent, initial)(_)).or(failedToLaunch)
+      launchServer()(converse(intent, initial, history)(_)).or(failedToLaunch)
 
     case path :: Nil =>
-      connectDomain(DomainSocket(path))(converse(intent, initial)(_)).or(unreachableSocket(path))
+      connectDomain(DomainSocket(path))(converse(intent, initial, history)(_)).or(unreachableSocket(path))
 
     case paths =>
       Out.println(t"Several REPL servers are running:")
@@ -748,7 +754,7 @@ private def connectSocket(intent: SessionIntent, initial: List[Text])
 // with `-s`/`--session`. The transport differs from `connectSocket` (a TCP endpoint rather than a
 // local UNIX domain socket), but the conversation — the `converse`/`runRepl` loop — is identical, so
 // a remote session behaves exactly like a local one.
-private def connectRemote(host: Optional[Text], portNumber: Int, intent: SessionIntent, initial: List[Text])
+private def connectRemote(host: Optional[Text], portNumber: Int, intent: SessionIntent, initial: List[Text], history: Workspace.HistoryConfig)
     (using Stdio, Monitor, Probate, Console, Environment, System)
 :   Exit =
   host.lay(missingHost): hostText =>
@@ -757,11 +763,11 @@ private def connectRemote(host: Optional[Text], portNumber: Int, intent: Session
         case Hostname.Error(_, _) => invalidHost(hostText)
       . protect:
           val endpoint: Endpoint[Tcp.Port] = hostText.as[Hostname] on port
-          connect(endpoint)(converse(intent, initial)(_)).or(unreachableRemote(hostText, portNumber))
+          connect(endpoint)(converse(intent, initial, history)(_)).or(unreachableRemote(hostText, portNumber))
 
 // The read/edit/print loop. The server's reply is printed verbatim. Ctrl+C/Ctrl+D
 // dismiss the line editor (`Question.Error`) and end the session.
-private def converse(intent: SessionIntent, initial: List[Text])(duplex: Duplex)
+private def converse(intent: SessionIntent, initial: List[Text], history: Workspace.HistoryConfig)(duplex: Duplex)
     (using Stdio, Monitor, Probate, Console, Environment)
 :   Exit =
   // The kitty keyboard protocol (applied by `interactive`) makes the terminal report
@@ -781,7 +787,7 @@ private def converse(intent: SessionIntent, initial: List[Text])(duplex: Duplex)
 
   . protect:
       interactive: terminal ?=>
-        runRepl(duplex, state, pending, nextId, submits, completions, intent, initial)
+        runRepl(duplex, state, pending, nextId, submits, completions, intent, initial, history)
 
 // One REPL input line is an inline block at the bottom of the console — a bordered,
 // live-highlighted editor with, when completions are active, a pane below it listing
@@ -798,7 +804,8 @@ private def runRepl
     submits:     juc.LinkedBlockingQueue[Repl.Reply],
     completions: juc.LinkedBlockingQueue[List[Repl.CompletionItem]],
     intent:      SessionIntent,
-    initial:     List[Text] )
+    initial:     List[Text],
+    historyConfig: Workspace.HistoryConfig )
   ( using terminal: Terminal, monitor: Monitor )
 :   Exit =
 
@@ -1073,6 +1080,23 @@ private def runRepl
   val history: scm.ArrayBuffer[Text] = scm.ArrayBuffer()
   var histIdx: Int = 0
   var draft: Text = t""
+
+  // Load the persisted prompt history (see `flame.History`) and PREPEND it, so the arrow keys walk
+  // up from this session's lines into earlier ones. `loaded` is the most recent `limit` entries;
+  // `historyOnDisk` tracks how many records the file holds, so persistence can compact it. The
+  // parameter `history` (the ArrayBuffer above) shadows the field name only by coincidence — the
+  // config arrives as the outer `history: Workspace.HistoryConfig`, referenced through a stable alias.
+  var historyOnDisk: Int = 0
+  historyConfig.file.let: file =>
+    val all: sci.List[Text] = flame.History.load(file)
+    historyOnDisk = all.length
+    all.takeRight(historyConfig.limit).foreach { entry => history += entry }
+    // A file already over the limit is trimmed to the most recent `limit` on load, so it cannot
+    // grow without bound across sessions.
+    if all.length > historyConfig.limit then
+      flame.History.replace(file, history.toList)
+      historyOnDisk = history.length
+  histIdx = history.length
 
   while running do
     val root = InlineRoot(terminal)
@@ -1368,7 +1392,22 @@ private def runRepl
     submitted.let: line =>
       // Record the submission for Up/Down recall (skip a consecutive duplicate), then reset
       // the cursor back to the newest position, exactly as the web front-end does on submit.
-      if line.trim != t"" && history.lastOption != Some(line) then history += line
+      if line.trim != t"" && history.lastOption != Some(line) then
+        history += line
+
+        // Persist it, keeping at most `limit` entries on disk: append one framed record while the
+        // file is still under the limit, and once it is full rewrite it with the most recent
+        // `limit` lines (which now include this one). Only when a `.pyrocosm/flame` directory made
+        // a history file available.
+        historyConfig.file.let: file =>
+          if historyOnDisk < historyConfig.limit then
+            flame.History.append(file, line)
+            historyOnDisk += 1
+          else
+            val recent: sci.List[Text] = history.toList.takeRight(historyConfig.limit)
+            flame.History.replace(file, recent)
+            historyOnDisk = recent.length
+
       histIdx = history.length
       draft = t""
 
@@ -2125,7 +2164,11 @@ private def endsWithContinuation(text: Text): Boolean =
   val trimmed: String = text.s.trim.nn
   if trimmed.isEmpty then true else
     val last:     Char    = trimmed.charAt(trimmed.length - 1)
-    val operator: Boolean = "+-*/%<>=&|^.:,@".indexOf(last.toInt) >= 0
+    // A trailing `.*` is a WILDCARD selector (`import soundness.*`), not a dangling `*` operator, so
+    // it completes the line — otherwise Enter continued `import soundness.*` onto a new line whenever
+    // the server's parser verdict had not yet arrived, disagreeing with it inconsistently.
+    val wildcard: Boolean = trimmed.endsWith(".*")
+    val operator: Boolean = "+-*/%<>=&|^.:,@".indexOf(last.toInt) >= 0 && !wildcard
     val lastWord: Text    = trimmed.drop(trimmed.lastIndexWhere(_.isWhitespace) + 1).nn.tt
     operator || continuationKeywords.has(lastWord)
 

@@ -1169,6 +1169,17 @@ object Tests extends Suite(m"Flame Tests"):
           case _ =>
             false
 
+      // A `HistoryEntry` — the record the client appends to `.pyrocosm/flame/history` for each
+      // submitted prompt — round-trips through BinTEL (a bare `Text` will not encode at the top
+      // level, so the line is wrapped in this struct).
+      test(m"a HistoryEntry round-trips through BinTEL"):
+        supervise:
+          val data: Data = Repl.HistoryEntry(t"import soundness.*").bintel
+          Bintel.read[Repl.HistoryEntry](data)
+      . assert:
+          case Repl.HistoryEntry(t"import soundness.*") => true
+          case _                                        => false
+
       // A `SessionList` request only reports; it must not create a session (as an empty `Session`
       // request would through the connection's lazy current session), so a `--session` completion
       // can enumerate the joinable sessions without leaving throwaways behind.

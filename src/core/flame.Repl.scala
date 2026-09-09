@@ -168,6 +168,11 @@ object Repl:
   // `using` binding an implicit search would find, as opposed to a plain value.
   case class ScopeBinding(name: Optional[Text], tpe: Text, contextual: Boolean)
 
+  // One persisted prompt-history entry: the exact submitted line. A struct (not a bare `Text`,
+  // which BinTEL will not encode at the top level) so it frames cleanly; the client appends one
+  // such record per submission to `.pyrocosm/flame/history` and reads them back at startup.
+  case class HistoryEntry(line: Text)
+
   // The wire types' codecs, anchored PURE and tactic-free. Anchoring (rather than deriving
   // inline at each use) keeps the derivation graph shallow enough to resolve under the REPL's
   // minimal predef; purity is required by `Bintel.read`'s context bound AND by the by-name
@@ -199,6 +204,16 @@ object Repl:
   given scopeBindingDecodable: ScopeBinding is Tel.Decodable =
     import strategies.throwUnsafely
     Tel.DecodableDerivation.derived[ScopeBinding]
+
+  given historyEntryDecodable: HistoryEntry is Tel.Decodable =
+    import strategies.throwUnsafely
+    Tel.DecodableDerivation.derived[HistoryEntry]
+
+  // `HistoryEntry` is encoded on its OWN (not only as a field of `Reply`), so its encoder is
+  // anchored here — call-site auto-derivation infers a capturing `Self` that fails the override
+  // check, exactly as for `Request`/`Reply`.
+  given historyEntryEncodable: HistoryEntry is Tel.Encodable =
+    Tel.EncodableDerivation.derived[HistoryEntry]
 
   // What a session request did — the `outcome` a `Reply.Session` carries, so the client can tell
   // success from failure. `Join`/`Create` (from `--join`/`--create`) each have a failure the other
