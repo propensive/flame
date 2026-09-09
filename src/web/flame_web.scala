@@ -67,6 +67,9 @@ import webserverErrorPages.minimalErrorPage
 case class WebRequest(kind: Text, seq: Int, code: Text, offset: Int)
 case class WebToken(text: Text, accent: Text, role: Text = t"")
 case class WebCompletion(name: Text, kind: Text, signature: Text)
+// One binding the unfinished line has introduced (`Repl.ScopeBinding`); `name` is empty for a
+// synthetic context-function parameter, which is shown by type alone.
+case class WebScope(name: Text, tpe: Text, contextual: Boolean)
 
 case class WebReply
    ( kind:        Text,
@@ -81,7 +84,9 @@ case class WebReply
      name:        Text = t"",
      // The type the singleton `tpe` widens to, empty unless `tpe` is a singleton; shown dimmed
      // after a `<:`, mirroring the CLI (see `Repl.TypeText`).
-     base:        Text = t"" )
+     base:        Text = t"",
+     // What the (unfinished) line has brought into scope so far, for the row under the editor.
+     scope:       List[WebScope] = Nil )
 
 // The JSON REST API's request/response bodies (served alongside the browser UI and WebSocket — see
 // the `/api/…` routes in `serveHttp`). Flat case classes, so jacinta derives their JSON codecs
@@ -122,6 +127,10 @@ val replScript: Text = t"""
     "  border: 1px solid #3a3a3a; border-radius: 4px; padding: 0.4rem 0.6rem;",
     "  min-height: 1.4em; background: #252526; caret-color: #d4d4d4; }",
     "code::after { content: attr(data-ghost); color: #5c6370; }",
+    // The scope row under the editor: what the unfinished line has brought into scope. Sized even
+    // when empty, so its appearance never shifts the editor.
+    ".scope { color: #5c6370; min-height: 1.3em; margin: 0.2rem 0 0.5rem 0.6rem; }",
+    ".scope .given { font-style: italic; }",
     ".prompt { color: #808080; }",
     ".result { color: #b5cea8; }",
     ".error { color: #f48771; white-space: pre-wrap; }",
@@ -166,6 +175,10 @@ val replScript: Text = t"""
 
   var log = document.querySelector("pre");
   var editor = document.querySelector("code");
+  // The scope row, directly under the editor (see `renderScope`).
+  var scopeRow = document.createElement("div");
+  scopeRow.className = "scope";
+  editor.parentNode.insertBefore(scopeRow, editor.nextSibling);
   // The page is pretty-printed, so the empty elements arrive holding indentation
   // whitespace; clear it so the editor and log start genuinely empty.
   log.innerHTML = "";
@@ -324,6 +337,38 @@ val replScript: Text = t"""
     }
   }
 
+  // Shows what the unfinished line has brought into scope: `given Unsafe` for a contextual binding
+  // (with its name too, where the user could write one), `x: Int` for a plain one; nothing when the
+  // line opens no scope.
+  function renderScope(bindings) {
+    scopeRow.innerHTML = "";
+    if (!bindings || !bindings.length) return;
+    var lead = document.createElement("span");
+    lead.textContent = "\u2937 scope: ";
+    scopeRow.appendChild(lead);
+    for (var i = 0; i < bindings.length; i++) {
+      var b = bindings[i];
+      if (i > 0) scopeRow.appendChild(document.createTextNode(", "));
+      if (b.contextual) {
+        var given = document.createElement("span");
+        given.className = "given";
+        given.textContent = "given ";
+        scopeRow.appendChild(given);
+      }
+      if (b.name) {
+        var name = document.createElement("span");
+        name.className = "tok-term";
+        name.textContent = b.name;
+        scopeRow.appendChild(name);
+        scopeRow.appendChild(document.createTextNode(": "));
+      }
+      var tpe = document.createElement("span");
+      tpe.className = "tok-typal";
+      tpe.textContent = b.tpe;
+      scopeRow.appendChild(tpe);
+    }
+  }
+
   function highlight(tokens) {
     var text = "";
     for (var i = 0; i < tokens.length; i++) text += tokens[i].text;
@@ -398,6 +443,7 @@ val replScript: Text = t"""
     if (!connected) return;
     var code = editor.textContent;
     if (code.trim() === "") return;
+    renderScope([]);
     var line = document.createElement("div");
     var prompt = document.createElement("span");
     prompt.className = "prompt";
@@ -703,7 +749,13 @@ val replScript: Text = t"""
     }
     if (msg.kind === "tokens") {
       highlight(msg.tokens);
-      if (msg.seq in tokenizeCode) { incompleteText = tokenizeCode[msg.seq]; incomplete = msg.incomplete; delete tokenizeCode[msg.seq]; }
+      if (msg.seq in tokenizeCode) {
+        incompleteText = tokenizeCode[msg.seq]; incomplete = msg.incomplete;
+        // The scope row tracks the line on screen: a reply for older text is ignored (a newer
+        // tokenize is in flight), and the row keeps its last answer until that one lands.
+        if (incompleteText === editor.textContent) renderScope(msg.scope);
+        delete tokenizeCode[msg.seq];
+      }
       return;
     }
     // Async mode: a "pending" ack appends an empty placeholder block tagged with the submission's seq;
@@ -914,9 +966,15 @@ def serveHttp(port: Int, quit: Promise[Unit])(using Monitor, System, Probate, Cl
     safely(payload.read[Json].as[WebRequest]).let: request =>
       request.kind match
         case t"tokenize" =>
+          // The scope the line has opened so far is the one session-dependent part of a tokenize
+          // (imports, history, classpath); a connection whose session does not exist yet has none.
+          val scope: List[WebScope] =
+            session.lay(Nil)(_.scopeAt(request.code)).map: binding =>
+              WebScope(binding.name.or(t""), binding.tpe, binding.contextual)
+
           WebReply
            ( t"tokens", request.seq, t"", t"", t"", t"", webTokens(Repl.tokenize(request.code)), Nil,
-             Repl.incomplete(request.code) )
+             Repl.incomplete(request.code), scope = scope )
           . in[Json].show
 
         case t"submit" =>

@@ -721,6 +721,11 @@ private def runRepl
   @volatile var incompleteFor: Optional[(Text, Boolean)] = Unset
   val incompletePending: TrieMap[Int, Text] = TrieMap()
 
+  // The server's account of what the current (unfinished) line has brought into scope — the
+  // `Unsafe` an `unsafely:` makes available, a lambda's parameter — from the same `Tokenized`
+  // reply, paired with the value it was computed for; shown faint under the editor box.
+  @volatile var scopeFor: Optional[(Text, List[Repl.ScopeBinding])] = Unset
+
   // The server's verdict on whether the current line reads as natural language rather than Scala
   // (`Repl.classify`), refined from the same `Tokenized` reply as `incompleteFor` and paired with
   // the value it was computed for. Until it arrives, `Repl.proseScore`'s lexical evidence decides.
@@ -809,12 +814,13 @@ private def runRepl
       // Braced, so the assignment is a block rather than a named argument.
       data.lay({ live = false }): bytes =>
         safely(Bintel.read[Repl.Reply](bytes)).let:
-          case Repl.Reply.Tokenized(id, highlight, incomplete, language) =>
+          case Repl.Reply.Tokenized(id, highlight, incomplete, language, scope) =>
             pending.remove(id).foreach(state.reconcile(_, highlight))
 
             incompletePending.remove(id).foreach: value =>
               incompleteFor = (value, incomplete)
               languageFor = (value, language)
+              scopeFor = (value, scope)
 
             terminal.events.put(Terminal.Info.Redraw)
 
@@ -1017,10 +1023,20 @@ private def runRepl
         if language || candidates.nil then Nil
         else completionTable(candidates.keep(10), terminal.knownColumns.max(1))
 
+      // The scope rows show the server's LATEST answer while there is a line on screen at all: a
+      // keystroke's own answer is a round trip away, and hiding the rows until it lands (as the
+      // ghost does) made them vanish and reappear on every keypress. A stale answer is at most one
+      // round trip old, and the reply for the current text replaces it — with nothing, if the line
+      // no longer opens a scope.
+      val scopeLines: List[Teletype] =
+        if language || editor.value.length == 0 then Nil
+        else scopeFor.lay(Nil): (_: Text, bindings: List[Repl.ScopeBinding]) =>
+          scopeTable(bindings, terminal.knownColumns.max(1))
+
       // `paint` already flushes the block to the terminal (via `InlineRoot.flush`), so no explicit
       // `root.flush()` is needed here — and a second flush would be actively wrong, re-running the
       // inline shrink handling against an already-settled block.
-      paint(root, replPane(editor, tokens, ghost, rows, compLines, language))
+      paint(root, replPane(editor, tokens, ghost, rows, scopeLines, compLines, language))
 
     refresh()
     frame()
@@ -1323,6 +1339,7 @@ private def replPane
     tokens:    List[Repl.Token],
     ghost:     Text,
     rows:      Int,
+    scopeLines: List[Teletype],
     compLines: List[Teletype],
     language:  Boolean )
 :   Pane =
@@ -1350,12 +1367,20 @@ private def replPane
   // trailing newline, which would scroll the panel and clip the first row). When the pane
   // shrinks or vanishes, the inline anchoring holds the box's top and clears the rows below it,
   // so the editor never moves; when there are no candidates the block is just the box.
-  if compLines.nil then box
-  else
-    val list = panel(minHeight = compLines.size, maxHeight = compLines.size):
-      summon[Extent].put(compLines.join(e"\n"))
+  val list: List[Pane] =
+    if compLines.nil then Nil
+    else List(panel(minHeight = compLines.size, maxHeight = compLines.size):
+      summon[Extent].put(compLines.join(e"\n")))
 
-    stack(box, list)
+  // The scope rows under the box (see `scopeTable`), sized exactly to their count like the
+  // completion pane, so a long list wraps onto further rows rather than being clipped to one.
+  // Absent — no row at all — when the line opens nothing.
+  val scopeRow: List[Pane] =
+    if scopeLines.nil then Nil
+    else List(panel(minHeight = scopeLines.size, maxHeight = scopeLines.size):
+      summon[Extent].put(scopeLines.join(e"\n")))
+
+  if scopeRow.nil && list.nil then box else stack(((box :: scopeRow) + list)*)
 
 // One replayable line of the session: the source `text` (to compute the box's wrapped height at any
 // terminal width), the highlight `tokens` (to redraw the box), and the `result` text printed below it
@@ -1449,7 +1474,7 @@ private def replyText(reply: Repl.Reply): Text = reply match
   case Repl.Reply.Rejected(_, diagnostics, _)      => t"$diagnostics\n"
   case Repl.Reply.Crashed(_, diagnostics, _)       => t"$diagnostics\n"
   case Repl.Reply.Failed(_, message)               => t"$message\n"
-  case Repl.Reply.Tokenized(_, _, _, _)            => t""
+  case Repl.Reply.Tokenized(_, _, _, _, _)         => t""
   case Repl.Reply.Completed(_, _)                  => t""
   case Repl.Reply.Session(_, _, _)                 => t""
   case Repl.Reply.Pending(_)                       => t""
@@ -1458,7 +1483,7 @@ private def replyText(reply: Repl.Reply): Text = reply match
 // The request id every reply echoes — used to correlate an out-of-band async fill with the submission
 // (its `Pending` placeholder) it completes. (The enum's cases share the field but not an accessor.)
 private def replyId(reply: Repl.Reply): Int = reply match
-  case Repl.Reply.Tokenized(id, _, _, _)      => id
+  case Repl.Reply.Tokenized(id, _, _, _, _)   => id
   case Repl.Reply.Completed(id, _)            => id
   case Repl.Reply.Ran(id, _, _, _, _, _, _)   => id
   case Repl.Reply.Rejected(id, _, _)          => id
@@ -1474,6 +1499,42 @@ private def replyId(reply: Repl.Reply): Int = reply match
 // column) is a single Unicode glyph, and the glyph + name are coloured by the kind's broad category
 // using the syntax palette — a term/callable peach, a type/namespace teal, a keyword orange — so a
 // method reads like a term and a type like a type, matching how each would look in code.
+// The rows naming what the unfinished line has brought into scope (see `ScopeInspector`): a
+// contextual binding as `given Unsafe` (with a name too, where the user could write one), a plain
+// binding as `x: Int`, comma-separated after a faint `⤷ scope:` lead. Items are packed into rows
+// of at most `width` columns — one short, so an ambiguous-width glyph can't force a wrap — with
+// continuation rows indented to the lead's width, so the list reads as one aligned block.
+private def scopeTable(bindings: List[Repl.ScopeBinding], width: Int): List[Teletype] =
+  if bindings.nil then Nil
+  else
+    val items: List[Teletype] = bindings.map: (binding: Repl.ScopeBinding) =>
+      val tpe: Teletype = e"${palette.scalaType}(${binding.tpe})"
+      val named: Teletype =
+        binding.name.lay(tpe): (name: Text) =>
+          e"$Italic(${palette.scalaTerm}($name))${palette.scalaSymbol}(:) $tpe"
+      if binding.contextual then e"$Faint(given) $named" else named
+
+    val lead: Text = t" ⤷ scope: "
+    val indent: Teletype = e"${t" "*lead.length}"
+    val limit: Int = (width - 1).max(lead.length + 1)
+
+    // Fold the items into rows: an item follows the current row (after a comma) if it fits, and
+    // otherwise starts an indented new row; an item longer than a whole row simply overflows it.
+    var rows: List[Teletype] = Nil
+    var current: Teletype = e"$Faint($lead)"
+    var empty: Boolean = true
+
+    items.each: item =>
+      if empty then
+        current = current+item
+        empty = false
+      else if current.plain.length + 2 + item.plain.length <= limit then current = current+e", "+item
+      else
+        rows = rows :+ (current+e",")
+        current = indent+item
+
+    rows :+ current
+
 private def completionTable(items: List[Repl.CompletionItem], width: Int): List[Teletype] =
   def style(kind: Text): (Text, Color in Srgb) = kind.lower match
     case t"method"    => (t"ƒ", palette.scalaTerm)

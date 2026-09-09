@@ -162,6 +162,12 @@ object Repl:
   // to text here so the reply serializes simply.
   case class CompletionItem(name: Text, kind: Text, signature: Text)
 
+  // One binding an unfinished line has introduced into scope (see `Repl#scopeAt`): its `name`
+  // where the user could write one (a lambda's `x`, a `using x: Foo`), or none for a synthetic
+  // context-function parameter; its rendered type; and whether it is `contextual` — a `given`/
+  // `using` binding an implicit search would find, as opposed to a plain value.
+  case class ScopeBinding(name: Optional[Text], tpe: Text, contextual: Boolean)
+
   // The wire types' codecs, anchored PURE and tactic-free. Anchoring (rather than deriving
   // inline at each use) keeps the derivation graph shallow enough to resolve under the REPL's
   // minimal predef; purity is required by `Bintel.read`'s context bound AND by the by-name
@@ -190,6 +196,10 @@ object Repl:
     import strategies.throwUnsafely
     Tel.DecodableDerivation.derived[CompletionItem]
 
+  given scopeBindingDecodable: ScopeBinding is Tel.Decodable =
+    import strategies.throwUnsafely
+    Tel.DecodableDerivation.derived[ScopeBinding]
+
   // A request from a connected client. `id` is echoed in the reply so the client
   // can re-associate replies that arrive out of order (a fast `tokenize` may
   // overtake a slow `submit`). Serialized as JSON with a `kind` discriminator.
@@ -208,7 +218,11 @@ object Repl:
   enum Reply:
     // `language` is `classify`'s verdict: the code reads as natural language rather than Scala,
     // so the front-end may route it to an assistant instead of submitting it for evaluation.
-    case Tokenized(id: Int, highlight: List[Token], incomplete: Boolean, language: Boolean)
+    // `scope` is what the line has brought into scope SO FAR (an unfinished `unsafely:` has made an
+    // `Unsafe` available; `xs.map { x =>` has bound `x`), for a front-end to show while the user
+    // continues the line; empty for a line that opens no scope. See `Repl#scopeAt`.
+    case Tokenized(id: Int, highlight: List[Token], incomplete: Boolean, language: Boolean,
+                   scope: List[ScopeBinding])
     case Completed(id: Int, completions: List[CompletionItem])
 
     case Ran(id: Int, value: Optional[Text], output: Text, tpe: Optional[TypeText],
@@ -305,6 +319,59 @@ object Repl:
         then firstError = diagnostic.pos.start
 
     Probe(needsMore, errors, firstError)
+
+  // `code` extended with `ScopeInspector.marker` on a new line where the user's NEXT statement would
+  // go, or `Unset` if no such extension parses. The marker is tried at the indentation of the last
+  // non-blank line first (a sibling statement: after `unsafely:\n  val x = 1` the next line is
+  // another statement of the block), then one level deeper (the first statement of a block the
+  // last line opens: after `unsafely:` alone, a same-indent line is a syntax error). Parser only,
+  // so it is cheap enough to run on every keystroke; `Repl#scopeAt` typechecks the result.
+  def scopeProbe(code: Text): Optional[Text] =
+    val lines: List[Text] = code.cut(t"\n")
+
+    // A brace-, parenthesis- or bracket-delimited scope (`xs.map { x =>`) is still open at the end
+    // of the line, so the marker is followed by the closers, innermost first, that would complete
+    // it — a colon-introduced block needs none.
+    val closers: Text = unclosed(code).map { (closer: Char) => t"\n$closer" }.join
+
+    lines.reverse.seek(_.trim != t"").let: last =>
+      val indent: Int = last.s.length - last.s.stripLeading.nn.length
+
+      def candidate(depth: Int): Text =
+        t"$code\n${" ".repeat(depth).nn.tt}${ScopeInspector.marker}$closers"
+
+      List(candidate(indent), candidate(indent + 2)).seek: text =>
+        val outcome = probe(text)
+        !outcome.needsMore && !outcome.errors
+
+  // The closing delimiters for the brackets left open in `code`, innermost first — a lexical
+  // approximation that skips string literals (with escapes) and line comments, which is all an
+  // unfinished line's bracket structure needs.
+  private def unclosed(code: Text): List[Char] =
+    var stack: sci.List[Char] = sci.Nil
+    val text: String = code.s
+    var i: Int = 0
+
+    while i < text.length do
+      text.charAt(i) match
+        case '"' =>
+          i += 1
+          while i < text.length && text.charAt(i) != '"' do
+            if text.charAt(i) == '\\' then i += 1
+            i += 1
+
+        case '/' if i + 1 < text.length && text.charAt(i + 1) == '/' =>
+          while i < text.length && text.charAt(i) != '\n' do i += 1
+
+        case '(' => stack = ')' :: stack
+        case '[' => stack = ']' :: stack
+        case '{' => stack = '}' :: stack
+        case ')' | ']' | '}' => stack = if stack.isEmpty then stack else stack.tail
+        case _ => ()
+
+      i += 1
+
+    List.from(stack)
 
   // How a submitted line should be treated: as Scala (`Code`) — including malformed Scala, which
   // runs and surfaces its error — or as natural language (`Language`), which a front-end may hand
@@ -1724,6 +1791,58 @@ class Repl[version <: Scalac.Versions]
 
             reply.put(result)
 
+  // The scope inspector (see `ScopeInspector`) and the key — line index, compiler arguments and
+  // classpath — it was opened with; as with the warm session, a change to any retires it. `scopeCache` is the
+  // last answer and the line it was for: front-ends tokenize on every keystroke, and a redraw with
+  // unchanged text must not typecheck again.
+  @scala.caps.unsafe.untrackedCaptures
+  private var inspector: Optional[ScopeInspector] = Unset
+  @scala.caps.unsafe.untrackedCaptures
+  private var inspectorKey: Optional[Text] = Unset
+  @volatile
+  @scala.caps.unsafe.untrackedCaptures
+  private var scopeCache: Optional[(Text, List[Repl.ScopeBinding])] = Unset
+  private val scopeLock: AnyRef = new AnyRef()
+
+  // The bindings the unfinished line `code` has introduced into scope so far — what its next
+  // statement would see beyond the session's own definitions and imports (see `ScopeInspector`).
+  // Only a line that spans several lines, or that the parser wants more of, can have opened a
+  // scope; anything else answers `Nil` without a compile. The probe is wrapped exactly as a
+  // submission would be (`layout.wrap`, with the history and session imports), as a statement
+  // where the line can only be one and as the wrapper's result binding otherwise, so the marker
+  // is typed in the same scope the real line would be.
+  def scopeAt(code: Text)(using System): List[Repl.ScopeBinding] =
+    if !(code.contains(t"\n") || Repl.incomplete(code)) then Nil
+    else scopeCache.let { (forCode, found) => if forCode == code then found else Unset }.or:
+      val found: List[Repl.ScopeBinding] = Repl.scopeProbe(code).lay(Nil): body =>
+        val content: Text = if Repl.neverExpression(code) then body else t"final val __scope = $body"
+        val source: Text = layout.wrap(index, historyImports, contextImports(code), content)
+        val offset: Int = source.s.lastIndexOf(ScopeInspector.marker.s)
+        val scalac: Scalac[version, Universe.Classfile] = effectiveScalac
+        val path: Text = classpath()
+        // The line index is part of the key: a fresh inspector per submitted line, since one that is
+        // already open cannot see the wrapper classfile the latest submission added (see
+        // `ScopeInspector`), and the probe's history imports name it.
+        val key: Text = t"$index ${scalac.commandLineArguments.join(t" ")} $path"
+
+        def open(): ScopeInspector =
+          val fresh = ScopeInspector(List(t"-classpath", path) + scalac.commandLineArguments)
+          inspector = fresh
+          inspectorKey = key
+          fresh
+
+        val active: ScopeInspector = scopeLock.synchronized:
+          inspector.lay(open()): existing =>
+            if inspectorKey.lay(true)(_ != key) then
+              existing.retire()
+              open()
+            else existing
+
+        if offset < 0 then Nil else active.inspect(source, offset, semanticImports)
+
+      scopeCache = (code, found)
+      found
+
   // The live warm session, and the compiler arguments and classpath it was opened with — a change
   // to either retires it (see `Warm`).
   @scala.caps.unsafe.untrackedCaptures
@@ -1850,7 +1969,14 @@ class Repl[version <: Scalac.Versions]
           try
             // Seed accessors read their session from this thread-local.
             ReplBridge.setCurrentSession(session)
-            Repl.CapturedOut.capture(stream)(scala.Console.withOut(stream)(loader.on(t"$name$$")))
+
+            // The ambient `Stdio`'s termcap for this run: ANSI in the terminal, plain on the web.
+            val termcap: Termcap = render match
+              case Repl.Rendering.Html => termcapDefinitions.basicTermcap
+              case _                   => termcapDefinitions.xterm256Termcap
+
+            ReplStdio.withTermcap(termcap):
+              Repl.CapturedOut.capture(stream)(scala.Console.withOut(stream)(loader.on(t"$name$$")))
             Outcome.Ran(notices, rendered, output)
           catch
             case error: ExceptionInInitializerError =>
@@ -1916,7 +2042,22 @@ class Repl[version <: Scalac.Versions]
     val repeated = importsIn(line)
     def keep(statement: Text): Boolean = !repeated.has(statement)
 
-    prelude.imports.map(_.tt).filter(keep) + imports.filter(keep).map(qualifyImport)
+    ambientImports + prelude.imports.map(_.tt).filter(keep) + imports.filter(keep).map(qualifyImport)
+
+  // The imports every line gets WITHOUT asking, and that `/context` does not list and `/unimport`
+  // cannot remove — the REPL's equivalent of the console `println` writes to. Just the ambient
+  // `Stdio` provider (see `ReplStdio`), so `Out.println` prints as `println` does. Only in an
+  // EXPERIMENTAL compile: flame (like every Soundness library) is built with experimental language
+  // features, which mark its definitions `@experimental`, so a line compiled without the flag may
+  // not so much as import the provider — and could not name `Stdio` or `Out` either, so it loses
+  // nothing by going without.
+  private def ambientImports: List[Text] =
+    if experimentalCompile then List(t"import flame.ReplStdio.provider") else Nil
+
+  // Whether lines compile with `-experimental`: switched on with `/set experimental`, or always, in
+  // a seeded session (see `effectiveScalac`).
+  private def experimentalCompile: Boolean =
+    enabledSettings.has(t"experimental") || !prelude.seedTasty.nil
 
   // The two lines that render the value bound to `ref` and stash the rendering under `key` for
   // the outcome: an `@experimental` initializer (experimental mode is enabled just here, since
@@ -2063,7 +2204,7 @@ class Repl[version <: Scalac.Versions]
 
     // The scope this line sees, for typing the result and for checking name collisions.
     val context: List[Text] =
-      (prelude.imports.map(_.tt) + sessionImports) + historyImports
+      ambientImports + (prelude.imports.map(_.tt) + sessionImports) + historyImports
 
     // A definition or declaration can never be an expression: go STRAIGHT to the definition/statement
     // path, skipping the result-type probe and the try-as-expression compile — two whole compiler
@@ -2431,7 +2572,7 @@ class Repl[version <: Scalac.Versions]
     // The scope a compiled line would see: the prelude's and the user's persistent imports,
     // plus the prior wrapper objects' members and givens (as `import rs$line$N.{given, *}`).
     val context: List[Text] =
-      (prelude.imports.map(_.tt) + sessionImports) + historyImports
+      ambientImports + (prelude.imports.map(_.tt) + sessionImports) + historyImports
 
     // The full member list of `expr.`, compiled ONCE and cached under the base, so typing
     // further member characters (or backspacing) costs no recompilation. The base's type is

@@ -237,8 +237,13 @@ class Sessions[version <: Scalac.Versions]
        (encode(Repl.Reply.Failed(0, t"the request could not be parsed"))):
 
         case Repl.Request.Tokenize(id, code) =>
+          // The scope the line has opened so far is the one thing about a tokenize that depends on
+          // the session (its imports, history and classpath); a connection with no session yet — one
+          // is created lazily — has no scope to report.
+          val scope: List[Repl.ScopeBinding] = session(currentName).lay(Nil)(_.scopeAt(code))
+
           encode(Repl.Reply.Tokenized(id, Repl.tokenize(code), Repl.incomplete(code),
-              Repl.classify(code) == Repl.Verdict.Language))
+              Repl.classify(code) == Repl.Verdict.Language, scope))
 
         case Repl.Request.Submit(id, code) =>
           session(currentName).lay(encode(Repl.Reply.Failed(id, t"no active session"))): repl =>

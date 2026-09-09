@@ -169,6 +169,81 @@ object Tests extends Suite(m"Flame Tests"):
           case Repl.Outcome.Ran(_, _, output, _, _) => output.contains(t"Classpath (")
           case _                              => false
 
+      // The scope an UNFINISHED line has opened (see `ScopeInspector`): what its next statement
+      // would see. Rendered by name (where the user could write one) and type.
+      def scopeText(bindings: List[Repl.ScopeBinding]): Text =
+        bindings.map { b => t"${b.name.or(t"_")}: ${b.tpe}" }.join(t", ")
+
+      test(m"an unfinished `unsafely:` block reports the contextual values it has introduced"):
+        supervise:
+          val repl = Repl()
+          repl.react(0, t"import soundness.*")
+          scopeText(repl.scopeAt(t"unsafely:\n  "))
+      . assert { scope => scope.contains(t"Unsafe") && scope.contains(t"CanThrow[Exception]") }
+
+      test(m"an unfinished lambda reports its parameter by name and type"):
+        supervise:
+          Repl().scopeAt(t"scala.List(1, 2).map { x =>\n  ")
+      . assert:
+          case Repl.ScopeBinding(name, tpe, false) :: Nil => name == t"x" && tpe == t"Int"
+          case _                                          => false
+
+      test(m"nested scopes report the innermost block's contextual values first"):
+        supervise:
+          val repl = Repl()
+          repl.react(0, t"import soundness.*")
+          repl.scopeAt(t"unsafely:\n  safely:\n    ").map(_.tpe)
+      . assert { types => types.prim.let(_.contains(t"Diagnostics")).or(false) && types.exists(_.contains(t"Unsafe")) }
+
+      test(m"a block's own definitions are in scope for its next statement"):
+        supervise:
+          val repl = Repl()
+          repl.react(0, t"import soundness.*")
+          scopeText(repl.scopeAt(t"unsafely:\n  val n = 42\n  "))
+      . assert { scope => scope.contains(t"n: Int") && scope.contains(t"Unsafe") }
+
+      test(m"a complete single line opens no scope"):
+        supervise:
+          Repl().scopeAt(t"1 + 2")
+      . assert(_ == Nil)
+
+      // `Out.println` needs a `Stdio`; the REPL supplies one ambiently (see `ReplStdio`), writing
+      // to the run's captured stdout exactly as `println` does. Experimental mode, as any use of a
+      // Soundness definition needs.
+      test(m"Out.println prints without a Stdio import"):
+        supervise:
+          val repl = Repl()
+          repl.react(0, t"/set experimental")
+          repl.react(0, t"import soundness.*")
+          repl.interpret(t"Out.println(t\"ambient stdio\")")
+      . assert:
+          case Repl.Outcome.Ran(_, _, output, _, _) => output.contains(t"ambient stdio")
+          case _                                    => false
+
+      // The ambient one is a `Stdio.Provider`, found only when no `Stdio` is in lexical scope, so
+      // a user's own import is never ambiguous with it and simply takes over.
+      test(m"a user-imported Stdio takes precedence over the ambient one"):
+        supervise:
+          val repl = Repl()
+          repl.react(0, t"/set experimental")
+          repl.react(0, t"import soundness.*")
+          repl.react(1, t"import stdios.muteStdio")
+          repl.interpret(t"Out.println(t\"silenced\")")
+      . assert:
+          case Repl.Outcome.Ran(_, _, output, _, _) => !output.contains(t"silenced")
+          case _                                    => false
+
+      test(m"a user-defined Stdio on an earlier line takes precedence over the ambient one"):
+        supervise:
+          val repl = Repl()
+          repl.react(0, t"/set experimental")
+          repl.react(0, t"import soundness.*")
+          repl.react(1, t"given quiet: Stdio = stdios.muteStdio")
+          repl.interpret(t"Out.println(t\"silenced\")")
+      . assert:
+          case Repl.Outcome.Ran(_, _, output, _, _) => !output.contains(t"silenced")
+          case _                                    => false
+
       def diagnostics(reply: Repl.Reply): Text = reply match
         case r: Repl.Reply.Rejected => SemanticRender.stripAnsi(r.diagnostics)
         case _                      => t""
@@ -1032,6 +1107,27 @@ object Tests extends Suite(m"Flame Tests"):
       . assert:
           case Repl.Reply.Completed(_, items) => items.exists(_.name.contains(t"map"))
           case _                              => false
+
+      // A tokenize reply carries the scope the unfinished line has opened — computed on the
+      // connection's session (created by the first submission), so it sees that session's history.
+      test(m"a tokenize request reports the scope an unfinished line has opened"):
+        supervise:
+          val tcpPort = Port[Tcp]()
+          val service = Sessions().serve(tcpPort)
+          val socket  = jn.Socket("localhost", tcpPort.number)
+
+          try
+            exchange(socket, Repl.Request.Submit(1, t"val xs = scala.List(1, 2)"))
+            exchange(socket, Repl.Request.Tokenize(2, t"xs.map { y =>\n  "))
+          finally
+            socket.close()
+            service.stop()
+      . assert:
+          case Repl.Reply.Tokenized(2, _, true, false, Repl.ScopeBinding(name, tpe, false) :: Nil) =>
+            name == t"y" && tpe == t"Int"
+
+          case _ =>
+            false
 
     suite(m"REPL block captures outside references"):
       given Scalac[3.9, Universe.Classfile] = Scalac(Nil)
