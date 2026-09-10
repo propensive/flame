@@ -51,6 +51,7 @@ import dysasymptotics.linearSize
 
 import escapade.Faint
 import escapade.Italic
+import escapade.Underline
 import termcapDefinitions.xtermTrueColorTermcap
 import iridescence.WebColors
 // `soundness.*` also re-exports an unrelated `Signal` (embarcadero's workload-grant signal), so the
@@ -1419,6 +1420,11 @@ private def runRepl
       // transcript entry below is filed for the reader to fill when the real reply arrives.
       var asyncId: Optional[Int] = Unset
 
+      // The reply's highlight when it carries diagnostic marks (an error's or warning's span,
+      // underlined — see `Repl.mark`): the frozen box is repainted with it below, and it is kept
+      // for replay, so the underline survives a resize.
+      var marked: Optional[List[Repl.Token]] = Unset
+
       // The text shown below the box — the result, error, or command message. Captured (rather
       // than printed straight to `Out`) so the identical rendering is reused when the transcript
       // is replayed after a resize. It ends with a newline when non-empty, so the next inline
@@ -1471,7 +1477,26 @@ private def runRepl
               evaluating(sid)
 
             case reply =>
+              val highlight: List[Repl.Token] = reply match
+                case Repl.Reply.Rejected(_, _, tokens)      => tokens
+                case Repl.Reply.Ran(_, _, _, _, _, _, tokens) => tokens
+                case Repl.Reply.Threw(_, _, _, tokens)      => tokens
+                case _                                      => Nil
+
+              if highlight.exists(_.mark.present) then marked = highlight
               replyText(reply)
+
+      // Repaint the frozen box with the diagnostic's span underlined: the cursor sits on the row
+      // right after the box (`finish` left it there), so it is moved back up over the box's rows
+      // and border, and a static box — exactly as `replay` draws one — is painted in its place,
+      // dropping the cursor below it again before the result prints.
+      marked.let: tokens =>
+        val innerWidth: Int = (terminal.knownColumns - 4).max(1)
+        val boxRows: Int = LineEditor.cursorPosition(line, line.length, innerWidth)._1 + 1
+        Out.print(t"\e[${boxRows + 2}A\r")
+        val staticRoot = InlineRoot(terminal)
+        paint(staticRoot, replayBox(tokens, boxRows, naturalLanguage(line)))
+        staticRoot.finish()
 
       if result != t"" then Out.print(result)
 
@@ -1481,7 +1506,7 @@ private def runRepl
       // submission files its entry under `asyncId` so the out-of-band fill can update it in place (and
       // applies a fill that raced ahead of this point).
       if line != t"/clear" then
-        val entry = TranscriptEntry(line, tokens, result, asyncId.or(0), naturalLanguage(line))
+        val entry = TranscriptEntry(line, marked.or(tokens), result, asyncId.or(0), naturalLanguage(line))
         transcript += entry
 
         asyncId.let: sid =>
@@ -1870,11 +1895,20 @@ private def colourful(tokens: List[Repl.Token]): Teletype =
       // Invoked through the typeclass instance directly: `soundness.*` now also exports delicious's
       // `teletype` extension (on `SemanticMessage`), which shadows escapade's generic `.teletype`
       // extension for the `Teletypeable` instance here.
+      // A token inside a diagnostic's span (see `Repl.mark`) is UNDERLINED: an error's range in the
+      // error colour, a warning's keeping its own colour — so the frozen line shows exactly what the
+      // compiler pointed at.
+      val accent: Accent =
+        if token.mark.let(_ == Repl.errorMark).or(false) then Accent.Error else accentOf(token.accent)
+
       val coloured: Teletype =
         harlequin.syntaxHighlighting.tokenTeletypeable
-         . teletype(harlequin.Token(token.text, accentOf(token.accent)))
+         . teletype(harlequin.Token(token.text, accent))
 
-      if token.role.let(_ == t"binding").or(false) then e"$Italic($coloured)" else coloured
+      val styled: Teletype =
+        if token.role.let(_ == t"binding").or(false) then e"$Italic($coloured)" else coloured
+
+      if token.mark.present then e"$Underline($styled)" else styled
 
     . join
 

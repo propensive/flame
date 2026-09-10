@@ -1169,6 +1169,45 @@ object Tests extends Suite(m"Flame Tests"):
           case _ =>
             false
 
+      // A rejected line's highlight carries the error's span, mapped from the wrapped source back
+      // into the line's own coordinates (`Repl.userSpan`) and split into marked tokens
+      // (`Repl.mark`): here exactly the offending `"hello"`.
+      test(m"a type error's span is marked on the rejected line's tokens"):
+        supervise:
+          Repl().react(0, t"val n: Int = \"hello\"")
+      . assert:
+          case Repl.Reply.Rejected(_, _, tokens) =>
+            val marked = tokens.filter(_.mark.present)
+            marked.map(_.text).join == t"\"hello\"" && !marked.exists(_.mark != Repl.errorMark)
+
+          case _ =>
+            false
+
+      // A span on the SECOND line of a multi-line submission lands on that line's tokens.
+      test(m"a span on a later line of a multi-line submission is marked there"):
+        supervise:
+          Repl().react(0, t"def f: Int =\n  1 + \"x\"")
+      . assert:
+          case Repl.Reply.Rejected(_, _, tokens) =>
+            val marked = tokens.filter(_.mark.present).map(_.text).join
+            marked.contains(t"\"x\"") && !marked.contains(t"def")
+
+          case _ =>
+            false
+
+      // `userSpan` arithmetic: the first user line is shifted by the indent AND the binding prefix,
+      // later lines by the indent alone; a span before the body, or past it, is dropped.
+      test(m"userSpan maps wrapped coordinates back to the user's line"):
+        val body = 5
+        val onFirst  = Repl.userSpan(Span.area(Ordinal.zerary(5), Ordinal.zerary(2 + 8 + 3), Ordinal.zerary(5), Ordinal.zerary(2 + 8 + 7)), body, 2, 8, 2)
+        val onSecond = Repl.userSpan(Span.area(Ordinal.zerary(6), Ordinal.zerary(4), Ordinal.zerary(6), Ordinal.zerary(6)), body, 2, 8, 2)
+        val before   = Repl.userSpan(Span.area(Ordinal.zerary(1), Ordinal.zerary(0), Ordinal.zerary(1), Ordinal.zerary(3)), body, 2, 8, 2)
+        val after    = Repl.userSpan(Span.area(Ordinal.zerary(9), Ordinal.zerary(0), Ordinal.zerary(9), Ordinal.zerary(3)), body, 2, 8, 2)
+        ( onFirst.let(s => (s.startLine.let(_.n0), s.startColumn.let(_.n0), s.endColumn.let(_.n0))),
+          onSecond.let(s => (s.startLine.let(_.n0), s.startColumn.let(_.n0), s.endColumn.let(_.n0))),
+          before.present, after.present )
+      . assert(_ == ((0, 3, 7), (1, 2, 4), false, false))
+
       // A `HistoryEntry` — the record the client appends to `.pyrocosm/flame/history` for each
       // submitted prompt — round-trips through BinTEL (a bare `Text` will not encode at the top
       // level, so the line is wrapped in this struct).

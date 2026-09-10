@@ -65,7 +65,8 @@ import webserverErrorPages.minimalErrorPage
 // Messages exchanged with the browser as JSON over the WebSocket. Flat case classes (not
 // enums) so the JSON shape — `{"kind":…,"seq":…,…}` — is predictable for the JavaScript.
 case class WebRequest(kind: Text, seq: Int, code: Text, offset: Int)
-case class WebToken(text: Text, accent: Text, role: Text = t"")
+// `mark` is `error`/`warning` for a token inside a diagnostic's span (see `Repl.mark`), else empty.
+case class WebToken(text: Text, accent: Text, role: Text = t"", mark: Text = t"")
 case class WebCompletion(name: Text, kind: Text, signature: Text)
 // One binding the unfinished line has introduced (`Repl.ScopeBinding`); `name` is empty for a
 // synthetic context-function parameter, which is shown by type alone.
@@ -160,6 +161,10 @@ val replScript: Text = t"""
     // same syntax but clearly subordinate to the precise type it qualifies.
     ".widened { opacity: 0.55; }",
     ".tok-error { color: #f48771; text-decoration: underline; }",
+    // A token inside a diagnostic's span (`mark`): underlined in the diagnostic's colour, keeping
+    // its own syntax colour, so the log line shows exactly what the compiler pointed at.
+    ".mark-error { text-decoration: underline wavy #f48771; text-underline-offset: 2px; }",
+    ".mark-warning { text-decoration: underline wavy #e5c07b; text-underline-offset: 2px; }",
     ".tok-unparsed { color: #6a9955; }",
     // A `/`-command line is highlighted specially (see `makeSpans`): the command word in gold, and its
     // parameters in a fainter, more-yellow colour so they recede behind the command.
@@ -330,7 +335,8 @@ val replScript: Text = t"""
       if (slash) span.className = (sp !== -1 && off >= sp) ? "tok-command-param" : "tok-command";
       // The accent is the colour class; a term/type token's role (binding/usage) is a second
       // class, so the stylesheet can e.g. italicise .binding on top of the accent's colour.
-      else span.className = "tok-" + tokens[i].accent + (tokens[i].role ? " " + tokens[i].role : "");
+      else span.className = "tok-" + tokens[i].accent + (tokens[i].role ? " " + tokens[i].role : "")
+        + (tokens[i].mark ? " mark-" + tokens[i].mark : "");
       span.textContent = tokens[i].text;
       parent.appendChild(span);
       off += tokens[i].text.length;
@@ -367,6 +373,17 @@ val replScript: Text = t"""
       tpe.textContent = b.tpe;
       scopeRow.appendChild(tpe);
     }
+  }
+
+  // Rebuilds the log line submitted as `seq` from `tokens` when any of them carries a diagnostic
+  // mark (an error's or warning's span), so the offending range shows underlined in the line
+  // itself; the prompt is kept and the cloned editor spans replaced.
+  function remarkLine(seq, tokens) {
+    if (!tokens || !tokens.some(function(t) { return t.mark; })) return;
+    var line = log.querySelector('[data-line="' + seq + '"]');
+    if (!line) return;
+    while (line.childNodes.length > 1) line.removeChild(line.lastChild);
+    makeSpans(line, tokens);
   }
 
   function highlight(tokens) {
@@ -458,7 +475,9 @@ val replScript: Text = t"""
       history.push({ html: editor.innerHTML, text: code });
     histIdx = history.length;
     draft = "";
-    send("submit", code);
+    // Tag the log line with the submission's seq, so a reply whose tokens carry diagnostic marks
+    // can rebuild it with the offending span underlined (see `remarkLine`).
+    line.setAttribute("data-line", send("submit", code));
     editor.innerHTML = "";
     setGhost("");
     prevText = "";
@@ -788,6 +807,7 @@ val replScript: Text = t"""
       return;
     }
     if (msg.kind === "async") {
+      remarkLine(msg.seq, msg.tokens);
       var target = log.querySelector('[data-id="' + msg.seq + '"]');
       if (!target) { target = document.createElement("div"); log.appendChild(target); }
       target.removeAttribute("data-id");
@@ -796,7 +816,9 @@ val replScript: Text = t"""
       log.scrollIntoView(false);
       return;
     }
-    // A normal (synchronous) result or error: one block rendered by the shared helper.
+    // A normal (synchronous) result or error: one block rendered by the shared helper — after the
+    // submitted line is re-marked with any diagnostic span.
+    remarkLine(msg.seq, msg.tokens);
     var block = document.createElement("div");
     fillResult(block, msg);
     log.appendChild(block);
@@ -859,7 +881,7 @@ class ReplPage() extends Archetype:
     Fragment[Flow](H1(t"Flame REPL"), Pre(), Code(), Script(replScript))
 
 private def webTokens(tokens: List[Repl.Token]): List[WebToken] =
-  tokens.map { token => WebToken(token.text, token.accent, token.role.or(t"")) }
+  tokens.map { token => WebToken(token.text, token.accent, token.role.or(t""), token.mark.or(t"")) }
 
 private def webCompletions(items: List[Repl.CompletionItem]): List[WebCompletion] =
   items.map { item => WebCompletion(item.name, item.kind, item.signature) }

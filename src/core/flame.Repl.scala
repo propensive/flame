@@ -88,6 +88,12 @@ object Repl:
     class Standard() extends Layout:
       def objectName(index: Int): Text = t"rs$$line$$$index"
 
+      // Where the user's text sits in the wrapped source (see `wrap`): the file-scope imports,
+      // the `object` header line, then the history imports precede it, and every line of it is
+      // indented by two columns. `compile` uses these to map diagnostics back to the user's line.
+      def bodyLine(history: List[Text], imports: List[Text]): Int = imports.size + 1 + history.size
+      def indent: Int = 2
+
       def wrap(index: Int, history: List[Text], imports: List[Text], code: Text): Text =
         // The lambda parameters are annotated: `map` now goes through murmuration's `Mappable`, whose
         // element type is not yet fixed when gossamer's interpolator macro runs — leaving it to
@@ -108,6 +114,8 @@ object Repl:
 
   trait Layout:
     def objectName(index: Int): Text
+    def bodyLine(history: List[Text], imports: List[Text]): Int
+    def indent: Int
 
     // `history` holds fully-rendered import statements (one per prior wrapper object), not
     // object names: the session renders them itself so it can exclude shadowed members.
@@ -156,7 +164,98 @@ object Repl:
   // a term or type (a styling policy may e.g. italicise bindings); `tpe` is the token's
   // fully-qualified Scala type, where the typechecker resolved one. ANSI/CSS rendering is the
   // front-end's concern.
-  case class Token(text: Text, accent: Text, tpe: Optional[Text], role: Optional[Text] = Unset)
+  // `mark` flags a token that lies inside a diagnostic's span — `error` or `warning` — so the
+  // front-end can underline the offending range in the submitted line (see `mark`).
+  case class Token(text: Text, accent: Text, tpe: Optional[Text], role: Optional[Text] = Unset,
+                   mark: Optional[Text] = Unset)
+
+  val errorMark:   Text = t"error"
+  val warningMark: Text = t"warning"
+
+  // Maps a diagnostic's `span` — in the WRAPPED source's 0-based coordinates — back into the user's
+  // line: `bodyLine` is the wrapped line the user's first line sits on, `indent` the columns every
+  // user line is shifted right by, `prefix` the extra columns on the FIRST line only (a
+  // `final val x = ` binding prefix), and `userLines` how many lines the user typed. `Unset` when
+  // the span falls outside the user's text (in the imports, or on a generated line after it); a
+  // span running past the last user line is clipped to it.
+  def userSpan(span: Span, bodyLine: Int, indent: Int, prefix: Int, userLines: Int)
+  :   Optional[Span] =
+
+    val start: Int = span.startLine.let(_.n0 - bodyLine).or(-1)
+    val end:   Int = span.endLine.let(_.n0 - bodyLine).or(-1)
+
+    if start < 0 || start >= userLines || end < start then Unset else
+      def column(column: Optional[Ordinal], line: Int): Int =
+        (column.let(_.n0).or(0) - indent - (if line == 0 then prefix else 0)).max(0)
+
+      val endLine:   Int = end.min(userLines - 1)
+      val endColumn: Int = if end > userLines - 1 then 0x3fff else column(span.endColumn, endLine)
+
+      Span.area
+       ( Ordinal.zerary(start), Ordinal.zerary(column(span.startColumn, start)),
+         Ordinal.zerary(endLine), Ordinal.zerary(endColumn) )
+
+  // Splits `tokens` (the user's line, in its own coordinates) at the boundaries of every notice's
+  // span and marks the pieces inside one — `error` outranking `warning` where they overlap — so a
+  // front-end can underline exactly the range the compiler pointed at. Tokens are walked with a
+  // running line/column; the newline tokens `project` inserts advance the line. A zero-width span
+  // (a diagnostic at a point) marks the single character at that point, so it still shows.
+  def mark(tokens: List[Token], notices: List[Notice]): List[Token] =
+    val spans: sci.List[(Span, Int)] = notices.stdlib.flatMap: (notice: Notice) =>
+      val level: Int = notice.importance match
+        case Importance.Error   => 2
+        case Importance.Warning => 1
+        case _                  => 0
+
+      if level == 0 then sci.Nil
+      else notice.span.lay(sci.Nil) { (span: Span) => sci.List((span, level)) }
+
+    if spans.isEmpty then tokens else
+      val out: scm.ArrayBuffer[Token] = scm.ArrayBuffer()
+      var line: Int = 0
+      var col:  Int = 0
+
+      tokens.each: (token: Token) =>
+        val text: String = token.text.s
+
+        if text.contains("\n") then
+          out += token
+          line += text.count(_ == '\n')
+          col = text.length - text.lastIndexOf('\n') - 1
+        else
+          val length: Int = text.length
+          val marks: scala.Array[Int] = new scala.Array[Int](length)
+
+          spans.foreach: (span, level) =>
+            val startLine: Int = span.startLine.let(_.n0).or(-1)
+            val endLine:   Int = span.endLine.let(_.n0).or(-1)
+
+            if line >= startLine && line <= endLine then
+              val startColumn: Int = span.startColumn.let(_.n0).or(0)
+              val endColumn:   Int = span.endColumn.let(_.n0).or(Int.MaxValue)
+              val from:  Int = (if line == startLine then startColumn - col else 0).max(0)
+              val until0: Int = (if line == endLine then endColumn - col else length).min(length)
+              val until: Int = if until0 <= from && startLine == endLine && startColumn == endColumn then (from + 1).min(length) else until0
+              var i: Int = from
+              while i < until do
+                if marks(i) < level then marks(i) = level
+                i += 1
+
+          var start: Int = 0
+          while start < length do
+            var end: Int = start
+            while end < length && marks(end) == marks(start) do end += 1
+            val piece: Text = text.substring(start, end).nn.tt
+            val mark: Optional[Text] = marks(start) match
+              case 2 => errorMark
+              case 1 => warningMark
+              case _ => Unset
+            out += token.copy(text = piece, mark = mark)
+            start = end
+
+          col += length
+
+      List.from(out)
 
   // One tab-completion candidate. The Harlequin `Completion`'s `Syntax` signature is rendered
   // to text here so the reply serializes simply.
@@ -1955,13 +2054,38 @@ class Repl[version <: Scalac.Versions]
   // loads it (running its body) — off the mutex. `rendered` is evaluated after a successful run to
   // supply the `Outcome.Ran` value — `Unset` for statements, or the inspected result for an
   // expression line. `onOutput` receives each chunk of the run's stdout as it appears (async mode).
-  private def compile(imports: List[Text], code: Text, onOutput: Text => Unit)(rendered: => Optional[Text])
+  private def compile(imports: List[Text], code: Text, onOutput: Text => Unit, origin: Optional[Text] = Unset)
+      (rendered: => Optional[Text])
       (using Monitor, System, Probate)
   :   (Built^{onOutput, rendered}) logs CompileEvent raises Compiler.Error raises Async.Error =
 
     val name:    Text = layout.objectName(index)
-    val source:  Text = layout.wrap(index, historyImports, imports, code)
-    val (outcome, notices) = warmCompile(Map(t"$name.scala" -> source))
+    val imported: List[Text] = historyImports
+    val source:  Text = layout.wrap(index, imported, imports, code)
+    val (outcome, raw) = warmCompile(Map(t"$name.scala" -> source))
+
+    // Every notice's span is rewritten into the USER's coordinates (`Repl.userSpan`), or dropped
+    // when it lies outside the user's text, so the front-ends can underline it in the submitted
+    // line. `origin` is the line as the user typed it; `code` embeds it — verbatim on every line
+    // but the first, which a binding prefix (`final val x = `) may precede, measured here as
+    // whatever the first line of `code` has in front of the first line of `origin`. A `code` that
+    // does not embed `origin` that way (a probe) yields no positions.
+    val typed: Text = origin.or(code)
+    val userLines: Int = typed.cut(t"\n").size
+    val firstCode: Text = code.cut(t"\n").prim.or(t"")
+    val firstUser: Text = typed.cut(t"\n").prim.or(t"")
+
+    val prefix: Optional[Int] =
+      if firstCode.ends(firstUser) then firstCode.length - firstUser.length else Unset
+
+    val notices: List[Notice] = raw.map: (notice: Notice) =>
+      val mapped: Optional[Span] =
+        if notice.file != t"$name.scala" then Unset
+        else prefix.let: (prefix: Int) =>
+          notice.span.let: (span: Span) =>
+            Repl.userSpan(span, layout.bodyLine(imported, imports), layout.indent, prefix, userLines)
+
+      notice.copy(span = mapped)
 
     outcome match
       case CompileResult.Crash(trace) =>
@@ -2285,7 +2409,7 @@ class Repl[version <: Scalac.Versions]
     // (`echoCode`) rather than re-bound.
     val code: Text = if echo then echoCode(name, key, line) else expressionCode(name, key, line)
 
-    val expression: Built^{onOutput} = compile(contextImports(line), code, onOutput):
+    val expression: Built^{onOutput} = compile(contextImports(line), code, onOutput, line):
       Optional(ReplBridge.fetch[String](session, key.s)).let(_.tt)
 
     expression match
@@ -2335,7 +2459,7 @@ class Repl[version <: Scalac.Versions]
       val inspectedLines: List[Text] = line :: renderInto(bound, key)
       val inspected: Text = inspectedLines.join(t"\n")
 
-      mapRan(compile(contextImports(line), inspected, onOutput):
+      mapRan(compile(contextImports(line), inspected, onOutput, line):
           Optional(ReplBridge.fetch[String](session, key.s)).let(_.tt)):
         ran => ran.copy(name = bound, tpe = tpe)
 
@@ -2675,10 +2799,12 @@ class Repl[version <: Scalac.Versions]
       case Outcome.Ran(notices, value, output, name, tpe) =>
         // `evaluate` has already chosen the binding name/type and suppressed the value of a bare
         // `Unit` EXPRESSION (a `Unit` `val`/`var` definition keeps its binding, so it still shows).
-        Repl.Reply.Ran(id, value, output, tpe, name, renderDiagnostics(notices), tokens)
+        // The tokens carry the spans of any warnings, for the front-end to underline.
+        Repl.Reply.Ran(id, value, output, tpe, name, renderDiagnostics(notices), Repl.mark(tokens, notices))
 
       case Outcome.Rejected(notices) =>
-        Repl.Reply.Rejected(id, renderDiagnostics(notices), tokens)
+        // The tokens carry the errors' spans, mapped into the line's own coordinates by `compile`.
+        Repl.Reply.Rejected(id, renderDiagnostics(notices), Repl.mark(tokens, notices))
 
       case Outcome.Threw(_, error, output) =>
         // Render the exception's (trimmed) stack trace as a coloured teletype listing, rather than
