@@ -1447,6 +1447,17 @@ class Repl[version <: Scalac.Versions]
   @scala.caps.unsafe.untrackedCaptures
   private var importsCache: Optional[(List[Text], stenography.Imports)] = Unset
 
+  // Serialises EVERY use of the reifier: its construction, the export resolution that builds
+  // `semanticImports`, and the unpickling of a diagnostic's types (`SemanticRender.render`). The
+  // reifier holds ONE dotc context, and dotc's symbol table is single-threaded — yet the socket
+  // server handles each request in its own strand, so a submission's diagnostic rendering and a
+  // completion's signature rendering (both of which build `semanticImports` on first use, outside the
+  // compiler mutex) could enter the reifier at once. They did: two threads completing the same package
+  // scope concurrently corrupted a scope's hash chain, and a `lookupEntry` then walked it forever —
+  // a session that "hung on `Out`" with a thread at 100% CPU allocating nothing. The monitor is
+  // reentrant, so `renderDiagnostics` may take it and then call `semanticImports`.
+  private val reifierLock: AnyRef = new AnyRef()
+
   @scala.caps.unsafe.untrackedCaptures
   private var index:   Int        = 0
   @scala.caps.unsafe.untrackedCaptures
@@ -1594,10 +1605,11 @@ class Repl[version <: Scalac.Versions]
   // The shared reifier for semantic diagnostics, built lazily against the current classpath (its
   // types resolve there). `reifierCache` is cleared by `/classload`, so the next diagnostic rebuilds
   // it with the enlarged classpath.
-  private def semanticReifier(using System): delicious.Reifier = reifierCache.or:
-    val created = delicious.Reifier(classpath)
-    reifierCache = created
-    created
+  private def semanticReifier(using System): delicious.Reifier = reifierLock.synchronized:
+    reifierCache.or:
+      val created = delicious.Reifier(classpath)
+      reifierCache = created
+      created
 
   // The stenography `Imports` a rendered type is abbreviated against — so a type in an error message
   // reads the way the user would WRITE it (`Int`, not `scala.Int`; `ListBuffer`, not
@@ -1613,7 +1625,7 @@ class Repl[version <: Scalac.Versions]
   // names is `jacinta.Json`, which no `soundness` prefix shortens. The reifier resolves the exports of
   // every wildcard scope against the session classpath (`Reifier#imports`, Soundness #1959), adding
   // each export's target to `direct`, so `Json` reads as `Json` under `import soundness.*` too.
-  private def semanticImports(using System): stenography.Imports =
+  private def semanticImports(using System): stenography.Imports = reifierLock.synchronized:
     val key: List[Text] = (prelude.imports.map(_.tt) + imports) + history :+ layout.objectName(index)
 
     def rebuild: stenography.Imports =
@@ -1630,6 +1642,14 @@ class Repl[version <: Scalac.Versions]
     // `Set` — the seam is explicit since `scala` left `-Yimports`.
     var designators: sci.Set[Designator] = sci.Set()
     var direct:      sci.Set[Designator] = sci.Set()
+
+    // The scopes whose `export`s are resolved through the reifier: ONLY the user's (and the
+    // prelude's) wildcard imports, one plain designator per prefix. The compiler's implicit imports
+    // (`scala`, `java.lang`, …) and the empty-package wrappers export nothing worth finding, and
+    // resolving them means completing every class in those packages from the classpath — and every
+    // node-shape variant seeded into `designators` for matching would have resolved the same package
+    // again. `exports` builds its lookup path from the names alone, so one shape is enough.
+    var exportable:  sci.Set[Designator] = sci.Set()
 
     // A `Designator` node is either a TERM (an object or a package) or a TYPE (a class or a trait), and
     // `has` is an exact match — but a prefix's TEXT does not say which shape each of its nodes takes,
@@ -1695,17 +1715,26 @@ class Repl[version <: Scalac.Versions]
 
     (prelude.imports.map(_.tt) + imports).each: (statement: Text) =>
       val body: Text = statement.trim.skip(t"import ".length).trim
-      if body.ends(t".*") then wildcard(body.chomp(t".*", Rtl))
+      if body.ends(t".*") then
+        val prefix: Text = body.chomp(t".*", Rtl)
+        wildcard(prefix)
+        exportable += Designator(prefix)
       else if body.contains(t"{") then
         val prefix: Text = body.cut(t"{").stdlib.head.trim.chomp(t".", Rtl)
         body.cut(t"{").stdlib.last.cut(t"}").stdlib.head.cut(t",").map(_.trim).filter(_ != t"").each: selector =>
-          if selector == t"*" || selector == t"given" then wildcard(prefix)
+          if selector == t"*" || selector == t"given" then
+            wildcard(prefix)
+            exportable += Designator(prefix)
           else
             val name: Text = selector.cut(t"=>").stdlib.head.trim  // a renamed import (`Foo => Bar`) keeps `Foo`
             if name != t"" then directType(t"$prefix.$name")
       else directType(body)
 
-    semanticReifier.imports(designators, direct)
+    // Resolve the exports of the user's wildcard scopes (extending `direct` with each export's
+    // target), keeping the full `designators` set for prefix matching. No wildcard imports, no
+    // reifier at all.
+    if exportable.isEmpty then stenography.Imports(designators, direct)
+    else stenography.Imports(designators, semanticReifier.imports(exportable, direct).direct)
 
   // Renders a resolved type for DISPLAY (a result line's `: type`, a `def`'s return type), abbreviated
   // against the session's imports so it reads as the user wrote it — the same abbreviation the
@@ -1730,16 +1759,15 @@ class Repl[version <: Scalac.Versions]
   // it (`Reifier#imports`, Soundness #1959), which extends the direct imports with the targets of the
   // `export` aliases in every wildcard-imported scope, so a type reached through a prelude's export
   // (`jacinta.Json` under `import soundness.*`) renders by its leaf name, as the user would write it.
-  private def renderDiagnostics(notices: List[Notice])(using System): Text =
+  private def renderDiagnostics(notices: List[Notice])(using System): Text = reifierLock.synchronized:
     if notices.nil then t"" else
       val reifier: Optional[delicious.Reifier] =
         if notices.exists { (notice: Notice) => notice.markup.present } then semanticReifier
         else Unset
 
-      val imports: stenography.Imports = semanticImports
-
-      given stenography.Imports =
-        reifier.lay(imports) { (reifier: delicious.Reifier) => reifier.imports(imports.designators, imports.direct) }
+      // `semanticImports` has already resolved the wildcard scopes' exports (it used to be resolved
+      // AGAIN here, for every designator, on every diagnostic).
+      given stenography.Imports = semanticImports
 
       SemanticRender.render(notices, reifier, render == Repl.Rendering.Html)
 

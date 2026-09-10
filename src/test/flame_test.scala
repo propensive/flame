@@ -1169,6 +1169,29 @@ object Tests extends Suite(m"Flame Tests"):
           case _ =>
             false
 
+      // The reifier (one dotc context) is shared by a submission's diagnostic rendering and a
+      // completion's signature rendering, which the socket server runs concurrently. Unserialised,
+      // two first-time `semanticImports` builds corrupted a package scope and one thread looped
+      // forever: this drives both at once, repeatedly, and must return.
+      test(m"a concurrent completion and diagnostic on one session both return"):
+        supervise:
+          val repl = Repl()
+          repl.react(0, t"import soundness.*")
+          var stuck: Boolean = false
+
+          (1 to 3).each: round =>
+            val complete: Runnable = caps.unsafe.unsafeAssumePure(() => { repl.completionsAt(t"List(1, 2, 3).m", 14); () })
+            val submit:   Runnable = caps.unsafe.unsafeAssumePure(() => { repl.react(round, t"val n: Int = \"hello\""); () })
+            val completing = new Thread(complete)
+            val submitting = new Thread(submit)
+            completing.setDaemon(true); submitting.setDaemon(true)
+            completing.start(); submitting.start()
+            completing.join(120000L); submitting.join(120000L)
+            if completing.isAlive || submitting.isAlive then stuck = true
+
+          !stuck
+      . assert(_ == true)
+
       // A rejected line's highlight carries the error's span, mapped from the wrapped source back
       // into the line's own coordinates (`Repl.userSpan`) and split into marked tokens
       // (`Repl.mark`): here exactly the offending `"hello"`.
