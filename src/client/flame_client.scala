@@ -53,6 +53,7 @@ import escapade.Faint
 import escapade.Italic
 import escapade.Underline
 import termcapDefinitions.xtermTrueColorTermcap
+import textMetrics.wideCharacterWidthMetric
 import iridescence.WebColors
 // `soundness.*` also re-exports an unrelated `Signal` (embarcadero's workload-grant signal), so the
 // POSIX terminal signal type (whose `.Int` is SIGINT) is named explicitly to resolve the clash. It
@@ -901,16 +902,18 @@ private def runRepl
   // `Redraw`, which replays the transcript with the filled result in the placeholder's position.
   val asyncPending: TrieMap[Int, Unit]            = TrieMap()
   val asyncEntries: TrieMap[Int, TranscriptEntry] = TrieMap()
-  val asyncResults: TrieMap[Int, Text]            = TrieMap()
-  // Stdout streamed (async mode) for an in-flight submission, accumulated as `Output` chunks arrive so
-  // it shows live under the "evaluating" panel; only the (single) reader appends, so `Text` is safe.
-  val asyncOutput:  TrieMap[Int, Text]            = TrieMap()
+  val asyncResults: TrieMap[Int, Repl.Reply]      = TrieMap()
+  // Output streamed (async mode) for an in-flight submission, accumulated as raw (stream, chunk)
+  // pairs as `Output` chunks arrive, and rendered — wrapped and guttered at the CURRENT width —
+  // whenever the live panel is drawn; only the (single) reader appends.
+  val asyncOutput:  TrieMap[Int, sci.List[(Text, Text)]] = TrieMap()
   @volatile var asyncReplay: Boolean              = false
 
-  // The live display for a still-running async submission: its stdout streamed so far, then a faint
+  // The live display for a still-running async submission: its output streamed so far, then a faint
   // "evaluating" line. Replaced by the full result once the final reply arrives.
   def evaluating(id: Int): Text =
-    t"${asyncOutput.getOrElse(id, t"")}\e[2m⋯ evaluating…\e[22m\n"
+    val (output, spans) = assembleChunks(asyncOutput.getOrElse(id, sci.Nil))
+    t"${gutteredOutput(output, spans, terminal.knownColumns)}\e[2m⋯ evaluating…\e[22m\n"
 
   // What Enter does depends on how much has been typed:
   //  - a SINGLE line submits as soon as it is a COMPLETE (not incomplete-prefix) statement or
@@ -1002,8 +1005,7 @@ private def runRepl
           // recorded, refresh its live display and replay so the output appears as it is produced. (If
           // the entry isn't recorded yet, the submit loop applies the accumulated output when it files it.)
           case Repl.Reply.Output(id, chunk, stream) =>
-            val sofar: Text = asyncOutput.getOrElse(id, t"")
-            asyncOutput(id) = sofar + guttered(chunk, stream, sofar == t"" || sofar.ends(t"\n"))
+            asyncOutput(id) = asyncOutput.getOrElse(id, sci.Nil) :+ ((stream, chunk))
 
             asyncEntries.get(id).foreach: entry =>
               entry.result = evaluating(id)
@@ -1016,11 +1018,12 @@ private def runRepl
             val id = replyId(reply)
             asyncPending.remove(id)
             asyncOutput.remove(id)
-            val text = replyText(reply)
 
             asyncEntries.remove(id) match
-              case Some(entry) => entry.result = text
-              case None        => asyncResults(id) = text
+              case Some(entry) =>
+                entry.reply = reply
+                entry.result = replyText(reply, terminal.knownColumns)
+              case None => asyncResults(id) = reply
 
             asyncReplay = true
             terminal.events.put(Terminal.Info.Redraw)
@@ -1063,7 +1066,7 @@ private def runRepl
   // not be established.
   if earlyExit.absent then initial.each: command =>
     duplex.send(zephyrine.Stream(framed(encode(Repl.Request.Submit(nextId.getAndIncrement, command)))))
-    safely(submits.take().nn).let { reply => Out.print(replyText(reply)) }
+    safely(submits.take().nn).let { reply => Out.print(replyText(reply, terminal.knownColumns)) }
 
   val events = terminal.eventIterator()
   // A failed `--join`/`--create` leaves nothing to edit: skip straight past the loop to the exit.
@@ -1110,7 +1113,10 @@ private def runRepl
       val staticRoot = InlineRoot(terminal)
       paint(staticRoot, replayBox(entry.tokens, rows, entry.language))
       staticRoot.finish()
-      if entry.result != t"" then Out.print(entry.result)
+      // A reply re-renders at the current width (its captured output re-wraps, gutter on every row);
+      // anything else — a command's message, a live async panel — reprints as it was.
+      val result: Text = entry.reply.let { (reply: Repl.Reply) => replyText(reply, terminal.knownColumns) }.or(entry.result)
+      if result != t"" then Out.print(result)
 
   // Shell-style command history, like the web front-end: Up/Down cycle through submitted
   // lines. `histIdx == history.length` is the current draft; the draft is saved on the first
@@ -1464,6 +1470,10 @@ private def runRepl
       // for replay, so the underline survives a resize.
       var marked: Optional[List[Repl.Token]] = Unset
 
+      // The reply itself, kept on the transcript entry so a replay after a resize can re-render it —
+      // re-wrapping its captured output to the new width — rather than reprint the old rendering.
+      var answered: Optional[Repl.Reply] = Unset
+
       // The text shown below the box — the result, error, or command message. Captured (rather
       // than printed straight to `Out`) so the identical rendering is reused when the transcript
       // is replayed after a resize. It ends with a newline when non-empty, so the next inline
@@ -1523,7 +1533,8 @@ private def runRepl
                 case _                                      => Nil
 
               if highlight.exists(_.mark.present) then marked = highlight
-              replyText(reply)
+              answered = reply
+              replyText(reply, terminal.knownColumns)
 
       // Repaint the frozen box with the diagnostic's span underlined: the cursor sits on the row
       // right after the box (`finish` left it there), so it is moved back up over the box's rows
@@ -1546,13 +1557,15 @@ private def runRepl
       // applies a fill that raced ahead of this point).
       if line != t"/clear" then
         val entry = TranscriptEntry(line, marked.or(tokens), result, asyncId.or(0), naturalLanguage(line))
+        entry.reply = answered
         transcript += entry
 
         asyncId.let: sid =>
           asyncResults.remove(sid) match
-            case Some(text) =>
+            case Some(reply) =>
               // The final reply already arrived — apply it; no need to register for streaming.
-              entry.result = text
+              entry.reply = reply
+              entry.result = replyText(reply, terminal.knownColumns)
               asyncReplay = true
               terminal.events.put(Terminal.Info.Redraw)
 
@@ -1627,7 +1640,11 @@ private def replPane
 // async fill (arriving out-of-band after a `Pending` placeholder) can update the result in place; `id`
 // is 0 for synchronous entries, which never need locating.
 private case class TranscriptEntry
-   (text: Text, tokens: List[Repl.Token], var result: Text, id: Int = 0, language: Boolean = false)
+   (text: Text, tokens: List[Repl.Token], var result: Text, id: Int = 0, language: Boolean = false):
+  // The reply `result` was rendered from, when it was one (not a command message or a live async
+  // panel), so a replay can re-render it at the current width.
+  @scala.caps.unsafe.untrackedCaptures
+  var reply: Optional[Repl.Reply] = Unset
 
 // A static (non-interactive) editor box for transcript replay: the same rounded border and
 // 1-column inner padding as `replPane`'s box, showing the highlighted line, but with no caret,
@@ -1691,24 +1708,67 @@ private val stderrGutter: Text = t"\e[38;2;225;95;95m░\e[39m "
 private def gutter(stream: Text): Text =
   if stream == Repl.stderrStream then stderrGutter else stdoutGutter
 
-// `text` (a streamed chunk of `stream`) with a gutter before each line it begins: `atLineStart`
-// says whether the chunk itself opens a line, and later lines within it always do.
-private def guttered(text: Text, stream: Text, atLineStart: Boolean): Text =
-  val builder: jl.StringBuilder = jl.StringBuilder()
-  var lineStart: Boolean = atLineStart
+// The gutter's own width in columns (`░` and a space).
+private val gutterWidth: Int = 2
 
-  text.s.foreach: char =>
-    if lineStart && char != '\n' then builder.append(gutter(stream).s)
-    builder.append(char)
-    lineStart = char == '\n'
+// `line` (one logical line, possibly carrying ANSI escapes) broken into the visual rows it occupies
+// at `width` columns, so each can be given a gutter. Measured as the terminal draws it: grapheme by
+// grapheme (`Writing(…).boundaries`), each grapheme's cell width from hieroglyph's terminal metric —
+// exactly as `LineEditor.cursorPosition` lays the editor out — so a wide (East Asian) character
+// counts two columns and a combining sequence one; an escape sequence takes none and is copied
+// through with the row it falls in.
+private def visualRows(line: String, width: Int): sci.List[String] =
+  val metric: Grapheme is Measurable = summon[Grapheme is Measurable]
+  val rows: scm.ArrayBuffer[String] = scm.ArrayBuffer()
+  val row: jl.StringBuilder = jl.StringBuilder()
+  var columns: Int = 0
+  var i: Int = 0
 
-  builder.toString.tt
+  while i < line.length do
+    if line.charAt(i) == '\u001b' && i + 1 < line.length && line.charAt(i + 1) == '[' then
+      // A CSI sequence: copy it through to its final byte, occupying no columns.
+      var j: Int = i + 2
+      while j < line.length && (line.charAt(j) < '@' || line.charAt(j) > '~') do j += 1
+      val end: Int = (j + 1).min(line.length)
+      row.append(line, i, end)
+      i = end
+    else
+      // A visible run, up to the next escape: measured and broken grapheme by grapheme.
+      var j: Int = i
+      while j < line.length && line.charAt(j) != '\u001b' do j += 1
+      val run: String = line.substring(i, j).nn
+      val boundaries = Writing(run.tt).boundaries
+      var index: Int = 0
 
-// `output` with a gutter before every line that lies within a captured run (`spans`, by offset),
-// coloured for that run's stream; lines outside every run are left as they are.
-private def gutteredOutput(output: Text, spans: List[Repl.OutputSpan]): Text =
+      while index < boundaries.length - 1 do
+        val start: Int = boundaries.readUnchecked(index)
+        val end:   Int = boundaries.readUnchecked(index + 1)
+        val grapheme: String = run.substring(start, end).nn
+        val cellWidth: Int = metric.width(Grapheme(grapheme))
+
+        if columns > 0 && columns + cellWidth > width then
+          rows += row.toString
+          row.setLength(0)
+          columns = 0
+
+        row.append(grapheme)
+        columns += cellWidth
+        index += 1
+
+      i = j
+
+  rows += row.toString
+  rows.toList
+
+// `output` with a gutter opening every visual row of every line that lies within a captured run
+// (`spans`, by offset), coloured for that run's stream — including the continuation rows of a line
+// longer than the terminal, which is why the width matters: the text is wrapped here, `gutterWidth`
+// short of `columns`, rather than left for the terminal to wrap gutterless. Lines outside every run
+// (an engine message) are left as they are; with no known width nothing is wrapped.
+private def gutteredOutput(output: Text, spans: List[Repl.OutputSpan], columns: Optional[Int]): Text =
   val builder: jl.StringBuilder = jl.StringBuilder()
   val text: String = output.s
+  val width: Optional[Int] = columns.let { (each: Int) => (each - gutterWidth).max(1) }
   var offset: Int = 0
 
   while offset <= text.length do
@@ -1720,14 +1780,38 @@ private def gutteredOutput(output: Text, spans: List[Repl.OutputSpan]): Text =
     val covering: Optional[Repl.OutputSpan] =
       spans.seek { (span: Repl.OutputSpan) => span.start <= offset && offset < span.start + span.length }
 
-    if line.nonEmpty then covering.let { (span: Repl.OutputSpan) => builder.append(gutter(span.stream).s) }
-    builder.append(line)
+    covering match
+      case span: Repl.OutputSpan if line.nonEmpty =>
+        val rows: sci.List[String] = width.lay(sci.List(line)) { (each: Int) => visualRows(line, each) }
+        rows.zipWithIndex.foreach: (row, index) =>
+          if index > 0 then builder.append('\n')
+          builder.append(gutter(span.stream).s).nn.append(row)
+
+      case _ =>
+        builder.append(line)
+
     if newline >= 0 then builder.append('\n')
     offset = end + 1
 
   builder.toString.tt
 
-private def replyText(reply: Repl.Reply): Text = reply match
+// The plain text and spans of a sequence of streamed (stream, chunk) pairs, as `gutteredOutput`
+// takes them — a chunk may end mid-line, so the chunks are joined first and wrapped as a whole.
+private def assembleChunks(chunks: sci.List[(Text, Text)]): (Text, List[Repl.OutputSpan]) =
+  val builder: jl.StringBuilder = jl.StringBuilder()
+  val spans: scm.ArrayBuffer[Repl.OutputSpan] = scm.ArrayBuffer()
+
+  chunks.foreach: (stream, text) =>
+    if text.length > 0 then
+      spans += Repl.OutputSpan(stream, builder.length, text.length)
+      builder.append(text.s)
+
+  val assembled: List[Repl.OutputSpan] = List.from(spans.toList)
+  (builder.toString.tt, assembled)
+
+// `columns` is the terminal's width, for wrapping captured output with a gutter on every row (see
+// `gutteredOutput`); absent (the `--basic` mode) leaves wrapping to the terminal.
+private def replyText(reply: Repl.Reply, columns: Optional[Int] = Unset): Text = reply match
   case Repl.Reply.Ran(_, value, output, tpe, name, diagnostics, _, spans) =>
     // The value is shown only when there is one, as `name = value : type`, each part omitted
     // when absent — so no bare `=`/`:` appears when there is no result. The line is syntax-coloured
@@ -1754,9 +1838,10 @@ private def replyText(reply: Repl.Reply): Text = reply match
         t"${e"$binding$rendered$typed".render(xtermTrueColorTermcap)}\n"
 
     val diag: Text = if diagnostics != t"" then t"$diagnostics\n" else t""
-    t"${gutteredOutput(output, spans)}$valueLine$diag"
+    t"${gutteredOutput(output, spans, columns)}$valueLine$diag"
 
-  case Repl.Reply.Threw(_, output, diagnostics, _, spans) => t"${gutteredOutput(output, spans)}$diagnostics\n"
+  case Repl.Reply.Threw(_, output, diagnostics, _, spans) =>
+    t"${gutteredOutput(output, spans, columns)}$diagnostics\n"
   case Repl.Reply.Rejected(_, diagnostics, _)      => t"$diagnostics\n"
   case Repl.Reply.Crashed(_, diagnostics, _)       => t"$diagnostics\n"
   case Repl.Reply.Failed(_, message)               => t"$message\n"
