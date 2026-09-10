@@ -30,78 +30,64 @@
 ┃                                                                                                  ┃
 ┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛
                                                                                                   */
-package flame;
+package flame
 
-import java.util.concurrent.ConcurrentHashMap;
-import java.util.concurrent.atomic.AtomicLong;
-import java.util.function.Consumer;
-import java.util.function.Supplier;
+import java.lang as jl
 
-// A process-global, session-keyed registry bridging runtime values from a host
-// program's scope into separately-compiled REPL code (see `Repl.apply`). Written
-// in Java deliberately: the surrounding Scala module is compiled with
-// experimental language features, which would mark a Scala equivalent
-// `@experimental` and make it unreferenceable from REPL code compiled without
-// experimental mode. A Java class carries no such marker.
-public final class ReplBridge {
-  private ReplBridge() {}
+import scala.collection.concurrent.TrieMap
+import scala.collection.immutable as sci
 
-  private static final ConcurrentHashMap<String, Object> registry = new ConcurrentHashMap<>();
-  private static final AtomicLong counter = new AtomicLong(0L);
-  private static final ThreadLocal<Long> current = new ThreadLocal<>();
+import ambience.*
+import anticipation.*
+import gossamer.*
+import vacuous.*
 
-  private static String key(long session, String name) { return session + " " + name; }
+// The contextual values a REPL line sees by default — a `WorkingDirectory`, an `Environment` and a
+// `System` — reflecting the CLIENT that launched (or joined) the session: the directory `flame` was
+// run from and that shell's environment, not the background daemon's, which hosts every session
+// from wherever it happened to start. Each connection reports its values (`Repl.Request.Context`),
+// which the server files here against the session; a line's run sets the session in
+// `ReplBridge`'s thread-local first, so the givens below look up the right connection's values at
+// each use. A session nobody has reported for (a web session, or an async thread the user spawned)
+// falls back to the daemon's own directory and environment.
+//
+// The givens are CONDITIONAL — each takes the `Ambient` marker, always available from the same
+// import — because a conditional given yields to a plain one at the same nesting level: a user who
+// imports `environments.javaBaseEnvironment` on a line, or defines a `given Environment` on an
+// earlier one, gets theirs, never an ambiguity. (`Repl#ambientImports` injects the import.)
+object ReplContext:
+  case class Values(workingDirectory: Text, environment: sci.Map[Text, Text])
 
-  public static long freshSession() { return counter.incrementAndGet(); }
+  private val registry: TrieMap[Long, Values] = TrieMap()
 
-  // The macro does not know the runtime session, so the seed object's accessors
-  // call the session-less `fetchLive`/`updateLive` below, which read the session
-  // from a thread-local set by the REPL immediately before each line runs. This
-  // keeps the pickled seed block closed (its accessors refer only to `ReplBridge`,
-  // never to a session value baked in at macro time).
-  public static void setCurrentSession(long session) { current.set(session); }
+  def set(session: Long, values: Values): Unit = registry(session) = values
+  def clear(session: Long): Unit = registry.remove(session)
 
-  public static long currentSession() {
-    Long session = current.get();
-    return session == null ? 0L : session;
-  }
+  private def current: Optional[Values] = registry.get(ReplBridge.currentSession()) match
+    case Some(values) => values
+    case None         => Unset
 
-  public static void put(long session, String name, Object value) {
-    registry.put(key(session, name), value);
-  }
+  private def daemonDirectory: Text = Optional(jl.System.getProperty("user.dir")).let(_.tt).or(t"/")
 
-  @SuppressWarnings("unchecked")
-  public static <T> T fetch(long session, String name) {
-    return (T) registry.get(key(session, name));
-  }
+  class Ambient()
+  given ambient: Ambient = Ambient()
 
-  // A dynamic binding stores a supplier read live on each access, so a `def`
-  // accessor in the REPL re-evaluates the host reference (e.g. a `var`) rather
-  // than freezing its value at capture time.
-  public static void putSupplier(long session, String name, Supplier<Object> supplier) {
-    registry.put(key(session, name), supplier);
-  }
+  // The client's working directory, or the daemon's when none was reported.
+  given workingDirectory: Ambient => WorkingDirectory = () =>
+    current.let(_.workingDirectory).or(daemonDirectory)
 
-  @SuppressWarnings("unchecked")
-  public static <T> T fetchLive(long session, String name) {
-    return (T) ((Supplier<Object>) registry.get(key(session, name))).get();
-  }
+  // The client's environment; a variable it lacks is absent even if the daemon has it.
+  given environment: Ambient => Environment = new Environment:
+    def variable(name: Text): Optional[Text] = current match
+      case values: Values => values.environment.get(name) match
+        case Some(value) => value
+        case None        => Unset
+      case _ => Optional(jl.System.getenv(name.s)).let(_.tt)
 
-  // Session-less variants used by seed accessors (session via thread-local).
-  public static <T> T fetchLive(String name) { return fetchLive(currentSession(), name); }
-
-  public static void updateLive(String name, Object value) {
-    updateLive(currentSession(), name, value);
-  }
-
-  // A mutable dynamic binding also stores a consumer, so a `def name_=` accessor
-  // in the REPL writes back to the host `var`.
-  public static void putSetter(long session, String name, Consumer<Object> setter) {
-    registry.put(key(session, name) + " set", setter);
-  }
-
-  @SuppressWarnings("unchecked")
-  public static void updateLive(long session, String name, Object value) {
-    ((Consumer<Object>) registry.get(key(session, name) + " set")).accept(value);
-  }
-}
+  // The daemon JVM's properties (the client is a shell, with none of its own), except that
+  // `user.dir` is the client's working directory — so everything derived from it (a
+  // `systemWorkingDirectory`, a `TemporaryDirectory` read from the properties) follows the client.
+  given system: Ambient => System = new System:
+    def apply(name: Text): Optional[Text] =
+      if name == t"user.dir" then current.let(_.workingDirectory).or(daemonDirectory)
+      else Optional(jl.System.getProperty(name.s)).let(_.tt)

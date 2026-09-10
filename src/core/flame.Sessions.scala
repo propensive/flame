@@ -223,6 +223,19 @@ class Sessions[version <: Scalac.Versions]
       current = name
       name
 
+    // The client's reported context (see `Repl.Request.Context`), applied to whichever session is
+    // current — now, and again on every switch, so a joined session sees the joining client's
+    // directory and environment.
+    @volatile var context: Optional[(Text, List[Repl.Pair])] = Unset
+
+    def applyContext(): Unit = context.let: (directory, environment) =>
+      current.let: name =>
+        session(name).let: repl =>
+          val variables: scala.collection.immutable.Map[Text, Text] =
+            environment.stdlib.map { pair => (pair.key, pair.value) }.toMap
+
+          ReplContext.set(repl.session, ReplContext.Values(directory, variables))
+
     val writes: Mutex = Mutex()
     val out: ji.DataOutputStream = ji.DataOutputStream(ji.BufferedOutputStream(output))
 
@@ -266,7 +279,8 @@ class Sessions[version <: Scalac.Versions]
 
               async:
                 val reply: Repl.Reply =
-                  safely(repl.react(id, code, chunk => send(encode(Repl.Reply.Output(id, chunk))))).or
+                  safely(repl.react(id, code, chunk => Repl.streamChunks(chunk).each { (stream, text) =>
+                    send(encode(Repl.Reply.Output(id, text, stream))) })).or
                    (Repl.Reply.Failed(id, t"the submission could not be processed"))
 
                 send(encode(reply))
@@ -285,7 +299,9 @@ class Sessions[version <: Scalac.Versions]
           val created: Boolean = if name == t"" then wasAbsent else open(name)
           if name != t"" then current = name
           val outcome = if created then Repl.SessionOutcome.Created else Repl.SessionOutcome.Joined
-          encode(Repl.Reply.Session(id, currentName, names, outcome))
+          val reply = encode(Repl.Reply.Session(id, currentName, names, outcome))
+          applyContext()
+          reply
 
 
         case Repl.Request.Join(id, name) =>
@@ -293,6 +309,7 @@ class Sessions[version <: Scalac.Versions]
           // nothing (NOT `currentName`, which would create a throwaway session on the failure path).
           if session(name).present then
             current = name
+            applyContext()
             encode(Repl.Reply.Session(id, name, names, Repl.SessionOutcome.Joined))
           else encode(Repl.Reply.Session(id, current.or(t""), names, Repl.SessionOutcome.Missing))
 
@@ -301,12 +318,18 @@ class Sessions[version <: Scalac.Versions]
           // nothing, so a name clash is an error rather than a silent join.
           if open(name) then
             current = name
+            applyContext()
             encode(Repl.Reply.Session(id, name, names, Repl.SessionOutcome.Created))
           else encode(Repl.Reply.Session(id, current.or(t""), names, Repl.SessionOutcome.Exists))
 
         case Repl.Request.SessionList(id) =>
           // Report only — no `currentName`, so a bare probe (a tab-completion) creates nothing.
           encode(Repl.Reply.SessionList(id, names))
+
+        case Repl.Request.Context(_, directory, environment) =>
+          context = (directory, environment)
+          applyContext()
+          Unset
 
         case Repl.Request.Quit(_) =>
           quit.offer(()) yet Unset

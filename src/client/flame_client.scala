@@ -263,6 +263,10 @@ def runClient(): Unit =
     val history: Workspace.HistoryConfig =
       Workspace.historyConfig(summon[Cli].workingDirectory.directory())
 
+    // This invocation's directory and environment, reported to the session (see `ReplContext`).
+    val context: ClientContext =
+      ClientContext(summon[Cli].workingDirectory.directory(), environmentPairs(summon[Cli].environment))
+
     arguments match
       // `flame -<flag>…` — the terminal REPL with options: `-s NAME` joins a session, `--host HOST`
       // (with optional `--port`) connects to a remote server (`flame listen`), and the settings flags
@@ -295,8 +299,8 @@ def runClient(): Unit =
         else intent match
           case SessionIntent.Invalid(message) => command(sessionArgError(message))
           case intent => host match
-            case host: Text => command(connectRemote(host, port, intent, settings, history))
-            case _          => command(connectSocket(intent, settings, history))
+            case host: Text => command(connectRemote(host, port, intent, settings, history, context))
+            case _          => command(connectSocket(intent, settings, history, context))
 
       // `flame serve [--port N | -p N]` — the web front-end (default port 8080). `Port()` registers
       // the flag (so it is offered in tab-completion) and reads its value; the pure `Int`
@@ -330,7 +334,7 @@ def runClient(): Unit =
       case Nil =>
         sessionIntent(Nil, Join(), Create(), workspace) match
           case SessionIntent.Invalid(message) => command(sessionArgError(message))
-          case intent => command(connectSocket(intent, startupCommands(Nil, workspace), history))
+          case intent => command(connectSocket(intent, startupCommands(Nil, workspace), history, context))
 
 
       case _ =>
@@ -716,7 +720,34 @@ private def socketPaths(directory: Text): List[Text] =
 // Connects to a per-process UNIX domain socket. With no server running, launches one
 // in the background and attaches to it (so `flame` alone is a self-contained REPL,
 // reconnectable later); with exactly one, connects to it; with several, lists them.
-private def connectSocket(intent: SessionIntent, initial: List[Text], history: Workspace.HistoryConfig)
+// What this client reports to the server for the session's ambient contextual values (see
+// `ReplContext`): the invocation's working directory and its environment.
+private case class ClientContext(workingDirectory: Text, environment: List[Repl.Pair])
+
+// The invocation's environment as pairs. Ethereal hands the client's variables over as an opaque
+// `LazyEnvironment` (a `KEY=VALUE` list behind `variable(name)` alone), so the list is read back
+// reflectively; any other `Environment`, or a failure to read, reports nothing, and the server then
+// falls back to the daemon's own environment.
+private def environmentPairs(environment: Environment): List[Repl.Pair] =
+  try
+    val field = environment.getClass.getDeclaredField("variables").nn
+    field.setAccessible(true)
+
+    field.get(environment) match
+      case lines: scala.collection.immutable.List[?] =>
+        val pairs: scala.collection.immutable.List[Repl.Pair] = lines.flatMap:
+          case line: String =>
+            val parts = line.split("=", 2).nn
+            if parts.length == 2 then scala.collection.immutable.List(Repl.Pair(parts(0).nn.tt, parts(1).nn.tt))
+            else scala.collection.immutable.Nil
+          case _ => scala.collection.immutable.Nil
+
+        List.from(pairs)
+
+      case _ => Nil
+  catch case _: Exception => Nil
+
+private def connectSocket(intent: SessionIntent, initial: List[Text], history: Workspace.HistoryConfig, context: ClientContext)
     (using Stdio, Monitor, Probate, Console, Environment, System)
 :   Exit =
   // Probe every socket file: a connectable one is live; one that refuses (a crashed or
@@ -736,10 +767,10 @@ private def connectSocket(intent: SessionIntent, initial: List[Text], history: W
   live.to(List) match
     case Nil =>
       Out.println(t"Starting a REPL server…")
-      launchServer()(converse(intent, initial, history)(_)).or(failedToLaunch)
+      launchServer()(converse(intent, initial, history, context)(_)).or(failedToLaunch)
 
     case path :: Nil =>
-      connectDomain(DomainSocket(path))(converse(intent, initial, history)(_)).or(unreachableSocket(path))
+      connectDomain(DomainSocket(path))(converse(intent, initial, history, context)(_)).or(unreachableSocket(path))
 
     case paths =>
       Out.println(t"Several REPL servers are running:")
@@ -755,7 +786,7 @@ private def connectSocket(intent: SessionIntent, initial: List[Text], history: W
 // with `-s`/`--session`. The transport differs from `connectSocket` (a TCP endpoint rather than a
 // local UNIX domain socket), but the conversation — the `converse`/`runRepl` loop — is identical, so
 // a remote session behaves exactly like a local one.
-private def connectRemote(host: Optional[Text], portNumber: Int, intent: SessionIntent, initial: List[Text], history: Workspace.HistoryConfig)
+private def connectRemote(host: Optional[Text], portNumber: Int, intent: SessionIntent, initial: List[Text], history: Workspace.HistoryConfig, context: ClientContext)
     (using Stdio, Monitor, Probate, Console, Environment, System)
 :   Exit =
   host.lay(missingHost): hostText =>
@@ -764,11 +795,11 @@ private def connectRemote(host: Optional[Text], portNumber: Int, intent: Session
         case Hostname.Error(_, _) => invalidHost(hostText)
       . protect:
           val endpoint: Endpoint[Tcp.Port] = hostText.as[Hostname] on port
-          connect(endpoint)(converse(intent, initial, history)(_)).or(unreachableRemote(hostText, portNumber))
+          connect(endpoint)(converse(intent, initial, history, context)(_)).or(unreachableRemote(hostText, portNumber))
 
 // The read/edit/print loop. The server's reply is printed verbatim. Ctrl+C/Ctrl+D
 // dismiss the line editor (`Question.Error`) and end the session.
-private def converse(intent: SessionIntent, initial: List[Text], history: Workspace.HistoryConfig)(duplex: Duplex)
+private def converse(intent: SessionIntent, initial: List[Text], history: Workspace.HistoryConfig, context: ClientContext)(duplex: Duplex)
     (using Stdio, Monitor, Probate, Console, Environment)
 :   Exit =
   // The kitty keyboard protocol (applied by `interactive`) makes the terminal report
@@ -788,7 +819,7 @@ private def converse(intent: SessionIntent, initial: List[Text], history: Worksp
 
   . protect:
       interactive: terminal ?=>
-        runRepl(duplex, state, pending, nextId, submits, completions, intent, initial, history)
+        runRepl(duplex, state, pending, nextId, submits, completions, intent, initial, history, context)
 
 // One REPL input line is an inline block at the bottom of the console — a bordered,
 // live-highlighted editor with, when completions are active, a pane below it listing
@@ -806,7 +837,8 @@ private def runRepl
     completions: juc.LinkedBlockingQueue[List[Repl.CompletionItem]],
     intent:      SessionIntent,
     initial:     List[Text],
-    historyConfig: Workspace.HistoryConfig )
+    historyConfig: Workspace.HistoryConfig,
+    context:       ClientContext )
   ( using terminal: Terminal, monitor: Monitor )
 :   Exit =
 
@@ -969,8 +1001,9 @@ private def runRepl
           // A streamed chunk of an async run's stdout: accumulate it and, if the transcript entry is
           // recorded, refresh its live display and replay so the output appears as it is produced. (If
           // the entry isn't recorded yet, the submit loop applies the accumulated output when it files it.)
-          case Repl.Reply.Output(id, chunk) =>
-            asyncOutput(id) = asyncOutput.getOrElse(id, t"") + chunk
+          case Repl.Reply.Output(id, chunk, stream) =>
+            val sofar: Text = asyncOutput.getOrElse(id, t"")
+            asyncOutput(id) = sofar + guttered(chunk, stream, sofar == t"" || sofar.ends(t"\n"))
 
             asyncEntries.get(id).foreach: entry =>
               entry.result = evaluating(id)
@@ -1017,6 +1050,12 @@ private def runRepl
       case Repl.SessionOutcome.Exists =>
         Out.println(Repl.messages.sessionExists(intent.requestedName)); earlyExit = Exit.Fail(10)
       case _ => ()
+
+  // Report this client's working directory and environment, so the session's ambient
+  // `WorkingDirectory`/`Environment`/`System` are this client's (see `ReplContext`). Unanswered.
+  if earlyExit.absent then
+    val report = Repl.Request.Context(nextId.getAndIncrement, context.workingDirectory, context.environment)
+    duplex.send(zephyrine.Stream(framed(encode(report))))
 
   // Apply the startup settings from `--set`/`--language` by submitting each as a command to the
   // session, printing its confirmation (`X enabled`) below the banner. Synchronous — async mode
@@ -1479,8 +1518,8 @@ private def runRepl
             case reply =>
               val highlight: List[Repl.Token] = reply match
                 case Repl.Reply.Rejected(_, _, tokens)      => tokens
-                case Repl.Reply.Ran(_, _, _, _, _, _, tokens) => tokens
-                case Repl.Reply.Threw(_, _, _, tokens)      => tokens
+                case Repl.Reply.Ran(_, _, _, _, _, _, tokens, _) => tokens
+                case Repl.Reply.Threw(_, _, _, tokens, _)      => tokens
                 case _                                      => Nil
 
               if highlight.exists(_.mark.present) then marked = highlight
@@ -1641,8 +1680,55 @@ private def colourBorder(colour: Color in Srgb)(child: Pane): Pane =
 // whether printed live or reprinted when the transcript is replayed after a resize. Each
 // non-empty part ends with a newline (as the live output did), so lines flow correctly; an
 // empty result means the line produced no visible value (a definition, import, or Unit).
+// Each line of captured output opens with a coloured GUTTER, `░ `: blue for stdout, red for
+// stderr, so the two can be told apart where they interleave, while the text itself stays in the
+// terminal's own colours. Lines the engine produced (a command's message) and compiler diagnostics
+// get no gutter. A line's gutter takes the stream of the run that begins it (a line rarely mixes
+// streams; its first run decides).
+private val stdoutGutter: Text = t"\e[38;2;86;140;230m░\e[39m "
+private val stderrGutter: Text = t"\e[38;2;225;95;95m░\e[39m "
+
+private def gutter(stream: Text): Text =
+  if stream == Repl.stderrStream then stderrGutter else stdoutGutter
+
+// `text` (a streamed chunk of `stream`) with a gutter before each line it begins: `atLineStart`
+// says whether the chunk itself opens a line, and later lines within it always do.
+private def guttered(text: Text, stream: Text, atLineStart: Boolean): Text =
+  val builder: jl.StringBuilder = jl.StringBuilder()
+  var lineStart: Boolean = atLineStart
+
+  text.s.foreach: char =>
+    if lineStart && char != '\n' then builder.append(gutter(stream).s)
+    builder.append(char)
+    lineStart = char == '\n'
+
+  builder.toString.tt
+
+// `output` with a gutter before every line that lies within a captured run (`spans`, by offset),
+// coloured for that run's stream; lines outside every run are left as they are.
+private def gutteredOutput(output: Text, spans: List[Repl.OutputSpan]): Text =
+  val builder: jl.StringBuilder = jl.StringBuilder()
+  val text: String = output.s
+  var offset: Int = 0
+
+  while offset <= text.length do
+    val newline: Int = text.indexOf('\n', offset)
+    val end: Int = if newline < 0 then text.length else newline
+    val line: String = text.substring(offset, end).nn
+
+    // The run covering the line's first character (or, for an empty line, its position).
+    val covering: Optional[Repl.OutputSpan] =
+      spans.seek { (span: Repl.OutputSpan) => span.start <= offset && offset < span.start + span.length }
+
+    if line.nonEmpty then covering.let { (span: Repl.OutputSpan) => builder.append(gutter(span.stream).s) }
+    builder.append(line)
+    if newline >= 0 then builder.append('\n')
+    offset = end + 1
+
+  builder.toString.tt
+
 private def replyText(reply: Repl.Reply): Text = reply match
-  case Repl.Reply.Ran(_, value, output, tpe, name, diagnostics, _) =>
+  case Repl.Reply.Ran(_, value, output, tpe, name, diagnostics, _, spans) =>
     // The value is shown only when there is one, as `name = value : type`, each part omitted
     // when absent — so no bare `=`/`:` appears when there is no result. The line is syntax-coloured
     // like code: the binding NAME reads as a binding (term colour, italic), `=` and `:` as operator/
@@ -1668,9 +1754,9 @@ private def replyText(reply: Repl.Reply): Text = reply match
         t"${e"$binding$rendered$typed".render(xtermTrueColorTermcap)}\n"
 
     val diag: Text = if diagnostics != t"" then t"$diagnostics\n" else t""
-    t"$output$valueLine$diag"
+    t"${gutteredOutput(output, spans)}$valueLine$diag"
 
-  case Repl.Reply.Threw(_, output, diagnostics, _) => t"$output$diagnostics\n"
+  case Repl.Reply.Threw(_, output, diagnostics, _, spans) => t"${gutteredOutput(output, spans)}$diagnostics\n"
   case Repl.Reply.Rejected(_, diagnostics, _)      => t"$diagnostics\n"
   case Repl.Reply.Crashed(_, diagnostics, _)       => t"$diagnostics\n"
   case Repl.Reply.Failed(_, message)               => t"$message\n"
@@ -1679,22 +1765,22 @@ private def replyText(reply: Repl.Reply): Text = reply match
   case Repl.Reply.Session(_, _, _, _)              => t""
   case Repl.Reply.SessionList(_, _)                => t""
   case Repl.Reply.Pending(_)                       => t""
-  case Repl.Reply.Output(_, _)                     => t""
+  case Repl.Reply.Output(_, _, _)                  => t""
 
 // The request id every reply echoes — used to correlate an out-of-band async fill with the submission
 // (its `Pending` placeholder) it completes. (The enum's cases share the field but not an accessor.)
 private def replyId(reply: Repl.Reply): Int = reply match
   case Repl.Reply.Tokenized(id, _, _, _, _)   => id
   case Repl.Reply.Completed(id, _)            => id
-  case Repl.Reply.Ran(id, _, _, _, _, _, _)   => id
+  case Repl.Reply.Ran(id, _, _, _, _, _, _, _) => id
   case Repl.Reply.Rejected(id, _, _)          => id
-  case Repl.Reply.Threw(id, _, _, _)          => id
+  case Repl.Reply.Threw(id, _, _, _, _)       => id
   case Repl.Reply.Crashed(id, _, _)           => id
   case Repl.Reply.Failed(id, _)               => id
   case Repl.Reply.Session(id, _, _, _)        => id
   case Repl.Reply.SessionList(id, _)          => id
   case Repl.Reply.Pending(id)                 => id
-  case Repl.Reply.Output(id, _)               => id
+  case Repl.Reply.Output(id, _, _)            => id
 
 // The completion candidates as a compact, HEADER-LESS list — one Teletype line each: a kind glyph,
 // the name, then the type signature (subdued, truncated to fit). The kind (replacing the old `kind`

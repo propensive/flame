@@ -68,6 +68,9 @@ case class WebRequest(kind: Text, seq: Int, code: Text, offset: Int)
 // `mark` is `error`/`warning` for a token inside a diagnostic's span (see `Repl.mark`), else empty.
 case class WebToken(text: Text, accent: Text, role: Text = t"", mark: Text = t"")
 case class WebCompletion(name: Text, kind: Text, signature: Text)
+// A run of captured stdout (`out`) or stderr (`err`) within a reply's `output`, by offset
+// (`Repl.OutputSpan`), so the page can shade the two streams differently.
+case class WebSpan(stream: Text, start: Int, length: Int)
 // One binding the unfinished line has introduced (`Repl.ScopeBinding`); `name` is empty for a
 // synthetic context-function parameter, which is shown by type alone.
 case class WebScope(name: Text, tpe: Text, contextual: Boolean)
@@ -87,7 +90,11 @@ case class WebReply
      // after a `<:`, mirroring the CLI (see `Repl.TypeText`).
      base:        Text = t"",
      // What the (unfinished) line has brought into scope so far, for the row under the editor.
-     scope:       List[WebScope] = Nil )
+     scope:       List[WebScope] = Nil,
+     // The captured stdout/stderr runs within `output`; for an `output` (streamed chunk) message,
+     // `stream` says which stream the whole chunk came from.
+     spans:       List[WebSpan]  = Nil,
+     stream:      Text           = t"" )
 
 // The JSON REST API's request/response bodies (served alongside the browser UI and WebSocket — see
 // the `/api/…` routes in `serveHttp`). Flat case classes, so jacinta derives their JSON codecs
@@ -134,6 +141,11 @@ val replScript: Text = t"""
     ".scope .given { font-style: italic; }",
     ".prompt { color: #808080; }",
     ".result { color: #b5cea8; }",
+    // Captured stdout and stderr: each line opens with a coloured `░ ` gutter — blue for stdout, red
+    // for stderr — so the two can be told apart where they interleave; the text keeps its own colour,
+    // and engine messages and compiler diagnostics get no gutter.
+    ".gutter-out { color: #568ce6; }",
+    ".gutter-err { color: #e15f5f; }",
     ".error { color: #f48771; white-space: pre-wrap; }",
     // An embedded code sample in a diagnostic never word-wraps mid-token (see `SemanticRender`).
     ".error .code-sample { white-space: pre; }",
@@ -424,11 +436,45 @@ val replScript: Text = t"""
   // Renders a result/error reply INTO `target` — output, then the value line (`name = value : type`,
   // the value already server-rendered HTML, the rest escaped), then diagnostics. Shared by the normal
   // result path and the async fill so a placeholder fills identically to an inline result.
+  function gutterHtml(stream) {
+    return "<span class='" + (stream === "err" ? "gutter-err" : "gutter-out") + "'>\u2591 </span>";
+  }
+
+  // Renders a reply's plain `output`, opening every line that lies within a captured run (`spans`,
+  // by offset) with that run's gutter; lines outside every run (an engine message) get none.
+  function outputHtml(text, spans) {
+    var html = "", offset = 0;
+    while (offset <= text.length) {
+      var nl = text.indexOf("\\n", offset);
+      var end = nl < 0 ? text.length : nl;
+      var line = text.slice(offset, end);
+      var covering = (spans || []).find(function(s) { return s.start <= offset && offset < s.start + s.length; });
+      if (line.length && covering) html += gutterHtml(covering.stream);
+      html += escapeHtml(line);
+      if (nl >= 0) html += "\\n";
+      offset = end + 1;
+    }
+    return html;
+  }
+
+  // Appends a streamed chunk of `stream` to the placeholder's output element, opening each line the
+  // chunk begins with a gutter; `data-linestart` remembers whether the next text opens a line.
+  function appendStream(os, text, stream) {
+    var lineStart = os.getAttribute("data-linestart") !== "no";
+    for (var i = 0; i < text.length; i++) {
+      var ch = text.charAt(i);
+      if (lineStart && ch !== "\\n") os.insertAdjacentHTML("beforeend", gutterHtml(stream));
+      os.appendChild(document.createTextNode(ch));
+      lineStart = ch === "\\n";
+    }
+    os.setAttribute("data-linestart", lineStart ? "yes" : "no");
+  }
+
   function fillResult(target, msg) {
     var html = "";
     var out = msg.output;
     if (out) { if (out.charAt(out.length - 1) === "\\n") out = out.slice(0, -1); }
-    if (out) html += "<div>" + escapeHtml(out) + "</div>";
+    if (out) html += "<div>" + outputHtml(out, msg.spans) + "</div>";
     if (msg.value) {
       // Syntax-colour the `name = value : type` line like code: the binding NAME as a binding (term
       // colour, italicised via `.binding`), `=`/`:` as operator/symbol punctuation, and the TYPE in
@@ -801,7 +847,7 @@ val replScript: Text = t"""
       var ptarget = log.querySelector('[data-id="' + msg.seq + '"]');
       if (ptarget) {
         var os = ptarget.querySelector(".stream-out");
-        if (os) os.textContent += msg.output;
+        if (os) appendStream(os, msg.output, msg.stream);
         log.scrollIntoView(false);
       }
       return;
@@ -888,17 +934,17 @@ private def webCompletions(items: List[Repl.CompletionItem]): List[WebCompletion
 
 // Maps a typed `Repl.Reply` (from `react`) to the flat reply the browser renders.
 private def resultReply(seq: Int, reply: Repl.Reply): WebReply = reply match
-  case Repl.Reply.Ran(_, value, output, tpe, name, diagnostics, highlight) =>
+  case Repl.Reply.Ran(_, value, output, tpe, name, diagnostics, highlight, spans) =>
     WebReply
      ( t"result", seq, value.or(t""), tpe.let(_.text).or(t""), output, diagnostics,
        webTokens(highlight),
-       name = name.or(t""), base = tpe.let(_.base).or(t"") )
+       name = name.or(t""), base = tpe.let(_.base).or(t""), spans = webSpans(spans) )
 
   case Repl.Reply.Rejected(_, diagnostics, highlight) =>
     WebReply(t"error", seq, t"", t"", t"", diagnostics, webTokens(highlight))
 
-  case Repl.Reply.Threw(_, output, diagnostics, highlight) =>
-    WebReply(t"error", seq, t"", t"", output, diagnostics, webTokens(highlight))
+  case Repl.Reply.Threw(_, output, diagnostics, highlight, spans) =>
+    WebReply(t"error", seq, t"", t"", output, diagnostics, webTokens(highlight), spans = webSpans(spans))
 
   case Repl.Reply.Crashed(_, diagnostics, highlight) =>
     WebReply(t"error", seq, t"", t"", t"", diagnostics, webTokens(highlight))
@@ -917,19 +963,22 @@ private def asyncReply(seq: Int, reply: Repl.Reply): WebReply =
 
 // A streamed chunk of an async submission's stdout, correlated by `seq`; the browser appends its
 // `output` to the matching placeholder as it arrives (the final `async` reply then re-renders in full).
-private def outputReply(seq: Int, chunk: Text): WebReply =
-  WebReply(t"output", seq, t"", t"", chunk, t"", Nil)
+private def outputReply(seq: Int, chunk: Text, stream: Text): WebReply =
+  WebReply(t"output", seq, t"", t"", chunk, t"", Nil, stream = stream)
+
+private def webSpans(spans: List[Repl.OutputSpan]): List[WebSpan] =
+  spans.map { span => WebSpan(span.stream, span.start, span.length) }
 
 // Maps a typed `Repl.Reply` (from `react`) to the flat JSON result the REST API returns. Unlike
 // `resultReply`, this carries no highlight tokens and the value is plain text (the API's sessions
 // render in `Rendering.Inspect`), so it is safe to serialize straight to JSON.
 private def apiResult(reply: Repl.Reply): ApiResult = reply match
-  case Repl.Reply.Ran(_, value, output, tpe, name, diagnostics, _) =>
+  case Repl.Reply.Ran(_, value, output, tpe, name, diagnostics, _, _) =>
     ApiResult
      ( t"ran", value.or(t""), tpe.let(_.text).or(t""), output, name.or(t""), plain(diagnostics),
        base = tpe.let(_.base).or(t"") )
 
-  case Repl.Reply.Threw(_, output, diagnostics, _) =>
+  case Repl.Reply.Threw(_, output, diagnostics, _, _) =>
     ApiResult(t"error", output = output, diagnostics = plain(diagnostics))
 
   case Repl.Reply.Rejected(_, diagnostics, _) => ApiResult(t"error", diagnostics = plain(diagnostics))
@@ -1033,7 +1082,8 @@ def serveHttp(port: Int, quit: Promise[Unit])(using Monitor, System, Probate, Cl
                 async:
                   val reply: Repl.Reply =
                     safely
-                     (repl.react(request.seq, code, chunk => push(outputReply(request.seq, chunk).in[Json].show)))
+                     (repl.react(request.seq, code, chunk => Repl.streamChunks(chunk).each { (stream, text) =>
+                       push(outputReply(request.seq, text, stream).in[Json].show) }))
                     . or(Repl.Reply.Failed(request.seq, t"the submission could not be processed"))
 
                   push(asyncReply(request.seq, reply).in[Json].show)

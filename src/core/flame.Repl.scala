@@ -130,34 +130,92 @@ object Repl:
     case Rejected(notices: List[Notice])
     case Crashed(notices: List[Notice], error: StackTrace)
 
-  // Process-wide capture of Java-side `System.out`. `System.out` is a single global, so with
-  // concurrent runs (async mode runs each line off the compiler mutex) we cannot redirect and
-  // restore it per run, as the old per-run `setOut`/restore did — two overlapping runs would
-  // clobber each other's saved stream. Instead we install ONE `System.out` (lazily, once for the
-  // whole JVM) that dispatches each write to the running thread's current capture stream — set by
-  // `capture` around a run — falling back to the real stdout for threads with none. Scala-side
-  // `println` is already thread-local via `scala.Console.withOut`, so this only covers Java prints.
+  // Process-wide capture of Java-side `System.out` AND `System.err`. Each is a single global, so
+  // with concurrent runs (async mode runs each line off the compiler mutex) we cannot redirect and
+  // restore them per run — two overlapping runs would clobber each other's saved stream. Instead ONE
+  // dispatcher is installed for each (lazily, once for the whole JVM) that routes every write to the
+  // running thread's current capture stream — set by `capture` around a run — falling back to the
+  // real stream for threads with none. Scala-side `println`/`Console.err` are already thread-local
+  // via `Console.withOut`/`withErr`, so this covers Java prints and anything else writing to the
+  // `System` streams (the ambient `Stdio` of `ReplStdio` resolves them at each write).
   object CapturedOut:
-    private val current: ThreadLocal[ji.OutputStream] = ThreadLocal()
+    private val currentOut: ThreadLocal[ji.OutputStream] = ThreadLocal()
+    private val currentErr: ThreadLocal[ji.OutputStream] = ThreadLocal()
 
-    private lazy val installed: Unit =
-      val real: ji.OutputStream = jl.System.out.nn
-      val dispatch: ji.OutputStream = new ji.OutputStream:
+    private def dispatcher(current: ThreadLocal[ji.OutputStream], real: ji.OutputStream)
+    :   ji.OutputStream =
+      new ji.OutputStream:
         private def target: ji.OutputStream = Optional(current.get).or(real)
         def write(byte: Int): Unit = target.write(byte)
         override def write(bytes: scala.Array[Byte] | Null, off: Int, len: Int): Unit =
           target.write(bytes, off, len)
         override def flush(): Unit = target.flush()
 
-      jl.System.setOut(ji.PrintStream(dispatch, true, "UTF-8"))
+    private lazy val installed: Unit =
+      jl.System.setOut(ji.PrintStream(dispatcher(currentOut, jl.System.out.nn), true, "UTF-8"))
+      jl.System.setErr(ji.PrintStream(dispatcher(currentErr, jl.System.err.nn), true, "UTF-8"))
 
-    // Routes this thread's Java-side `System.out` to `stream` for the duration of `body`, then
-    // restores whatever it was before (nested captures are honoured, though runs never nest).
-    def capture[result](stream: ji.OutputStream)(body: => result): result =
+    // Routes this thread's Java-side `System.out`/`System.err` to `out`/`err` for the duration of
+    // `body`, then restores whatever they were before (nested captures are honoured).
+    def capture[result](out: ji.OutputStream, err: ji.OutputStream)(body: => result): result =
       installed
-      val previous: ji.OutputStream | Null = current.get
-      current.set(stream)
-      try body finally current.set(previous)
+      val previousOut: ji.OutputStream | Null = currentOut.get
+      val previousErr: ji.OutputStream | Null = currentErr.get
+      currentOut.set(out)
+      currentErr.set(err)
+      try body finally
+        currentOut.set(previousOut)
+        currentErr.set(previousErr)
+
+  // Captured stdout and stderr are kept IN ORDER, as they interleaved, and travel through an
+  // `Outcome`'s `output` tagged in-band: each captured run is bracketed by a private-use marker
+  // (`stdoutStart`/`stderrStart` … `streamEnd`), while text the engine itself produced (a command's
+  // message, an import confirmation) carries none. `segments` strips the markers and yields the
+  // plain text with each run's `OutputSpan`, which is what crosses the wire (`Reply.Ran.spans`) so a
+  // front-end can shade stdout and stderr differently and leave the rest on the normal background.
+  // In-band tagging keeps `Outcome` unchanged, and survives the engine appending to or replacing
+  // `output` (a replaced output simply has no markers). The markers are private-use code points
+  // that no program prints in practice; a stray one is dropped rather than shown.
+  val stdoutStart: Char = '\uE000'
+  val stderrStart: Char = '\uE001'
+  val streamEnd:   Char = '\uE002'
+
+  // A run of captured `stream` output (`out` or `err`) within a reply's plain `output`, by offset.
+  case class OutputSpan(stream: Text, start: Int, length: Int)
+
+  val stdoutStream: Text = t"out"
+  val stderrStream: Text = t"err"
+
+  // Wraps `text` as a tagged run of `stream` (see above).
+  def tagged(stream: Text, text: Text): Text =
+    val marker: Char = if stream == stderrStream then stderrStart else stdoutStart
+    t"${marker.toString.tt}$text${streamEnd.toString.tt}"
+
+  // The plain text of a tagged `output`, with the spans of its captured runs.
+  def segments(tagged: Text): (Text, List[OutputSpan]) =
+    val plain: jl.StringBuilder = jl.StringBuilder()
+    val spans: scm.ArrayBuffer[OutputSpan] = scm.ArrayBuffer()
+    var open: Optional[(Text, Int)] = Unset
+
+    tagged.s.foreach: char =>
+      if char == stdoutStart || char == stderrStart then
+        open = ((if char == stderrStart then stderrStream else stdoutStream), plain.length)
+      else if char == streamEnd then
+        open.let: (stream, start) =>
+          if plain.length > start then spans += OutputSpan(stream, start, plain.length - start)
+        open = Unset
+      else plain.append(char)
+
+    (plain.toString.tt, List.from(spans))
+
+  // The captured runs of a tagged `output` as (stream, text) pairs — for streaming a chunk.
+  def streamChunks(tagged: Text): List[(Text, Text)] =
+    val (plain, spans) = segments(tagged)
+    spans.map { span => (span.stream, plain.skip(span.start).keep(span.length)) }
+
+  given outputSpanDecodable: OutputSpan is Tel.Decodable =
+    import strategies.throwUnsafely
+    Tel.DecodableDerivation.derived[OutputSpan]
 
   // One syntax-highlighting token of the submitted line. `accent` is the lowercased Harlequin
   // accent (a COLOUR category — `keyword`, `term`, `typal`, …); `role` is `binding`/`usage` for
@@ -267,6 +325,13 @@ object Repl:
   // `using` binding an implicit search would find, as opposed to a plain value.
   case class ScopeBinding(name: Optional[Text], tpe: Text, contextual: Boolean)
 
+  // A key/value pair on the wire (an environment variable of a `Request.Context`).
+  case class Pair(key: Text, value: Text)
+
+  given pairDecodable: Pair is Tel.Decodable =
+    import strategies.throwUnsafely
+    Tel.DecodableDerivation.derived[Pair]
+
   // One persisted prompt-history entry: the exact submitted line. A struct (not a bare `Text`,
   // which BinTEL will not encode at the top level) so it frames cleanly; the client appends one
   // such record per submission to `.pyrocosm/flame/history` and reads them back at startup.
@@ -347,6 +412,11 @@ object Repl:
     // `--session` tab-completion can enumerate the joinable sessions without leaving a throwaway
     // one behind (which a `Session` request's lazy current-session creation would).
     case SessionList(id: Int)
+    // The connecting client's context — its working directory and environment — filed against the
+    // connection's current session (and re-filed whenever it switches), so the ambient
+    // `WorkingDirectory`/`Environment`/`System` a line sees are the client's (see `ReplContext`).
+    // Answered with nothing.
+    case Context(id: Int, workingDirectory: Text, environment: List[Pair])
 
   // A reply to a connected client, echoing the request's `id`. `highlight` is the
   // Harlequin tokenization of the submitted line. Serialized as JSON with a `kind`
@@ -361,11 +431,15 @@ object Repl:
                    scope: List[ScopeBinding])
     case Completed(id: Int, completions: List[CompletionItem])
 
+    // `output` is the run's captured stdout/stderr (in order) plus any engine message, as plain
+    // text; `spans` locates the captured runs within it, by stream, so a front-end can shade them.
     case Ran(id: Int, value: Optional[Text], output: Text, tpe: Optional[TypeText],
-             name: Optional[Text], diagnostics: Text, highlight: List[Token])
+             name: Optional[Text], diagnostics: Text, highlight: List[Token],
+             spans: List[OutputSpan])
 
     case Rejected(id: Int, diagnostics: Text, highlight: List[Token])
-    case Threw(id: Int, output: Text, diagnostics: Text, highlight: List[Token])
+    case Threw(id: Int, output: Text, diagnostics: Text, highlight: List[Token],
+               spans: List[OutputSpan])
     case Crashed(id: Int, diagnostics: Text, highlight: List[Token])
     case Failed(id: Int, message: Text)
     // Sent in async mode (`/set async`) immediately on submit: a placeholder acknowledgement. The real
@@ -374,7 +448,8 @@ object Repl:
     case Pending(id: Int)
     // A chunk of the submission's stdout, streamed out-of-band as the run produces it (async mode), so a
     // front-end shows output as it appears rather than only in the final reply. Carries the same `id`.
-    case Output(id: Int, chunk: Text)
+    // `stream` is `out` or `err` (see `Repl.stdoutStream`).
+    case Output(id: Int, chunk: Text, stream: Text)
     // The connection's current session `name`, plus `names` — every session on the server (for the
     // startup display and `/session` tab-completion) — and the request's `outcome`, which the client
     // uses to distinguish a create from a join and to detect a failed `--join`/`--create` (one of
@@ -2135,28 +2210,53 @@ class Repl[version <: Scalac.Versions]
           // `PrintStream` flushes after every write/`println`) the newly-captured bytes are decoded
           // and handed to the sink, so async mode can stream stdout as it appears. The full text is
           // still returned in `output`.
-          val captured: ji.ByteArrayOutputStream = ji.ByteArrayOutputStream()
+          // stdout and stderr are captured into ONE ordered list of runs — a run per stretch of
+          // consecutive writes to the same stream — so their interleaving is preserved; each is
+          // rendered tagged (see `Repl.segments`). A sink's flush (an auto-flushing `PrintStream`
+          // flushes after every write/`println`) decodes the bytes written since its last flush and
+          // hands them, tagged, to `onOutput`, so async mode can stream either stream as it appears.
+          val runs: scm.ArrayBuffer[(Text, ji.ByteArrayOutputStream)] = scm.ArrayBuffer()
+          val runsLock: AnyRef = new AnyRef()
 
-          // Captures `onOutput` (impure), so its type is left to infer rather than pinned pure.
-          val teeing = new ji.OutputStream:
+          // Captures `onOutput` (impure), so the sinks' types are left to infer rather than pinned pure.
+          def sink(stream: Text) = new ji.OutputStream:
             @scala.caps.unsafe.untrackedCaptures
-            private var streamed: Int = 0
-            def write(byte: Int): Unit = captured.write(byte)
+            private var pending: ji.ByteArrayOutputStream = ji.ByteArrayOutputStream()
+
+            private def current(): ji.ByteArrayOutputStream =
+              if runs.nonEmpty && runs.last(0) == stream then runs.last(1)
+              else
+                val fresh = ji.ByteArrayOutputStream()
+                runs += ((stream, fresh))
+                fresh
+
+            def write(byte: Int): Unit = runsLock.synchronized:
+              current().write(byte)
+              pending.write(byte)
+
             override def write(bytes: scala.Array[Byte] | Null, off: Int, len: Int): Unit =
-              captured.write(bytes, off, len)
+              runsLock.synchronized:
+                current().write(bytes, off, len)
+                pending.write(bytes, off, len)
 
             override def flush(): Unit =
-              val all: scala.Array[Byte] = captured.toByteArray.nn
-              if all.length > streamed then
-                val chunk = String(all, streamed, all.length - streamed, "UTF-8").tt
-                streamed = all.length
-                safely(onOutput(chunk))
+              val chunk: Optional[Text] = runsLock.synchronized:
+                if pending.size == 0 then Unset else
+                  val text: Text = pending.toString("UTF-8").nn.tt
+                  pending.reset()
+                  text
 
-          val stream: ji.PrintStream = ji.PrintStream(teeing, true, "UTF-8")
+              chunk.let { (text: Text) => safely(onOutput(Repl.tagged(stream, text))) }
+
+          val out: ji.PrintStream = ji.PrintStream(sink(Repl.stdoutStream), true, "UTF-8")
+          val err: ji.PrintStream = ji.PrintStream(sink(Repl.stderrStream), true, "UTF-8")
 
           def output: Text =
-            stream.flush()
-            captured.toString("UTF-8").nn.tt
+            out.flush()
+            err.flush()
+            runsLock.synchronized:
+              runs.map { (stream, bytes) => Repl.tagged(stream, bytes.toString("UTF-8").nn.tt) }
+              . mkString.tt
 
           try
             // Seed accessors read their session from this thread-local.
@@ -2168,7 +2268,8 @@ class Repl[version <: Scalac.Versions]
               case _                   => termcapDefinitions.xterm256Termcap
 
             ReplStdio.withTermcap(termcap):
-              Repl.CapturedOut.capture(stream)(scala.Console.withOut(stream)(loader.on(t"$name$$")))
+              Repl.CapturedOut.capture(out, err):
+                scala.Console.withOut(out)(scala.Console.withErr(err)(loader.on(t"$name$$")))
             Outcome.Ran(notices, rendered, output)
           catch
             case error: ExceptionInInitializerError =>
@@ -2244,7 +2345,11 @@ class Repl[version <: Scalac.Versions]
   // not so much as import the provider — and could not name `Stdio` or `Out` either (the trait
   // `Stdio` itself is marked), so it loses nothing by going without.
   private def ambientImports: List[Text] =
-    if experimentalCompile then List(t"import flame.ReplStdio.provider") else Nil
+    if experimentalCompile then
+      List
+       ( t"import flame.ReplStdio.provider",
+         t"import flame.ReplContext.{ambient, workingDirectory, environment, system}" )
+    else Nil
 
   // Whether lines compile with `-experimental`: switched on with `/set experimental`, or always, in
   // a seeded session (see `effectiveScalac`).
@@ -2828,7 +2933,8 @@ class Repl[version <: Scalac.Versions]
         // `evaluate` has already chosen the binding name/type and suppressed the value of a bare
         // `Unit` EXPRESSION (a `Unit` `val`/`var` definition keeps its binding, so it still shows).
         // The tokens carry the spans of any warnings, for the front-end to underline.
-        Repl.Reply.Ran(id, value, output, tpe, name, renderDiagnostics(notices), Repl.mark(tokens, notices))
+        val (plain, spans) = Repl.segments(output)
+        Repl.Reply.Ran(id, value, plain, tpe, name, renderDiagnostics(notices), Repl.mark(tokens, notices), spans)
 
       case Outcome.Rejected(notices) =>
         // The tokens carry the errors' spans, mapped into the line's own coordinates by `compile`.
@@ -2842,7 +2948,8 @@ class Repl[version <: Scalac.Versions]
         // front-end), not plain text.
         val trace: Text = StackTraceRender.render(error)(using loader)
         val rendered: Text = if render == Repl.Rendering.Html then SemanticRender.htmlPlain(trace) else trace
-        Repl.Reply.Threw(id, output, rendered, tokens)
+        val (plain, spans) = Repl.segments(output)
+        Repl.Reply.Threw(id, plain, rendered, tokens, spans)
 
       case Outcome.Crashed(notices, _) =>
         Repl.Reply.Crashed(id, renderDiagnostics(notices), tokens)

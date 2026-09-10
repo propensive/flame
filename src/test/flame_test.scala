@@ -724,21 +724,21 @@ object Tests extends Suite(m"Flame Tests"):
         supervise:
           Repl().react(0, t"1 + 1")
       . assert:
-          case Repl.Reply.Ran(_, value, _, tpe, _, _, _) => value == t"2" && tpe.present
+          case Repl.Reply.Ran(_, value, _, tpe, _, _, _, _) => value == t"2" && tpe.present
           case _                                       => false
 
       test(m"a Unit result shows neither a value nor a type"):
         supervise:
           Repl().react(0, t"println(\"hi\")")
       . assert:
-          case Repl.Reply.Ran(_, value, _, tpe, _, _, _) => value.absent && tpe.absent
+          case Repl.Reply.Ran(_, value, _, tpe, _, _, _, _) => value.absent && tpe.absent
           case _                                       => false
 
       test(m"an import produces no result value"):
         supervise:
           Repl().react(0, t"import scala.collection.mutable.*")
       . assert:
-          case Repl.Reply.Ran(_, value, _, tpe, _, _, _) => value.absent && tpe.absent
+          case Repl.Reply.Ran(_, value, _, tpe, _, _, _, _) => value.absent && tpe.absent
           case _                                       => false
 
       test(m"a type error is reported as Rejected with notices"):
@@ -759,7 +759,7 @@ object Tests extends Suite(m"Flame Tests"):
         supervise:
           Repl().react(0, t"throw new RuntimeException(\"boom\")")
       . assert:
-          case Repl.Reply.Threw(_, _, diagnostics, _) =>
+          case Repl.Reply.Threw(_, _, diagnostics, _, _) =>
             diagnostics.contains(t"RuntimeException") && diagnostics.contains(t"boom")
             && diagnostics.contains(t".scala")
           case _ => false
@@ -1008,7 +1008,7 @@ object Tests extends Suite(m"Flame Tests"):
       // The type is the SINGLETON `2`, not `Int`: an expression line is bound as a `final val`, so a
       // constant expression keeps the constant type the compiler folds it to (see `Repl.resultType`).
       . assert:
-          case Repl.Reply.Ran(_, value, _, tpe, _, _, _) =>
+          case Repl.Reply.Ran(_, value, _, tpe, _, _, _, _) =>
             value.let(_ == t"2").or(false) && tpe.let(_.text == t"2").or(false)
 
           case _ =>
@@ -1053,7 +1053,7 @@ object Tests extends Suite(m"Flame Tests"):
             channel.close()
             service.stop()
       . assert:
-          case Repl.Reply.Ran(_, value, _, _, _, _, _) => value.let(_ == t"42").or(false)
+          case Repl.Reply.Ran(_, value, _, _, _, _, _, _) => value.let(_ == t"42").or(false)
           case _                                    => false
 
       test(m"sessions are independent and each has a distinct name"):
@@ -1191,6 +1191,97 @@ object Tests extends Suite(m"Flame Tests"):
 
           !stuck
       . assert(_ == true)
+
+      // A session's ambient `WorkingDirectory`/`Environment`/`System` (see `ReplContext`) reflect the
+      // values filed for it — the client's — and `System`'s `user.dir` follows the working directory.
+      test(m"the ambient WorkingDirectory, Environment and System are the client's"):
+        supervise:
+          val repl = Repl()
+          ReplContext.set(repl.session, ReplContext.Values(t"/tmp/flame-client",
+            scala.collection.immutable.Map(t"FLAME_TEST_VARIABLE" -> t"present")))
+          repl.react(0, t"/set experimental")
+          repl.react(0, t"import soundness.*")
+          repl.interpret(t"(summon[WorkingDirectory].directory(), summon[Environment].variable(t\"FLAME_TEST_VARIABLE\"), summon[System](t\"user.dir\"))")
+      . assert:
+          case Repl.Outcome.Ran(_, value, _, _, _) =>
+            value.let(_.contains(t"/tmp/flame-client")).or(false) && value.let(_.contains(t"present")).or(false)
+
+          case _ =>
+            false
+
+      // The ambient givens are conditional, so a user's own `given` on an earlier line (in scope
+      // through the history import, an inner level) — or an import of Soundness's — wins outright.
+      test(m"a user-defined WorkingDirectory overrides the ambient one"):
+        supervise:
+          val repl = Repl()
+          ReplContext.set(repl.session, ReplContext.Values(t"/tmp/flame-client", scala.collection.immutable.Map()))
+          repl.react(0, t"/set experimental")
+          repl.react(0, t"import soundness.*")
+          repl.react(1, t"given mine: WorkingDirectory = () => t\"/mine\"")
+          repl.interpret(t"summon[WorkingDirectory].directory()")
+      . assert:
+          case Repl.Outcome.Ran(_, value, _, _, _) => value.let(_.contains(t"/mine")).or(false)
+          case _                                   => false
+
+      test(m"an imported Soundness Environment given overrides the ambient one without ambiguity"):
+        supervise:
+          val repl = Repl()
+          repl.react(0, t"/set experimental")
+          repl.react(0, t"import soundness.*")
+          repl.react(1, t"import environments.emptyEnvironment")
+          repl.interpret(t"summon[Environment].variable(t\"HOME\")")
+      // `emptyEnvironment` answers `Unset` (rendered `○`) where the ambient one would give a path;
+      // and the line ran — no ambiguity between the two givens.
+      . assert:
+          case Repl.Outcome.Ran(_, value, _, _, _) => value.let(_.contains(t"○")).or(false)
+          case _                                   => false
+
+      // Over the wire: a `Context` request files the connecting client's values on its session.
+      test(m"a Context request makes the client's working directory ambient in its session"):
+        supervise:
+          val tcpPort = Port[Tcp]()
+          val service = Sessions().serve(tcpPort)
+          val socket  = jn.Socket("localhost", tcpPort.number)
+
+          try
+            exchange(socket, Repl.Request.Session(1, t""))
+            send(socket, Repl.Request.Context(2, t"/tmp/flame-over-the-wire", List(Repl.Pair(t"K", t"v"))))
+            exchange(socket, Repl.Request.Submit(3, t"/set experimental"))
+            exchange(socket, Repl.Request.Submit(4, t"import soundness.*"))
+            exchange(socket, Repl.Request.Submit(5, t"summon[WorkingDirectory].directory()"))
+          finally
+            socket.close()
+            service.stop()
+      . assert:
+          case Repl.Reply.Ran(_, value, _, _, _, _, _, _) => value.let(_.contains(t"/tmp/flame-over-the-wire")).or(false)
+          case _                                          => false
+
+      // stdout and stderr are both captured, in the order they interleaved, and a reply locates each
+      // run by stream (`spans`) within the plain `output`, so the front-ends can shade them apart.
+      test(m"stdout and stderr are captured in order, as separate spans"):
+        supervise:
+          Repl().react(0, t"println(\"a\"); System.err.println(\"b\"); println(\"c\")")
+      . assert:
+          case Repl.Reply.Ran(_, _, output, _, _, _, _, spans) =>
+            output == t"a\nb\nc\n"
+            && spans == List(Repl.OutputSpan(t"out", 0, 2), Repl.OutputSpan(t"err", 2, 2), Repl.OutputSpan(t"out", 4, 2))
+
+          case _ =>
+            false
+
+      // The ambient `Stdio` (see `ReplStdio`) routes `Err` to the captured stderr as well.
+      test(m"Err.println is captured as stderr"):
+        supervise:
+          val repl = Repl()
+          repl.react(0, t"/set experimental")
+          repl.react(0, t"import soundness.*")
+          repl.react(1, t"Err.println(t\"oops\")")
+      . assert:
+          case Repl.Reply.Ran(_, _, output, _, _, _, _, spans) =>
+            output.contains(t"oops") && spans.exists(_.stream == t"err") && !spans.exists(_.stream == t"out")
+
+          case _ =>
+            false
 
       // A rejected line's highlight carries the error's span, mapped from the wrapped source back
       // into the line's own coordinates (`Repl.userSpan`) and split into marked tokens
