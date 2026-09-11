@@ -35,7 +35,7 @@ publishLocal:
 # release`), and are inlined otherwise. Set GITHUB_TOKEN to lift the API rate limit.
 flame.jar: assembly
 	cp out/flame/launcher/assembly.dest/out.jar flame.jar
-	java -cp flame.jar soundness.repackage --github propensive/flame,propensive/soundness,propensive/proscala
+	java -cp flame.jar soundness.repackage --github propensive/flame,propensive/pyrocosm,propensive/soundness,propensive/proscala
 
 flame: flame.jar
 	java -Dbuild.executable=flame -jar flame.jar

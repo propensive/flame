@@ -32,39 +32,21 @@
                                                                                                   */
 package flame
 
-import scala.compiletime.summonFrom
-import scala.language.implicitConversions
-
-import anticipation.*
-import archimedes.*
-import honeycomb.*
-import prepositional.*
-import spectacular.*
-
-// Renders a REPL result value as an HTML string for the web front-end, choosing the renderer by what
-// typeclass can be resolved for the value's (static) type — a cascade:
-//   1. a honeycomb `Renderable` → render to an `Html` node;
-//   2. else a spectacular `Showable` → its text;
-//   3. else `toString`.
-// The `Showable`/`toString` text is wrapped in a `#text` node and serialized, so honeycomb HTML-escapes
-// it: EVERY branch yields HTML-safe `Text` (a value whose text contains `<`/`&` cannot break the DOM).
-//
-// `render` is inlined into the compiled REPL wrapper (where the value's static type — and its
-// Renderable/Showable instances — are in scope). It binds each summoned given by name and calls its
-// typeclass method directly (`renderable.render` / `showable.text`), and delegates serialization to the
-// public `serialize`/`escape` helpers, so the wrapper needs no honeycomb/spectacular extension imports
-// — only `flame.HtmlRender` on the classpath.
-object HtmlRender:
-  inline def render[value](v: value): Text = summonFrom:
-    case renderable: (`value` is Renderable)  => serialize(renderable.render(v))
-    case given (`value` is Encodable in Math) => serialize(v.math.html)
-    case showable:   (`value` is Showable)    => escape(showable.text(v))
-    case _                                    => escape(v.toString.tt)
-
-  // Serialize an `Html` node to a `Text` (honeycomb's `Html is Showable`, which HTML-escapes text).
-  def serialize(node: Html of ?): Text = node.show
-
-  // Wrap plain text as a `#text` node and serialize it, so it is HTML-escaped.
-  def escape(content: Text): Text =
-    val node: Html of "#text" = content
-    node.show
+// Flame's colours, from the Zed theme the REPL has always been coloured with: one table, so the
+// terminal theme, the web theme and the diagnostics palette agree. Each is an `0xRRGGBB` value.
+object FlameColours:
+  val background: Int = 0x000000  // editor.background
+  val foreground: Int = 0xd4be98  // editor.foreground
+  val error:      Int = 0xea6962  // deleted (a clear red)
+  val number:     Int = 0xcc3366  // number
+  val string:     Int = 0x99ffff  // string
+  val term:       Int = 0xffcc99  // variable: every term, binding or usage
+  val tpe:        Int = 0x00cc99  // type
+  val keyword:    Int = 0xff6633  // keyword
+  val symbol:     Int = 0xcc6699  // punctuation.bracket: `(` `)` `[` `]` `:`
+  val operator:   Int = 0xf28534  // operator: `=` `.`
+  val comment:    Int = 0x928374  // comment
+  val subdued:    Int = 0x5a524c  // editor.line_number
+  val parameter:  Int = 0xd8a657  // a muted yellow, for a command's parameters and warnings
+  val margin:     Int = 0x111111  // editor.gutter.background
+  val selection:  Int = 0x2a2520  // a focused, selected row

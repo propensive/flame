@@ -40,6 +40,8 @@ import _root_.java.nio.channels as jnc
 
 import soundness.*
 
+import pyrocosm.{Block, Event, Inline, Token, Tone}
+
 
 import classloaders.threadContextClassloader
 import filesystemBackends.javaBaseFilesystem
@@ -185,7 +187,7 @@ object Tests extends Suite(m"Flame Tests"):
         supervise:
           Repl().scopeAt(t"scala.List(1, 2).map { x =>\n  ")
       . assert:
-          case Repl.ScopeBinding(name, tpe, false) :: Nil => name == t"x" && tpe == t"Int"
+          case Repl.ScopeBinding(name, tpe, false, _) :: Nil => name == t"x" && tpe == t"Int"
           case _                                          => false
 
       test(m"nested scopes report the innermost block's contextual values first"):
@@ -724,21 +726,21 @@ object Tests extends Suite(m"Flame Tests"):
         supervise:
           Repl().react(0, t"1 + 1")
       . assert:
-          case Repl.Reply.Ran(_, value, _, tpe, _, _, _, _) => value == t"2" && tpe.present
+          case Repl.Reply.Ran(_, value, _, tpe, _, _, _, _, _) => value == t"2" && tpe.present
           case _                                       => false
 
       test(m"a Unit result shows neither a value nor a type"):
         supervise:
           Repl().react(0, t"println(\"hi\")")
       . assert:
-          case Repl.Reply.Ran(_, value, _, tpe, _, _, _, _) => value.absent && tpe.absent
+          case Repl.Reply.Ran(_, value, _, tpe, _, _, _, _, _) => value.absent && tpe.absent
           case _                                       => false
 
       test(m"an import produces no result value"):
         supervise:
           Repl().react(0, t"import scala.collection.mutable.*")
       . assert:
-          case Repl.Reply.Ran(_, value, _, tpe, _, _, _, _) => value.absent && tpe.absent
+          case Repl.Reply.Ran(_, value, _, tpe, _, _, _, _, _) => value.absent && tpe.absent
           case _                                       => false
 
       test(m"a type error is reported as Rejected with notices"):
@@ -759,7 +761,7 @@ object Tests extends Suite(m"Flame Tests"):
         supervise:
           Repl().react(0, t"throw new RuntimeException(\"boom\")")
       . assert:
-          case Repl.Reply.Threw(_, _, diagnostics, _, _) =>
+          case Repl.Reply.Threw(_, _, diagnostics, _, _, _) =>
             diagnostics.contains(t"RuntimeException") && diagnostics.contains(t"boom")
             && diagnostics.contains(t".scala")
           case _ => false
@@ -992,6 +994,279 @@ object Tests extends Suite(m"Flame Tests"):
           Set(t"port", t"host", t"session", t"set", t"language", t"basic").has(name)
       . assert(_ == List())
 
+    suite(m"Exhibiting replies"):
+      given Scalac[3.9, Universe.Classfile] = Scalac(Nil)
+
+      // Every piece of text in a run of blocks, for checks that do not care about structure.
+      def texts(blocks: List[Block]): Text =
+        def inline(node: Inline): Text = node match
+          case Inline.Textual(text)   => text
+          case Inline.Code(_, tokens) => tokens.map(_.text).join
+          case Inline.Phrase(content) => content.map(inline).join
+          case Inline.Emphasis(content) => content.map(inline).join
+          case Inline.Toned(_, content) => content.map(inline).join
+          case Inline.Figure(value, _)  => value.toString.tt
+          case _                      => t""
+
+        def block(node: Block): Text = node match
+          case Block.Paragraph(content)    => content.map(inline).join
+          case Block.Group(content)        => texts(content)
+          case Block.Notice(_, _, content) => texts(content)
+          case Block.Output(text, _)       => text
+          case Block.Code(_, lines, _)     => lines.map(_.tokens.map(_.text).join).join(t"\n")
+          case Block.Table(_, rows, _)     => rows.map(_.cells.map(_.content.map(inline).join).join(t" ")).join(t"\n")
+          case _                           => t""
+
+        blocks.map(block).join(t"\n")
+
+      def exhibiting(using Monitor, System, Probate): Repl[3.9] =
+        Repl.make[3.9](Repl.Prelude.empty, Repl.Rendering.Exhibit(false))
+
+      test(m"a result is exhibited as blocks, with no text rendering"):
+        supervise(exhibiting.react(0, t"val n = 1 + 1"))
+      . assert:
+          case Repl.Reply.Ran(_, value, _, _, _, diagnostics, _, _, blocks) =>
+            val text = texts(Blocks.decode(blocks))
+            value.absent && diagnostics == t"" && text.contains(t"n") && text.contains(t"2") && text.contains(t"Int")
+          case _ => false
+
+      test(m"captured output becomes output blocks by stream"):
+        supervise(exhibiting.react(0, t"java.lang.System.out.println(\"hi\"); java.lang.System.err.println(\"oh\")"))
+      . assert:
+          case Repl.Reply.Ran(_, _, _, _, _, _, _, _, blocks) =>
+            Blocks.decode(blocks).stdlib.collect { case Block.Output(text, error) => (text.trim, error) } == scala.List((t"hi", false), (t"oh", true))
+          case _ => false
+
+      test(m"a rejection's diagnostics are notices of failure"):
+        supervise(exhibiting.react(0, t"val n: Int = \"hello\""))
+      . assert:
+          case Repl.Reply.Rejected(_, diagnostics, tokens, blocks) =>
+            val decoded = Blocks.decode(blocks)
+            diagnostics == t"" && decoded.exists { case Block.Notice(Tone.Failure, _, _) => true; case _ => false }
+              && texts(decoded).contains(t"Int") && tokens.exists(_.mark.present)
+          case _ => false
+
+      test(m"a thrown exception is exhibited as a stack trace"):
+        supervise(exhibiting.react(0, t"throw new java.lang.RuntimeException(\"boom\")"))
+      . assert:
+          case Repl.Reply.Threw(_, _, diagnostics, _, _, blocks) =>
+            diagnostics == t"" && texts(Blocks.decode(blocks)).contains(t"boom")
+          case _ => false
+
+      test(m"a diagnostic with a blank line inside survives the wire"):
+        supervise:
+          val repl = exhibiting
+          repl.react(0, t"/set experimental")
+          repl.react(0, t"import soundness.*")
+          repl.react(0, t"delay(3*Second) yet println(\"hello\")")
+      . assert:
+          case Repl.Reply.Rejected(_, _, _, blocks) =>
+            val decoded = Blocks.decode(blocks)
+            !decoded.nil && texts(decoded).contains(t"Monitor")
+          case _ => false
+
+      test(m"a connection answers a submission and pushes an asynchronous one"):
+        supervise:
+          val sessions = Sessions(Repl.Rendering.Exhibit(true))
+          val sent = scala.collection.mutable.ArrayBuffer[Repl.Reply]()
+          val connection = sessions.connection { reply => sent.synchronized { sent += reply; () } }
+          val first = connection.respond(Repl.Request.Submit(1, t"1 + 1"))
+          connection.respond(Repl.Request.Submit(2, t"/set async"))
+          val third = connection.respond(Repl.Request.Submit(3, t"6 * 7"))
+          val deadline = java.lang.System.currentTimeMillis + 20000L
+          while sent.synchronized(sent.length) < 2 && java.lang.System.currentTimeMillis < deadline do Thread.sleep(50)
+          (first, third, sent.synchronized(sent.toList))
+      . assert:
+          case (Repl.Reply.Ran(1, _, _, _, _, _, _, _, _), Unset, replies) =>
+            replies.exists { case Repl.Reply.Pending(3) => true; case _ => false }
+              && replies.exists { case Repl.Reply.Ran(3, _, _, _, _, _, _, _, blocks) => texts(Blocks.decode(blocks)).contains(t"42"); case _ => false }
+          case _ => false
+
+    suite(m"REPL interface"):
+      // An engine whose replies the test supplies, recording every request it is given.
+      class FakeEngine extends Engine:
+        val requests: scala.collection.mutable.ArrayBuffer[Repl.Request] = scala.collection.mutable.ArrayBuffer()
+        var callbacks: scala.collection.immutable.Map[Int, Repl.Reply -> Unit] = scala.collection.immutable.Map()
+        var sink: Repl.Reply -> Unit = _ => ()
+        var next: Int = 0
+        var closed: Boolean = false
+
+        def request(request: Int => Repl.Request)(reply: Repl.Reply => Unit): Unit =
+          next += 1
+          requests += request(next)
+          callbacks = callbacks.updated(next, scala.caps.unsafe.unsafeAssumePure(reply))
+
+        def send(request: Int => Repl.Request): Unit =
+          next += 1
+          requests += request(next)
+
+        def pushed(sink: Repl.Reply => Unit): Unit = this.sink = scala.caps.unsafe.unsafeAssumePure(sink)
+        def close(): Unit = closed = true
+        def answer(id: Int, reply: Repl.Reply): Unit = callbacks(id)(reply)
+        def push(reply: Repl.Reply): Unit = sink(reply)
+
+        def submissions: scala.List[Repl.Request.Submit] =
+          requests.toList.collect { case submit: Repl.Request.Submit => submit }
+
+      def blocksOf(text: Text): Text = Blocks.encode(List(Block.paragraph(text)))
+
+      def pendingEntry(block: Block): Boolean = block match
+        case Block.Group(content) => content.stdlib.lastOption.exists { case Block.Gauge(_, _) => true; case _ => false }
+        case _                    => false
+
+      def texts(blocks: List[Block]): Text =
+        def inline(node: Inline): Text = node match
+          case Inline.Textual(text)     => text
+          case Inline.Code(_, tokens)   => tokens.map(_.text).join
+          case Inline.Phrase(content)   => content.map(inline).join
+          case Inline.Emphasis(content) => content.map(inline).join
+          case Inline.Toned(_, content) => content.map(inline).join
+          case Inline.Figure(value, _)  => value.toString.tt
+          case _                        => t""
+
+        def block(node: Block): Text = node match
+          case Block.Paragraph(content)    => content.map(inline).join
+          case Block.Group(content)        => texts(content)
+          case Block.Notice(_, _, content) => texts(content)
+          case Block.Output(text, _)       => text
+          case _                           => t""
+
+        blocks.map(block).join(t"\n")
+
+      def fresh(options: ReplInterface.Options = ReplInterface.Options())(using Monitor, Probate): (FakeEngine, ReplInterface) =
+        val engine = FakeEngine()
+        (engine, scala.caps.unsafe.unsafeAssumePure(ReplInterface(engine, options)))
+
+      test(m"a submission becomes a pending entry and a request"):
+        supervise:
+          val (engine, interface) = fresh()
+          interface.handle(Event.Submitted(interface.field.input, t"1 + 1"))
+          (engine.submissions, interface.transcript())
+      . assert:
+          case (scala.List(Repl.Request.Submit(_, t"1 + 1")), entries) => entries.stdlib.length == 1 && pendingEntry(entries.stdlib.head)
+          case _ => false
+
+      test(m"a trailing blank line is stripped from a submission"):
+        supervise:
+          val (engine, interface) = fresh()
+          interface.handle(Event.Submitted(interface.field.input, t"val x = 1\n  x\n"))
+          engine.submissions.map(_.code)
+      . assert(_ == scala.List(t"val x = 1\n  x"))
+
+      test(m"an engine answering before the request returns still settles the entry"):
+        supervise:
+          val engine = FakeEngine()
+          val interface: ReplInterface = scala.caps.unsafe.unsafeAssumePure(ReplInterface(engine, ReplInterface.Options()))
+          val immediate: Engine = new Engine:
+            def request(request: Int => Repl.Request)(reply: Repl.Reply => Unit): Unit =
+              request(7) match
+                case Repl.Request.Submit(id, _) => reply(Repl.Reply.Ran(id, Unset, t"", Unset, Unset, t"", Nil, Nil, blocksOf(t"at once")))
+                case _                          => ()
+            def send(request: Int => Repl.Request): Unit = ()
+            def pushed(sink: Repl.Reply => Unit): Unit = ()
+            def close(): Unit = ()
+          val prompt: ReplInterface = scala.caps.unsafe.unsafeAssumePure(ReplInterface(immediate, ReplInterface.Options()))
+          prompt.handle(Event.Submitted(prompt.field.input, t"1 + 1"))
+          prompt.transcript()
+      . assert: entries =>
+          entries.stdlib.length == 1 && !pendingEntry(entries.stdlib.head) && texts(entries).contains(t"at once")
+
+      test(m"the reply settles the entry in place"):
+        supervise:
+          val (engine, interface) = fresh()
+          interface.handle(Event.Submitted(interface.field.input, t"1 + 1"))
+          val id = engine.submissions.head.id
+          engine.answer(id, Repl.Reply.Ran(id, Unset, t"", Unset, Unset, t"", Nil, Nil, blocksOf(t"res0: Int = 2")))
+          interface.transcript()
+      . assert: entries =>
+          entries.stdlib.length == 1 && !pendingEntry(entries.stdlib.head) && texts(entries).contains(t"res0: Int = 2")
+
+      test(m"an asynchronous run streams its output before its reply fills the entry"):
+        supervise:
+          val (engine, interface) = fresh()
+          interface.handle(Event.Submitted(interface.field.input, t"slow()"))
+          val id = engine.submissions.head.id
+          engine.answer(id, Repl.Reply.Pending(id))
+          engine.push(Repl.Reply.Output(id, t"hi\n", Repl.stdoutStream))
+          val streaming = interface.transcript()
+          engine.push(Repl.Reply.Ran(id, Unset, t"hi\n", Unset, Unset, t"", Nil, List(Repl.OutputSpan(Repl.stdoutStream, 0, 3)), t""))
+          (streaming, interface.transcript())
+      . assert:
+          case (streaming, settled) =>
+            // The streamed chunk shows while the run is pending; the reply then carries the whole
+            // output itself, shown once.
+            pendingEntry(streaming.stdlib.head) && texts(streaming).contains(t"hi")
+              && !pendingEntry(settled.stdlib.head) && texts(settled).s.split("hi").nn.length == 2
+
+      test(m"editing decorates the prompt at once and asks the engine for the scope"):
+        supervise:
+          val (engine, interface) = fresh()
+          interface.handle(Event.Edited(interface.field.input, t"val x = (", 9))
+          (engine.requests.toList, interface.field.decoration())
+      . assert:
+          case (scala.List(Repl.Request.Tokenize(_, t"val x = (")), decoration) =>
+            decoration.incomplete && decoration.tokens.exists(_.text == t"val")
+          case _ => false
+
+      test(m"a multi-line entry submits only after a blank line"):
+        supervise:
+          val (engine, interface) = fresh()
+          interface.handle(Event.Edited(interface.field.input, t"val x = 1\nx", 11))
+          val open = interface.field.decoration().incomplete
+          interface.handle(Event.Edited(interface.field.input, t"val x = 1\nx\n", 12))
+          (open, interface.field.decoration().incomplete)
+      . assert(_ == (true, false))
+
+      test(m"a command is never incomplete"):
+        supervise:
+          val (engine, interface) = fresh()
+          interface.handle(Event.Edited(interface.field.input, t"/set async", 10))
+          interface.field.decoration()
+      . assert: decoration =>
+          !decoration.incomplete && decoration.tokens.stdlib.headOption.exists(_.accent == Token.Accent.Command)
+
+      test(m"/clear empties the transcript"):
+        supervise:
+          val (engine, interface) = fresh()
+          interface.handle(Event.Submitted(interface.field.input, t"1 + 1"))
+          interface.handle(Event.Submitted(interface.field.input, t"/clear"))
+          (interface.transcript(), engine.submissions.length)
+      . assert(_ == (Nil, 1))
+
+      test(m"/session asks the engine and notes the answer"):
+        supervise:
+          val (engine, interface) = fresh()
+          interface.handle(Event.Submitted(interface.field.input, t"/session other"))
+          val id = engine.requests.toList.collect { case Repl.Request.Session(id, t"other") => id }.head
+          engine.answer(id, Repl.Reply.Session(id, t"other", List(t"default", t"other"), Repl.SessionOutcome.Joined))
+          texts(interface.transcript())
+      . assert(_.contains(Repl.messages.switched(t"other")))
+
+      test(m"submissions join the history and are persisted"):
+        supervise:
+          val persisted = scala.collection.mutable.ArrayBuffer[Text]()
+          val (engine, interface) = fresh(ReplInterface.Options(history = List(t"earlier"), persist = persisted += _))
+          interface.handle(Event.Submitted(interface.field.input, t"1 + 1"))
+          interface.handle(Event.Submitted(interface.field.input, t"1 + 1"))
+          (interface.field.history(), persisted.toList)
+      . assert(_ == (List(t"earlier", t"1 + 1"), scala.List(t"1 + 1")))
+
+      test(m"an unknown command is refused without troubling the engine"):
+        supervise:
+          val (engine, interface) = fresh()
+          interface.handle(Event.Submitted(interface.field.input, t"/nonsense"))
+          (engine.submissions.length, texts(interface.transcript()))
+      . assert:
+          case (0, text) => text.contains(Repl.messages.unknownCommand(t"/nonsense"))
+          case _ => false
+
+      test(m"closing the interface closes the engine"):
+        supervise:
+          val (engine, interface) = fresh()
+          interface.handle(Event.Closed)
+          engine.closed
+      . assert(_ == true)
+
     suite(m"REPL TCP server"):
       given Scalac[3.9, Universe.Classfile] = Scalac(Nil)
 
@@ -1008,7 +1283,7 @@ object Tests extends Suite(m"Flame Tests"):
       // The type is the SINGLETON `2`, not `Int`: an expression line is bound as a `final val`, so a
       // constant expression keeps the constant type the compiler folds it to (see `Repl.resultType`).
       . assert:
-          case Repl.Reply.Ran(_, value, _, tpe, _, _, _, _) =>
+          case Repl.Reply.Ran(_, value, _, tpe, _, _, _, _, _) =>
             value.let(_ == t"2").or(false) && tpe.let(_.text == t"2").or(false)
 
           case _ =>
@@ -1053,7 +1328,7 @@ object Tests extends Suite(m"Flame Tests"):
             channel.close()
             service.stop()
       . assert:
-          case Repl.Reply.Ran(_, value, _, _, _, _, _, _) => value.let(_ == t"42").or(false)
+          case Repl.Reply.Ran(_, value, _, _, _, _, _, _, _) => value.let(_ == t"42").or(false)
           case _                                    => false
 
       test(m"sessions are independent and each has a distinct name"):
@@ -1253,7 +1528,7 @@ object Tests extends Suite(m"Flame Tests"):
             socket.close()
             service.stop()
       . assert:
-          case Repl.Reply.Ran(_, value, _, _, _, _, _, _) => value.let(_.contains(t"/tmp/flame-over-the-wire")).or(false)
+          case Repl.Reply.Ran(_, value, _, _, _, _, _, _, _) => value.let(_.contains(t"/tmp/flame-over-the-wire")).or(false)
           case _                                          => false
 
       // stdout and stderr are both captured, in the order they interleaved, and a reply locates each
@@ -1262,7 +1537,7 @@ object Tests extends Suite(m"Flame Tests"):
         supervise:
           Repl().react(0, t"println(\"a\"); System.err.println(\"b\"); println(\"c\")")
       . assert:
-          case Repl.Reply.Ran(_, _, output, _, _, _, _, spans) =>
+          case Repl.Reply.Ran(_, _, output, _, _, _, _, spans, _) =>
             output == t"a\nb\nc\n"
             && spans == List(Repl.OutputSpan(t"out", 0, 2), Repl.OutputSpan(t"err", 2, 2), Repl.OutputSpan(t"out", 4, 2))
 
@@ -1277,7 +1552,7 @@ object Tests extends Suite(m"Flame Tests"):
           repl.react(0, t"import soundness.*")
           repl.react(1, t"Err.println(t\"oops\")")
       . assert:
-          case Repl.Reply.Ran(_, _, output, _, _, _, _, spans) =>
+          case Repl.Reply.Ran(_, _, output, _, _, _, _, spans, _) =>
             output.contains(t"oops") && spans.exists(_.stream == t"err") && !spans.exists(_.stream == t"out")
 
           case _ =>
@@ -1290,7 +1565,7 @@ object Tests extends Suite(m"Flame Tests"):
         supervise:
           Repl().react(0, t"val n: Int = \"hello\"")
       . assert:
-          case Repl.Reply.Rejected(_, _, tokens) =>
+          case Repl.Reply.Rejected(_, _, tokens, _) =>
             val marked = tokens.filter(_.mark.present)
             marked.map(_.text).join == t"\"hello\"" && !marked.exists(_.mark != Repl.errorMark)
 
@@ -1302,7 +1577,7 @@ object Tests extends Suite(m"Flame Tests"):
         supervise:
           Repl().react(0, t"def f: Int =\n  1 + \"x\"")
       . assert:
-          case Repl.Reply.Rejected(_, _, tokens) =>
+          case Repl.Reply.Rejected(_, _, tokens, _) =>
             val marked = tokens.filter(_.mark.present).map(_.text).join
             marked.contains(t"\"x\"") && !marked.contains(t"def")
 
@@ -1389,7 +1664,7 @@ object Tests extends Suite(m"Flame Tests"):
             socket.close()
             service.stop()
       . assert:
-          case Repl.Reply.Tokenized(2, _, true, false, Repl.ScopeBinding(name, tpe, false) :: Nil) =>
+          case Repl.Reply.Tokenized(2, _, true, false, Repl.ScopeBinding(name, tpe, false, _) :: Nil) =>
             name == t"y" && tpe == t"Int"
 
           case _ =>

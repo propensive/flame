@@ -47,17 +47,18 @@ import stenography.*
 import vacuous.*
 
 import delicious.*  // Markup, SemanticMessage, Reifier, `semantic` on Notice, `teletype` on SemanticMessage
+import pyrocosm.{Block, Tone}
+import pyrocosm.{exhibit, sourceCodePresentable, flattened}
 
 // Renders compiler notices for a REPL reply, re-rendering the TYPES embedded in each error message
 // through stenography and syntax-highlighting both them and any embedded CODE SAMPLES with harlequin.
 // Under `-Zsemantic-diagnostics` the compiler wraps every interpolated type of a message in in-band
 // markers carrying its pickled TASTy, and interpolated trees as `code` nodes; `delicious` parses that
 // into a `Markup` tree and its `Reifier` turns each type marker's TASTy back into a
-// `stenography.Syntax`. For the CLI (`Inspect`) the rendering is `delicious.ansi`'s `teletype` —
-// harlequin-highlighted code and types as coloured ANSI; for the web (`Html`) the same tree is walked
-// here, emitting harlequin tokens as `tok-*` spans (the classes the web page already styles). Both
-// fall back to the compiler's own printed text for anything that cannot be reified, and to the plain
-// message when there is no semantic markup at all.
+// `stenography.Syntax`. For `Inspect` the rendering is `delicious.ansi`'s `teletype`, harlequin-
+// highlighted code and types as coloured ANSI; for `Exhibit` the same tree becomes Pyrocosm
+// blocks (`blocks`). Both fall back to the compiler's own printed text for anything that cannot
+// be reified, and to the plain message when there is no semantic markup at all.
 object SemanticRender:
   private def hex(rgb: Int): Color in Srgb =
     Srgb(((rgb >> 16) & 0xff)/255.0, ((rgb >> 8) & 0xff)/255.0, (rgb & 0xff)/255.0)
@@ -69,27 +70,27 @@ object SemanticRender:
   // Zed's punctuation.bracket/operator respectively.)
   val palette: ScalaSyntaxPalette = new Palette:
     type Form = Srgb
-    def background:       Color in Srgb = hex(0x000000)  // editor.background
-    def foreground:       Color in Srgb = hex(0xd4be98)  // editor.foreground
-    def scalaError:       Color in Srgb = hex(0xea6962)  // deleted (a clear red)
-    def scalaNumber:      Color in Srgb = hex(0xcc3366)  // number
-    def scalaString:      Color in Srgb = hex(0x99ffff)  // string
-    def scalaTerm:        Color in Srgb = hex(0xffcc99)  // variable — every term (binding or usage)
-    def scalaType:        Color in Srgb = hex(0x00cc99)  // type
-    def scalaKeyword:     Color in Srgb = hex(0xff6633)  // keyword
-    def scalaSymbol:      Color in Srgb = hex(0xcc6699)  // punctuation.bracket — `(` `)` `[` `]` `:`
-    def scalaParenthesis: Color in Srgb = hex(0xf28534)  // operator — `=` `.`
-    def scalaModifier:    Color in Srgb = hex(0xff6633)  // keyword (no distinct modifier scope)
-    def scalaComment:     Color in Srgb = hex(0x928374)  // comment
-    def subdued:          Color in Srgb = hex(0x5a524c)  // editor.line_number
-    def accented:         Color in Srgb = hex(0xd4be98)  // editor.active_line_number
-    def margin:           Color in Srgb = hex(0x111111)  // editor.gutter.background
+    def background:       Color in Srgb = hex(FlameColours.background)
+    def foreground:       Color in Srgb = hex(FlameColours.foreground)
+    def scalaError:       Color in Srgb = hex(FlameColours.error)
+    def scalaNumber:      Color in Srgb = hex(FlameColours.number)
+    def scalaString:      Color in Srgb = hex(FlameColours.string)
+    def scalaTerm:        Color in Srgb = hex(FlameColours.term)
+    def scalaType:        Color in Srgb = hex(FlameColours.tpe)
+    def scalaKeyword:     Color in Srgb = hex(FlameColours.keyword)
+    def scalaSymbol:      Color in Srgb = hex(FlameColours.symbol)
+    def scalaParenthesis: Color in Srgb = hex(FlameColours.operator)
+    def scalaModifier:    Color in Srgb = hex(FlameColours.keyword)
+    def scalaComment:     Color in Srgb = hex(FlameColours.comment)
+    def subdued:          Color in Srgb = hex(FlameColours.subdued)
+    def accented:         Color in Srgb = hex(FlameColours.foreground)
+    def margin:           Color in Srgb = hex(FlameColours.margin)
+
 
   // Renders `notices` to the diagnostics string. `reifier` reifies the TASTy of each type marker
   // (`Unset` — no marker present, or the reifier could not be built — falls back to compiler text).
-  // `html` picks the target: HTML spans for the web, coloured ANSI for the terminal.
-  def render(notices: List[Notice], reifier: Optional[Reifier], html: Boolean)(using Imports): Text =
-    notices.map { (notice: Notice) => renderNotice(notice, reifier, html) }.join(t"; ")
+  def render(notices: List[Notice], reifier: Optional[Reifier])(using Imports): Text =
+    notices.map { (notice: Notice) => renderNotice(notice, reifier) }.join(t"; ")
 
   // The column at which a diagnostic's PROSE word-wraps in the terminal rendering. Neither the daemon
   // nor basic mode knows the client terminal's true width, so this follows the compiler's own
@@ -97,11 +98,9 @@ object SemanticRender:
   // than the width is emitted whole on its own line.
   private val wrapWidth: Int = 80
 
-  private def renderNotice(notice: Notice, reifier: Optional[Reifier], html: Boolean)(using Imports)
-  :   Text =
-    notice.semantic.lay(if html then htmlPlain(notice.message) else wrapPlain(notice.message)): message =>
-      if html then htmlNodes(message.markup, reifier)
-      else ansiMessage(message, reifier).render(xtermTrueColorTermcap)
+  private def renderNotice(notice: Notice, reifier: Optional[Reifier])(using Imports): Text =
+    notice.semantic.lay(wrapPlain(notice.message)): message =>
+      ansiMessage(message, reifier).render(xtermTrueColorTermcap)
 
   // ── ANSI (the CLI's `Inspect` mode) ──────────────────────────────────────────────────────────
   // Mirrors `delicious.ansi`'s Teletype rendering (harlequin-highlighted code samples,
@@ -211,44 +210,105 @@ object SemanticRender:
   private def typeText(typed: Markup.Typed, reifier: Optional[Reifier])(using Imports): Text =
     reifier.lay(Unset: Optional[Syntax])(_.syntax(typed)).let(_.text).or(typed.plain)
 
-  // ── HTML (the web's `Html` mode) ─────────────────────────────────────────────────────────────
-  // Mirrors `delicious.ansi`'s Teletype rendering for the web: code samples and types are tokenized
-  // by harlequin (`Tokenized` depth — no compiler, no classpath) and emitted as `tok-<accent>` spans,
-  // the same classes the web editor already colours.
-  private def htmlNodes(nodes: List[Markup], reifier: Optional[Reifier])(using Imports): Text =
-    nodes.map { (node: Markup) => htmlNode(node, reifier) }.join
+  // The notices as Pyrocosm blocks: one notice per `Notice`, its message as paragraphs (one
+  // per line of the message, so the compiler's `Found:`/`Required:` lines keep their own),
+  // types highlighted as Scala types after stenography's abbreviation, code samples as Scala
+  // terms, a multi-line sample as a code block of its own.
+  def blocks(notices: List[Notice], reifier: Optional[Reifier])(using Imports): List[Block] =
+    notices.map { (notice: Notice) => noticeBlock(notice, reifier) }
 
-  private def htmlNode(markup: Markup, reifier: Optional[Reifier])(using Imports): Text = markup match
-    case Markup.Textual(text)               => htmlPlain(text)
+  private def noticeBlock(notice: Notice, reifier: Optional[Reifier])(using Imports): Block =
+    val tone: Tone = notice.importance match
+      case Importance.Error   => Tone.Failure
+      case Importance.Warning => Tone.Warning
+      case _                  => Tone.Info
 
-    // A code sample must not word-wrap mid-token: the `.code-sample` class (styled `white-space: pre`
-    // in the web page) exempts it from the surrounding `pre-wrap` prose flow.
-    case Markup.Code(_, _) =>
-      t"""<span class="code-sample">${htmlHighlight(markup.plain, Scala.Context.Term)}</span>"""
-    case typed: Markup.Typed                => htmlHighlight(typeText(typed, reifier), Scala.Context.Type)
-    case Markup.Symbolic(_, _, _, children) => htmlNodes(children, reifier)
-    case Markup.Named(_, _, children)       => htmlNodes(children, reifier)
-    case Markup.Spanned(_, _, children)     => htmlNodes(children, reifier)
+    // The message is shown trimmed of the whitespace around it: a compiler message often ends
+    // in a newline, which would stand as a blank line of the notice.
+    val content: List[Block] = notice.semantic.lay(paragraphs(stripAnsi(notice.message).trim)): message =>
+      markupBlocks(message.markup, reifier)
 
-  // Harlequin-highlights `text` (ANSI-stripped first — the compiler may have styled it) in `context`,
-  // as `tok-*` spans. Newlines are re-inserted between the token lines, exactly as `Repl.project` does.
-  private def htmlHighlight(text: Text, context: Scala.Context): Text =
-    val lines: List[List[harlequin.Token]] =
-      List.from(Scala.highlight(stripAnsi(text), context).lines.readable)
+    Block.Notice(tone, Unset, content)
 
-    lines
-     . map: (line: List[harlequin.Token]) =>
-         line.map: (token: harlequin.Token) =>
-           t"""<span class="tok-${token.accent.toString.tt.lower}">${escapeHtml(token.text)}</span>"""
-         . join
-     . join(t"\n")
+  // A message's lines stay together in one paragraph, broken where the message breaks.
+  private def paragraphs(text: Text): List[Block] =
+    val lines: scala.List[Text] = text.cut(t"\n").stdlib
+    val content: scala.List[pyrocosm.Inline] = lines.zipWithIndex.flatMap { (line, index) =>
+      (if index == 0 then scala.Nil else scala.List(pyrocosm.Inline.Break())) ::: lineInlines(line) }
+    List(Block.Paragraph(List.from(content)))
 
-  private def escapeHtml(text: Text): Text =
-    text.s.replace("&", "&amp;").nn.replace("<", "&lt;").nn.replace(">", "&gt;").nn.tt
+  // One line of a message as phrasing: a line of a missing-given diagnostic's tree (frontier's
+  // `■ resolving Foo`, `└─ ▸ propose bar`, and so on) has its mark toned, its keyword kept and
+  // its name highlighted as the type or value it is; any other line is text.
+  private val treeLine = "^([\\s│├└─]*)([■✓✗▪▸])\\s+(resolving|found|requires|candidate|propose)\\s+(\\S.*?)(\\s+\\(.*\\))?$".r
 
-  // Strips ANSI SGR escapes, then HTML-escapes — used to make an already-ANSI diagnostic (a thrown
-  // exception's stack trace) safe for the web's trusted-HTML diagnostics slot without colour.
+  private def lineInlines(line: Text): scala.List[pyrocosm.Inline] = line.s match
+    case treeLine(prefix0, mark0, keyword0, name0, label) =>
+      val prefix = prefix0.nn
+      val mark = mark0.nn
+      val keyword = keyword0.nn
+      val name = name0.nn
+
+      val tone: Tone = mark match
+        case "■" => Tone.Accent
+        case "✓" => Tone.Success
+        case "✗" => Tone.Failure
+        case "▪" => Tone.Warning
+        case _   => Tone.Info
+
+      val context = if keyword == "propose" then Scala.Context.Term else Scala.Context.Type
+      val labelled: scala.List[pyrocosm.Inline] =
+        if label == null then scala.Nil else scala.List(pyrocosm.Inline.Toned(Tone.Muted, pyrocosm.Inline.text(label.nn.tt)))
+
+      scala.List(pyrocosm.Inline.Toned(Tone.Muted, pyrocosm.Inline.text(prefix.tt)),
+        pyrocosm.Inline.Toned(tone, pyrocosm.Inline.text(mark.tt)),
+        pyrocosm.Inline.Textual(t" $keyword "),
+        highlighted(name.tt, context)) ::: labelled
+
+    case _ => scala.List(pyrocosm.Inline.Textual(line))
+
+  private def highlighted(text: Text, context: Scala.Context): pyrocosm.Inline =
+    pyrocosm.Inline.Code(pyrocosm.Language.Scala, Scala.highlight(stripAnsi(text), context).flattened)
+
+  // Runs of phrasing become one paragraph, broken at the message's own newlines; a code sample
+  // with a newline in it becomes a code block between paragraphs.
+  private def markupBlocks(nodes: List[Markup], reifier: Optional[Reifier])(using Imports): List[Block] =
+    val blocks = sci.List.newBuilder[Block]
+    var run: sci.List[pyrocosm.Inline] = sci.Nil
+
+    // A paragraph is trimmed of the breaks and blank text at either end.
+    def blank(node: pyrocosm.Inline): Boolean = node match
+      case pyrocosm.Inline.Break()      => true
+      case pyrocosm.Inline.Textual(text) => text.trim == t""
+      case _                            => false
+
+    def flush(): Unit =
+      val trimmed: sci.List[pyrocosm.Inline] = run.dropWhile(blank).reverse.dropWhile(blank)
+      if trimmed.nonEmpty then blocks += Block.Paragraph(List.from(trimmed))
+      run = sci.Nil
+
+    def phrase(markup: Markup): Unit = markup match
+      case Markup.Textual(text) =>
+        val lines = stripAnsi(text).cut(t"\n").stdlib
+        lines.zipWithIndex.foreach: (line, index) =>
+          if index > 0 then run = pyrocosm.Inline.Break() :: run
+          if line != t"" then run = lineInlines(line).reverse ::: run
+
+      case Markup.Code(_, _) =>
+        if markup.plain.contains(t"\n") then
+          flush()
+          blocks += Scala.highlight(stripAnsi(markup.plain), Scala.Context.Term).exhibit
+        else run = highlighted(markup.plain, Scala.Context.Term) :: run
+
+      case typed: Markup.Typed                => run = highlighted(typeText(typed, reifier), Scala.Context.Type) :: run
+      case Markup.Symbolic(_, _, _, children) => children.each(phrase)
+      case Markup.Named(_, _, children)       => children.each(phrase)
+      case Markup.Spanned(_, _, children)     => children.each(phrase)
+
+    nodes.each(phrase)
+    flush()
+    List.from(blocks.result())
+
   def stripAnsi(text: Text): Text =
     text.s.replaceAll("\\e?\\[[0-9;]*m", "").nn.tt
 
-  def htmlPlain(text: Text): Text = escapeHtml(stripAnsi(text))

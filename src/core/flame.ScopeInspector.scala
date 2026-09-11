@@ -143,7 +143,7 @@ class ScopeInspector(arguments: List[Text]):
     while (scope ne NoContext) && !scope.owner.isClass && depth < 64 do
       scope.scope.toList.foreach: symbol =>
         if relevant(symbol) then
-          val binding = render(symbol, imports)
+          val binding = render(symbol, imports).copy(level = depth)
           val key = t"${binding.name.or(t"")}:${binding.tpe}"
           if !seen.contains(key) then
             seen += key

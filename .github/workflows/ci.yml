@@ -21,3 +21,6 @@ jobs:
       assembly:      flame.launcher.assembly
       test_assembly: flame.test.assembly
       test_main:     flame.runTests
+      # The Pyrocosm release the interface is built on (`pyrocosmVersion` in build.mill), synced
+      # from its own GitHub Releases like the Soundness release.
+      extra_releases: propensive/pyrocosm=0.1.0

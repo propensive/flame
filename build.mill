@@ -41,6 +41,13 @@ object settings:
   // etc/ci/release.sh refuses to release when this pin disagrees with its VERSION argument.
   val flameVersion = sys.env.getOrElse("FLAME_VERSION", "0.1.2")
 
+  // The Pyrocosm release the user interface is built on: the model (and its compiler-facing
+  // exhibitions) in core, the terminal frontend in the client, the web frontend in web.
+  // Resolved from `~/.ivy2/local` like the Soundness components: installed from Pyrocosm's
+  // GitHub Releases by the shared CI workflow's `extra_releases` input, or locally by
+  // Soundness's sync script pointed at Pyrocosm, or by `make publishLocal` there.
+  val pyrocosmVersion = "0.1.0"
+
   val scalaOptions = Seq(
     // The fork's opt-in behaviours, enabled by name, exactly as the Soundness build enables
     // them (flame compiles the same idioms from the same TASTy): every capture-checking
@@ -163,6 +170,10 @@ object settings:
     "guillotine-core", "telekinesis-jvm", "urticose-url", "honeycomb-core", "cataclysm-core",
     "probably-core", "escapade-io", "imperial-core", "serpentine-core")
   . map(component)
+
+  val pyrocosmCoreDeps = Seq(
+    mvn"dev.propensive:pyrocosm-model:$pyrocosmVersion",
+    mvn"dev.propensive:pyrocosm-compiler:$pyrocosmVersion")
 
   val clientDeps = Seq(
     "ethereal-core",             // the daemon
@@ -400,7 +411,7 @@ object flame extends Project:
   // Soundness components. Released as `dev.propensive:flame-core`.
   object core extends Component(), Publishing:
     def mvnDeps =
-      settings.coreDeps :+ mvn"org.scala-lang:scala3-compiler_3:${settings.scalaVersion}"
+      settings.coreDeps ++ settings.pyrocosmCoreDeps :+ mvn"org.scala-lang:scala3-compiler_3:${settings.scalaVersion}"
 
     // frontier — `soundness.explainMissingContext`, the `@internal.diagnostic` catch-all given
     // that renders Soundness's missing-given advice — is a RUNTIME dependency only: it must be on
@@ -417,13 +428,13 @@ object flame extends Project:
   // `flame serve` can launch the web front-end in-process); those become `flame-core`/`flame-web`
   // POM dependencies, and the web front-end's Soundness deps come transitively.
   object client extends Component(core, web), Publishing:
-    def mvnDeps = settings.clientDeps
+    def mvnDeps = settings.clientDeps :+ mvn"dev.propensive:pyrocosm-terminal:${settings.pyrocosmVersion}"
 
   // An alternative, web-based front-end (`flame.web`): serves a page and forwards REPL input/output
   // over a WebSocket, driving the same `core` engine as the CLI client. Published as
   // `dev.propensive:flame-web`; still assembled directly by `make web`, hence `finalMainClass`.
   object web extends Component(core), Publishing:
-    def mvnDeps = settings.webDeps
+    def mvnDeps = settings.webDeps :+ mvn"dev.propensive:pyrocosm-web:${settings.pyrocosmVersion}"
     def finalMainClass = "flame.web"
     def prependShellScript = ""
 

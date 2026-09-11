@@ -83,6 +83,9 @@ import filesystemBackends.javaBaseFilesystem
 import pathInterfaces.pathOnLinux
 import stenography.Syntax
 
+// Named imports only: a wildcard would make `Text is Tel.Decodable` ambiguous with the anchor above.
+import pyrocosm.{Block, Inline}
+
 object Repl:
   object Layout:
     class Standard() extends Layout:
@@ -322,8 +325,10 @@ object Repl:
   // One binding an unfinished line has introduced into scope (see `Repl#scopeAt`): its `name`
   // where the user could write one (a lambda's `x`, a `using x: Foo`), or none for a synthetic
   // context-function parameter; its rendered type; and whether it is `contextual` — a `given`/
-  // `using` binding an implicit search would find, as opposed to a plain value.
-  case class ScopeBinding(name: Optional[Text], tpe: Text, contextual: Boolean)
+  // `using` binding an implicit search would find, as opposed to a plain value; and the `level`
+  // of the block that introduced it, innermost first from 0, so a front-end can show which
+  // wrapper each context came from.
+  case class ScopeBinding(name: Optional[Text], tpe: Text, contextual: Boolean, level: Int = 0)
 
   // A key/value pair on the wire (an environment variable of a `Request.Context`).
   case class Pair(key: Text, value: Text)
@@ -421,6 +426,10 @@ object Repl:
   // A reply to a connected client, echoing the request's `id`. `highlight` is the
   // Harlequin tokenization of the submitted line. Serialized as JSON with a `kind`
   // discriminator.
+  // `blocks`, under `Rendering.Exhibit`, is the reply's content as Pyrocosm blocks: a TEL
+  // document of a `Block.Group`, since the model anchors TEL codecs and BinTEL's structural
+  // derivation would need binary codecs for every type the model reaches (`Blocks.encode`
+  // and `Blocks.decode`). Empty under the text renderings.
   enum Reply:
     // `language` is `classify`'s verdict: the code reads as natural language rather than Scala,
     // so the front-end may route it to an assistant instead of submitting it for evaluation.
@@ -435,12 +444,12 @@ object Repl:
     // text; `spans` locates the captured runs within it, by stream, so a front-end can shade them.
     case Ran(id: Int, value: Optional[Text], output: Text, tpe: Optional[TypeText],
              name: Optional[Text], diagnostics: Text, highlight: List[Token],
-             spans: List[OutputSpan])
+             spans: List[OutputSpan], blocks: Text = t"")
 
-    case Rejected(id: Int, diagnostics: Text, highlight: List[Token])
+    case Rejected(id: Int, diagnostics: Text, highlight: List[Token], blocks: Text = t"")
     case Threw(id: Int, output: Text, diagnostics: Text, highlight: List[Token],
-               spans: List[OutputSpan])
-    case Crashed(id: Int, diagnostics: Text, highlight: List[Token])
+               spans: List[OutputSpan], blocks: Text = t"")
+    case Crashed(id: Int, diagnostics: Text, highlight: List[Token], blocks: Text = t"")
     case Failed(id: Int, message: Text)
     // Sent in async mode (`/set async`) immediately on submit: a placeholder acknowledgement. The real
     // result follows out-of-band later as an ordinary `Ran`/`Threw`/`Rejected`/`Crashed`/`Failed` reply
@@ -1170,6 +1179,20 @@ object Repl:
   // The user-facing status/notice lines that BOTH front-ends show, kept here so the CLI and the web
   // stay word-for-word identical. Each is a complete line, e.g. `/tasty` usage, already do); the
   // front-end adds its own trailing newline (CLI) or styling (web).
+  // The request a reply answers, for whoever correlates them.
+  def replyId(reply: Reply): Int = reply match
+    case Reply.Tokenized(id, _, _, _, _)         => id
+    case Reply.Completed(id, _)                  => id
+    case Reply.Ran(id, _, _, _, _, _, _, _, _)   => id
+    case Reply.Rejected(id, _, _, _)             => id
+    case Reply.Threw(id, _, _, _, _, _)          => id
+    case Reply.Crashed(id, _, _, _)              => id
+    case Reply.Failed(id, _)                     => id
+    case Reply.Pending(id)                       => id
+    case Reply.Output(id, _, _)                  => id
+    case Reply.Session(id, _, _, _)              => id
+    case Reply.SessionList(id, _)                => id
+
   object messages:
     def session(name: Text): Text = t"Session $name"
 
@@ -1458,14 +1481,16 @@ object Repl:
   // fidelity.
   case class Prelude(imports: List[String], seedTasty: List[String])
 
-  // How a result value is rendered for display. `Inspect` (the default, the CLI) uses spectacular's
-  // `Inspectable` to produce a teletype/text rendering; `Html` (the web front-end) uses the
-  // `flame.HtmlRender` cascade (a `Renderable` → HTML, else `Showable` → text, else `toString`),
-  // producing an HTML string. Both render INSIDE the compiled wrapper (where the value's static type
-  // is known) and stash the resulting `Text` via `ReplBridge`, so the choice only changes the
-  // rendering call emitted into the wrapper.
+  // How a result value is rendered for display. `Inspect` (the default, `--basic` and the REST
+  // API) uses spectacular's `Inspectable` to produce teletype text; `Exhibit` uses Pyrocosm's
+  // `Presentable` cascade to produce the model's blocks, for either medium, with `ansi` saying
+  // whether captured output may carry ANSI sequences (yes for a terminal, no for a web page).
+  // Both render INSIDE the compiled wrapper (where the value's static type is known) and stash
+  // the resulting `Text` via `ReplBridge`, so the choice only changes the rendering call emitted
+  // into the wrapper.
   enum Rendering:
-    case Inspect, Html
+    case Inspect
+    case Exhibit(ansi: Boolean)
 
   def make[version <: Scalac.Versions]
     ( prelude: Repl.Prelude, render: Repl.Rendering = Repl.Rendering.Inspect )
@@ -1829,7 +1854,7 @@ class Repl[version <: Scalac.Versions]
   // messages through stenography when the compiler supplied semantic markup (`-Zsemantic-diagnostics`);
   // otherwise the plain messages. Types are abbreviated against the session's imports (`semanticImports`)
   // so they read as the user wrote them. The output targets THIS session's front-end (`render`):
-  // coloured ANSI for `Inspect` (the CLI), HTML for `Html` (the web). The (expensive) reifier is built
+  // coloured ANSI for `Inspect`. The (expensive) reifier is built
   // only when some notice actually carries markup — and when it is, the imports are resolved through
   // it (`Reifier#imports`, Soundness #1959), which extends the direct imports with the targets of the
   // `export` aliases in every wildcard-imported scope, so a type reached through a prelude's export
@@ -1844,7 +1869,7 @@ class Repl[version <: Scalac.Versions]
       // AGAIN here, for every designator, on every diagnostic).
       given stenography.Imports = semanticImports
 
-      SemanticRender.render(notices, reifier, render == Repl.Rendering.Html)
+      SemanticRender.render(notices, reifier)
 
   // The compiler to use for the next line: the session's `Scalac` plus the flag of every setting the
   // user has switched on (`/set <name>`). `Scalac.Option` is contravariant in its version, so an
@@ -2264,8 +2289,8 @@ class Repl[version <: Scalac.Versions]
 
             // The ambient `Stdio`'s termcap for this run: ANSI in the terminal, plain on the web.
             val termcap: Termcap = render match
-              case Repl.Rendering.Html => termcapDefinitions.basicTermcap
-              case _                   => termcapDefinitions.xterm256Termcap
+              case Repl.Rendering.Exhibit(false) => termcapDefinitions.basicTermcap
+              case _                             => termcapDefinitions.xterm256Termcap
 
             ReplStdio.withTermcap(termcap):
               Repl.CapturedOut.capture(out, err):
@@ -2359,17 +2384,17 @@ class Repl[version <: Scalac.Versions]
   // The two lines that render the value bound to `ref` and stash the rendering under `key` for
   // the outcome: an `@experimental` initializer (experimental mode is enabled just here, since
   // spectacular `inspect` is `@experimental`, so the line compiles even when the session is not
-  // in experimental mode) whose body renders per the session's `render` mode — `Inspect` uses
-  // `.inspect` (teletype/text, CLI), `Html` uses `flame.HtmlRender.render` (the typeclass
-  // cascade → HTML, web). The rendering runs INSIDE the wrapper, where `ref`'s static type is
-  // known.
+  // in experimental mode) whose body renders per the session's `render` mode: `Inspect` uses
+  // `.inspect` (teletype text), `Exhibit` uses `flame.ExhibitRender.render` (the `Presentable`
+  // cascade, to the model's blocks). The rendering runs INSIDE the wrapper, where `ref`'s static
+  // type is known.
   private def renderInto(ref: Text, key: Text): List[Text] =
     val put: Text = render match
       case Repl.Rendering.Inspect =>
         t"flame.ReplBridge.put(${session.toString.tt}L, \"$key\", flame.InspectRender.render($ref))"
 
-      case Repl.Rendering.Html =>
-        t"flame.ReplBridge.put(${session.toString.tt}L, \"$key\", flame.HtmlRender.render($ref))"
+      case Repl.Rendering.Exhibit(_) =>
+        t"flame.ReplBridge.put(${session.toString.tt}L, \"$key\", flame.ExhibitRender.render($ref))"
 
     List
       ( t"@scala.annotation.experimental private val ${ref}_shown: scala.Unit =",
@@ -2928,28 +2953,57 @@ class Repl[version <: Scalac.Versions]
         case Built.Complete(result) => result
         case Built.Deferred(run)    => run()
 
+    // Under `Exhibit`, the reply carries the result as blocks (the value from its exhibit, the
+    // output by stream, the diagnostics, a stack trace) and the text fields stay empty; under
+    // the text renderings the reverse, so the reifier runs once either way.
+    val exhibiting: Boolean = render match
+      case Repl.Rendering.Exhibit(_) => true
+      case _                         => false
+
+    val ansi: Boolean = render match
+      case Repl.Rendering.Exhibit(ansi) => ansi
+      case _                            => true
+
+    def noticeBlocks(notices: List[Notice]): List[Block] =
+      if !exhibiting || notices.nil then Nil else reifierLock.synchronized:
+        val reifier: Optional[delicious.Reifier] =
+          if notices.exists { (notice: Notice) => notice.markup.present } then semanticReifier else Unset
+
+        given stenography.Imports = semanticImports
+        SemanticRender.blocks(notices, reifier)
+
+    def diagnosticsText(notices: List[Notice]): Text = if exhibiting then t"" else renderDiagnostics(notices)
+
     outcome.lay(unprocessed):
       case Outcome.Ran(notices, value, output, name, tpe) =>
         // `evaluate` has already chosen the binding name/type and suppressed the value of a bare
         // `Unit` EXPRESSION (a `Unit` `val`/`var` definition keeps its binding, so it still shows).
         // The tokens carry the spans of any warnings, for the front-end to underline.
         val (plain, spans) = Repl.segments(output)
-        Repl.Reply.Ran(id, value, plain, tpe, name, renderDiagnostics(notices), Repl.mark(tokens, notices), spans)
+
+        val blocks: List[Block] =
+          if !exhibiting then Nil
+          else Blocks.output(plain, spans, ansi) + noticeBlocks(notices) + Blocks.result(name, value.let(ExhibitRender.decode(_)), tpe)
+
+        Repl.Reply.Ran(id, if exhibiting then Unset else value, plain, tpe, name, diagnosticsText(notices), Repl.mark(tokens, notices), spans, Blocks.encode(blocks))
 
       case Outcome.Rejected(notices) =>
         // The tokens carry the errors' spans, mapped into the line's own coordinates by `compile`.
-        Repl.Reply.Rejected(id, renderDiagnostics(notices), Repl.mark(tokens, notices))
+        Repl.Reply.Rejected(id, diagnosticsText(notices), Repl.mark(tokens, notices), Blocks.encode(noticeBlocks(notices)))
 
       case Outcome.Threw(_, error, output) =>
         // Render the exception's (trimmed) stack trace as a coloured teletype listing, rather than
         // just its `toString`, so a thrown error surfaces where it came from. A stack trace carries no
-        // interpolated types, so it needs no semantic rendering — but for the web (`Html`) its ANSI is
-        // stripped and HTML-escaped, since the diagnostics slot there is trusted HTML (see the web
-        // front-end), not plain text.
-        val trace: Text = StackTraceRender.render(error)(using loader)
-        val rendered: Text = if render == Repl.Rendering.Html then SemanticRender.htmlPlain(trace) else trace
+        // interpolated types, so it needs no semantic rendering; under `Exhibit` it becomes a block.
         val (plain, spans) = Repl.segments(output)
-        Repl.Reply.Threw(id, plain, rendered, tokens, spans)
+
+        if exhibiting then
+          val blocks: List[Block] = Blocks.output(plain, spans, ansi) + List(Blocks.trace(StackTraceRender.trimmed(error)(using loader)))
+          Repl.Reply.Threw(id, plain, t"", tokens, spans, Blocks.encode(blocks))
+        else
+          val trace: Text = StackTraceRender.render(error)(using loader)
+          val rendered: Text = trace
+          Repl.Reply.Threw(id, plain, rendered, tokens, spans)
 
       case Outcome.Crashed(notices, _) =>
-        Repl.Reply.Crashed(id, renderDiagnostics(notices), tokens)
+        Repl.Reply.Crashed(id, diagnosticsText(notices), tokens, Blocks.encode(noticeBlocks(notices)))
