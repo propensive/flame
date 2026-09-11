@@ -32,66 +32,51 @@
                                                                                                   */
 package flame
 
-import java.lang as jl
-
+import scala.compiletime.summonFrom
 
 import anticipation.*
-import denominative.*
-import denominative.dysasymptotics.linearSize
-// `stackTraceTeletype` must be named: it is a given, and a wildcard import does not bring givens into
-// scope. Without it, escapade's generic `Showable`-based `Teletypeable` still applies, so the trace
-// renders — silently unstyled, with no compile error. It lives under `digression.teletypeables`,
-// where the API-nesting drive homed it (it was a top-level given in `digression` before, and in
-// escapade before that), so the named import is what keeps that move honest: a relocation breaks the
-// build here rather than quietly costing the trace its colour.
-import digression.*, digression.teletypeables.stackTraceTeletype
-import escapade.*, termcapDefinitions.xtermTrueColorTermcap
-import hellenism.Classloader
-import hieroglyph.*, textMetrics.uniformMetric
-// Resolve each frame against the TASTy and SMAP of the class it names, rather than taking the JVM's
-// erased view of it. `StackTrace(throwable)` takes a `StackTrace.Resolver`, and digression's companion
-// supplies a no-op one — digression deliberately has no classpath to read — so WITHOUT this import a
-// trace still renders, just as bare mangled class·method names with no source definitions, no source
-// lines and no inline chains. Reading is not free (one TASTy file per top-level class named in the
-// trace), but a trace is only rendered when a submission has already thrown.
-import hyperbole.stackResolutions.tastyStackResolution
+import contingency.*
+import gossamer.*
+import rudiments.*
+import spectacular.*
+import stratiform.*
+import turbulence.*
+import vacuous.*
 
-// Renders the stack trace of an exception thrown by user code (under `strategies.throwUnsafely`) to a
-// coloured, truecolor-ANSI listing, for the REPL's `Threw` reply. Uses Soundness `digression`:
-// `StackTrace(throwable)` captures the frames — resolved through hyperbole, so each names the source
-// definition it was compiled from and carries the chain of inlines it came through — and escapade
-// renders `StackTrace` to a `Teletype` (its exception class + message, then each frame's
-// class·method and file:line, with a `↳` sub-row per inline level) via digression's default
-// `StackTrace.Palette`. The internal REPL/JVM plumbing above the user's wrapper object is trimmed off.
-//
-// An inline chain is only recoverable where the frame's own classfile carries a JSR-45 SMAP: the
-// Soundness jars ship one, flame's own classes get one from `-Xjsr45` in its build, and a user's REPL
-// line does only under `/set jsr45` (off by default — see `Repl.settings`).
-object StackTraceRender:
-  // The index of the OUTERMOST frame belonging to the user's code: their code is compiled into the
-  // wrapper objects `rs$line$N`, so this is the last frame whose (raw) class name starts with
-  // `rs$line$`. Read from the raw `StackTraceElement`s (whose names are unmangled, unlike the frames
-  // digression rewrites), but the frame ORDER matches `StackTrace`'s, so the index carries over.
-  private def lastUserFrame(error: Throwable): Int =
-    val raw:  scala.Array[jl.StackTraceElement | Null] = error.getStackTrace.nn
-    var last: Int                                = -1
-    var i:    Int                                = 0
+import pyrocosm.{Block, Inline, Presentable}
 
-    while i < raw.length do
-      if raw(i).nn.getClassName.nn.startsWith("rs$line$") then last = i
-      i += 1
+import contingency.strategies.throwUnsafely
+import hieroglyph.charEncoders.utf8Encoder
 
-    last
+// The typeclass cascade for a result value under `Repl.Rendering.Exhibit`, expanded INSIDE
+// the compiled wrapper where the value's static type is known: Pyrocosm's `Presentable` (whose
+// own fallbacks cover `Showable`, products and `toString`), else spectacular's `Inspectable`
+// with any styling stripped, else `toString`. The exhibit crosses `ReplBridge` as text, so
+// `Outcome` and the bridge keep their `Text`: TEL, tagged with whether it is phrasing or flow.
+object ExhibitRender:
+  inline def render[value](v: value): Text = summonFrom:
+    case presentable: (`value` is Presentable) => encode(presentable.exhibit(v))
+    case inspectable: (`value` is Inspectable) => encode(Inline.Textual(SemanticRender.stripAnsi(inspectable.text(v)).trim))
+    case _                                     => encode(Inline.Textual(v.toString.tt))
 
-  // The `Classloader` is the resolver's: it reads each frame's classfile and TASTy through it, so it
-  // must be the REPL's own loader — the one the session's compiled lines were loaded from — for a
-  // user's frames to resolve at all.
-  // The trace with everything above the user's own frames trimmed away.
-  def trimmed(error: Throwable)(using Classloader): StackTrace =
-    val trace: StackTrace = StackTrace(error)
-    val last:  Int        = lastUserFrame(error)
-    if last < 0 then trace else trace.dropRight(trace.frames.size - 1 - last)
+  def encode(form: Inline | Block): Text = form match
+    case inline: Inline => t"inline:${inline.in[Tel].show}"
+    case block: Block   => t"block:${block.in[Tel].show}"
 
-  def render(error: Throwable)(using Classloader): Text =
-    val trimmed: StackTrace = this.trimmed(error)
-    trimmed.teletype.render(xtermTrueColorTermcap)
+  def decode(text: Text): Inline | Block =
+    if text.starts(t"block:") then text.s.substring(6).nn.tt.read[Tel].as[Block]
+    else if text.starts(t"inline:") then unquoted(text.s.substring(7).nn.tt.read[Tel].as[Inline])
+    else Inline.Textual(text)
+
+  // An inspection that found no instance marks the `toString` it fell back on with curly
+  // quotes; the exhibit shows that `toString` plainly.
+  private def unquoted(inline: Inline): Inline = inline match
+    case Inline.Textual(text0) =>
+      val text = text0.trim
+      if text.length > 1 && text.s.charAt(0) == '\u201c' && text.s.charAt(text.length - 1) == '\u201d'
+      then Inline.Textual(text.s.substring(1, text.length - 1).nn.tt)
+      else Inline.Textual(text0)
+
+    case Inline.Phrase(content)      => Inline.Phrase(content.map(unquoted))
+    case Inline.Toned(tone, content) => Inline.Toned(tone, content.map(unquoted))
+    case other                       => other

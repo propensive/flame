@@ -33,6 +33,7 @@
 package flame
 
 import java.util.concurrent.atomic as juca
+import scala.collection.concurrent.TrieMap
 
 import scala.caps
 
@@ -64,41 +65,10 @@ import webserverErrorPages.minimalErrorPage
 
 // Messages exchanged with the browser as JSON over the WebSocket. Flat case classes (not
 // enums) so the JSON shape — `{"kind":…,"seq":…,…}` — is predictable for the JavaScript.
-case class WebRequest(kind: Text, seq: Int, code: Text, offset: Int)
-// `mark` is `error`/`warning` for a token inside a diagnostic's span (see `Repl.mark`), else empty.
-case class WebToken(text: Text, accent: Text, role: Text = t"", mark: Text = t"")
-case class WebCompletion(name: Text, kind: Text, signature: Text)
-// A run of captured stdout (`out`) or stderr (`err`) within a reply's `output`, by offset
-// (`Repl.OutputSpan`), so the page can shade the two streams differently.
-case class WebSpan(stream: Text, start: Int, length: Int)
-// One binding the unfinished line has introduced (`Repl.ScopeBinding`); `name` is empty for a
-// synthetic context-function parameter, which is shown by type alone.
-case class WebScope(name: Text, tpe: Text, contextual: Boolean)
-
-case class WebReply
-   ( kind:        Text,
-     seq:         Int,
-     value:       Text,
-     tpe:         Text,
-     output:      Text,
-     diagnostics: Text,
-     tokens:      List[WebToken],
-     completions: List[WebCompletion] = Nil,
-     incomplete:  Boolean = false,
-     name:        Text = t"",
-     // The type the singleton `tpe` widens to, empty unless `tpe` is a singleton; shown dimmed
-     // after a `<:`, mirroring the CLI (see `Repl.TypeText`).
-     base:        Text = t"",
-     // What the (unfinished) line has brought into scope so far, for the row under the editor.
-     scope:       List[WebScope] = Nil,
-     // The captured stdout/stderr runs within `output`; for an `output` (streamed chunk) message,
-     // `stream` says which stream the whole chunk came from.
-     spans:       List[WebSpan]  = Nil,
-     stream:      Text           = t"" )
 
 // The JSON REST API's request/response bodies (served alongside the browser UI and WebSocket — see
 // the `/api/…` routes in `serveHttp`). Flat case classes, so jacinta derives their JSON codecs
-// automatically, exactly as it does for `WebRequest`/`WebReply`.
+// automatically.
 case class ApiEval(code: Text)                        // POST body for `/api/sessions/{name}/eval`
 case class ApiComplete(code: Text, offset: Int)       // POST body for `/api/sessions/{name}/complete`
 case class ApiCompletion(name: Text, kind: Text, signature: Text)  // one completion candidate
@@ -121,868 +91,21 @@ case class ApiResult
 // The browser-side editor and styling. No `$` (it would interpolate) and `\n` is written
 // `\\n` so the served script carries a real newline escape. Selects its two controls by
 // tag — the page has exactly one `<pre>` (the log) and one `<code>` (the editor).
-val replScript: Text = t"""
-(function() {
-  var css = [
-    // JetBrains Mono, loaded from Google Fonts. An `@import` must be the first rule in the sheet.
-    "@import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;700&display=swap');",
-    "body { font-family: 'JetBrains Mono', ui-monospace, SFMono-Regular, Menlo, monospace; margin: 1rem;",
-    "  background: #1e1e1e; color: #d4d4d4; }",
-    "h1 { font-size: 1.1rem; font-weight: normal; color: #d7ba7d; }",
-    // `pre`/`code` carry the UA's own monospace font, so make them inherit `body`'s JetBrains Mono.
-    "pre { font-family: inherit; white-space: pre-wrap; word-break: break-word; margin: 0 0 0.5rem; }",
-    "code { font-family: inherit; display: block; white-space: pre-wrap; word-break: break-word; outline: none;",
-    "  border: 1px solid #3a3a3a; border-radius: 4px; padding: 0.4rem 0.6rem;",
-    "  min-height: 1.4em; background: #252526; caret-color: #d4d4d4; }",
-    "code::after { content: attr(data-ghost); color: #5c6370; }",
-    // The scope row under the editor: what the unfinished line has brought into scope. Sized even
-    // when empty, so its appearance never shifts the editor.
-    ".scope { color: #5c6370; min-height: 1.3em; margin: 0.2rem 0 0.5rem 0.6rem; }",
-    ".scope .given { font-style: italic; }",
-    ".prompt { color: #808080; }",
-    ".result { color: #b5cea8; }",
-    // Captured stdout and stderr: each line opens with a coloured `░ ` gutter — blue for stdout, red
-    // for stderr — so the two can be told apart where they interleave; the text keeps its own colour,
-    // and engine messages and compiler diagnostics get no gutter.
-    ".gutter-out { color: #568ce6; }",
-    ".gutter-err { color: #e15f5f; }",
-    ".error { color: #f48771; white-space: pre-wrap; }",
-    // An embedded code sample in a diagnostic never word-wraps mid-token (see `SemanticRender`).
-    ".error .code-sample { white-space: pre; }",
-    ".notice { color: #e5c07b; font-weight: bold; white-space: pre-wrap; }",
-    ".pending { color: #808080; font-style: italic; }",
-    ".completions { position: fixed; z-index: 20; background: #252526; border: 1px solid #454545;",
-    "  max-height: 14em; overflow-y: auto; box-shadow: 0 2px 10px rgba(0,0,0,0.5); }",
-    ".completions div { padding: 1px 10px 1px 8px; white-space: pre; cursor: default; }",
-    ".completions div.sel { background: #094771; }",
-    ".citem-sig { color: #808080; margin-left: 1.5em; }",
-    ".status { position: fixed; top: 8px; right: 10px; z-index: 30; font-size: 0.8em;",
-    "  padding: 2px 9px; border-radius: 10px; border: 1px solid transparent; }",
-    ".status.ok { background: #14321a; color: #7ec77e; border-color: #2c5c34; }",
-    ".status.warn { background: #3a341d; color: #e5c07b; border-color: #6b5e30; }",
-    "code.offline { border-color: #7a3a3a; opacity: 0.65; }",
-    ".tok-keyword { color: #569cd6; }",
-    ".tok-modifier { color: #569cd6; }",
-    ".tok-string { color: #ce9178; }",
-    ".tok-number { color: #b5cea8; }",
-    ".tok-typal { color: #4ec9b0; }",
-    ".tok-term { color: #9cdcfe; }",
-    ".tok-symbol { color: #d4d4d4; }",
-    ".tok-parens { color: #ffd700; }",
-    // A singleton's base type: keeps the ordinary token colours, dimmed, so it is legible as the
-    // same syntax but clearly subordinate to the precise type it qualifies.
-    ".widened { opacity: 0.55; }",
-    ".tok-error { color: #f48771; text-decoration: underline; }",
-    // A token inside a diagnostic's span (`mark`): underlined in the diagnostic's colour, keeping
-    // its own syntax colour, so the log line shows exactly what the compiler pointed at.
-    ".mark-error { text-decoration: underline wavy #f48771; text-underline-offset: 2px; }",
-    ".mark-warning { text-decoration: underline wavy #e5c07b; text-underline-offset: 2px; }",
-    ".tok-unparsed { color: #6a9955; }",
-    // A `/`-command line is highlighted specially (see `makeSpans`): the command word in gold, and its
-    // parameters in a fainter, more-yellow colour so they recede behind the command.
-    ".tok-command { color: #d7ba7d; }",
-    ".tok-command-param { color: #a1843c; }",
-    // A term/type token's role is a second class: italicise bindings (a `val`/`def`/param or
-    // pattern name, a class/type definition, or a type parameter) on top of the accent's colour.
-    ".binding { font-style: italic; }"
-  ].join("\\n");
-  var styleEl = document.createElement("style");
-  styleEl.textContent = css;
-  document.head.appendChild(styleEl);
-
-  var log = document.querySelector("pre");
-  var editor = document.querySelector("code");
-  // The scope row, directly under the editor (see `renderScope`).
-  var scopeRow = document.createElement("div");
-  scopeRow.className = "scope";
-  editor.parentNode.insertBefore(scopeRow, editor.nextSibling);
-  // The page is pretty-printed, so the empty elements arrive holding indentation
-  // whitespace; clear it so the editor and log start genuinely empty.
-  log.innerHTML = "";
-  editor.innerHTML = "";
-  editor.contentEditable = "true";
-  editor.spellcheck = false;
-
-  // A live connection-state indicator, fixed in the corner.
-  var indicator = document.createElement("div");
-  document.body.appendChild(indicator);
-
-  var socket;
-  var seq = 0;
-  var serverInstance = null;
-  var sessionName = null;
-  var connected = false;
-  var everConnected = false;
-  var reconnectTimer = null;
-
-  // Shell-style input history. Each entry caches the submitted line's highlighted markup
-  // (`html`) so recall is instant and needs no re-tokenize, plus its plain `text` for
-  // de-duplication. `histIdx === history.length` means "the current draft" (not in history);
-  // `draft` holds the markup of what was being typed before navigating up.
-  var history = [];
-  var histIdx = 0;
-  var draft = "";
-
-  function setStatus(state) {
-    if (state === "connected") {
-      indicator.className = "status ok";
-      indicator.textContent = "connected";
-      editor.classList.remove("offline");
-    } else {
-      indicator.className = "status warn";
-      indicator.textContent = everConnected ? "reconnecting..." : "connecting...";
-      editor.classList.add("offline");
-    }
-  }
-
-  function send(kind, code, offset) {
-    if (socket && socket.readyState === WebSocket.OPEN) {
-      var s = ++seq;
-      if (kind === "tokenize") tokenizeCode[s] = code;
-      socket.send(JSON.stringify({ kind: kind, seq: s, code: code, offset: offset || 0 }));
-      return s;
-    }
-    return -1;
-  }
-
-  // Inline autosuggestion ("ghost text", fish-style): the remainder of a unique completion,
-  // or the common stem of several (then suffixed "..."), shown faint after the cursor via the
-  // `code::after` rule reading `data-ghost`. It is never part of `textContent`, so it never
-  // reaches `tokenize`/`submit`. `ghostSeq`/`popupSeq` tell a ghost reply from a Tab reply;
-  // `prevText` lets `input` tell an appended character from any other edit.
-  var ghost = "";
-  var ghostSeq = -1;
-  var popupSeq = -1;
-  var ghostTimer = null;
-  var prevText = "";
-
-  // The engine's latest "is this an incomplete prefix?" verdict and the text it was for,
-  // plus the text each in-flight `tokenize` seq was sent for, so Enter can decide instantly.
-  var incomplete = false;
-  var incompleteText = null;
-  var tokenizeCode = {};
-
-  // Bracket-balance fallback used only until the engine's verdict for the current text lands:
-  // non-empty with every bracket closed (ignores strings/comments, hence "looks").
-  function looksComplete(text) {
-    if (!text.trim()) return false;
-    var depth = 0;
-    for (var i = 0; i < text.length; i++) {
-      var c = text.charAt(i);
-      if (c === "(" || c === "[" || c === "{") depth++;
-      else if (c === ")" || c === "]" || c === "}") depth--;
-    }
-    return depth <= 0;
-  }
-
-  function setGhost(text) {
-    ghost = text || "";
-    if (ghost) editor.setAttribute("data-ghost", ghost);
-    else editor.removeAttribute("data-ghost");
-  }
-
-  function atEnd() { return getCaret() === editor.textContent.length && editor.textContent.length > 0; }
-
-  function applyGhost(candidates) {
-    if (!atEnd() || !candidates || !candidates.length) { setGhost(""); return; }
-    var isSlash = candidates[0].name.charAt(0) === "/";
-    var stem = currentStem(isSlash);
-    if (candidates.length === 1) {
-      var name = candidates[0].name;
-      setGhost(name.length > stem.length && name.indexOf(stem) === 0 ? name.slice(stem.length) : "");
-    } else {
-      var common = longestCommonPrefix(candidates.map(function(c) { return c.name; }));
-      setGhost(common.length > stem.length && common.indexOf(stem) === 0 ? common.slice(stem.length) + "..." : "");
-    }
-  }
-
-  function scheduleGhost() {
-    if (ghostTimer) clearTimeout(ghostTimer);
-    ghostTimer = setTimeout(function() {
-      ghostTimer = null;
-      if (atEnd()) ghostSeq = send("complete", editor.textContent, getCaret());
-      else setGhost("");
-    }, 200);
-  }
-
-  function getCaret() {
-    var sel = window.getSelection();
-    if (!sel.rangeCount) return 0;
-    var range = sel.getRangeAt(0);
-    var pre = range.cloneRange();
-    pre.selectNodeContents(editor);
-    pre.setEnd(range.endContainer, range.endOffset);
-    return pre.toString().length;
-  }
-
-  function setCaret(offset) {
-    var walker = document.createTreeWalker(editor, NodeFilter.SHOW_TEXT, null);
-    var node, remaining = offset, target = null, targetOffset = 0;
-    while ((node = walker.nextNode())) {
-      var len = node.textContent.length;
-      if (remaining <= len) { target = node; targetOffset = remaining; break; }
-      remaining -= len;
-    }
-    var sel = window.getSelection();
-    var range = document.createRange();
-    if (target) range.setStart(target, targetOffset);
-    else { range.selectNodeContents(editor); range.collapse(false); }
-    range.collapse(true);
-    sel.removeAllRanges();
-    sel.addRange(range);
-  }
-
-  function makeSpans(parent, tokens) {
-    // A `/`-command line is a REPL command, not Scala, so it is coloured specially rather than by the
-    // Scala accents: the command word (before the first space) reads as a command, and its parameters
-    // (everything after) are shown fainter and more yellow. `sp` is the first space; a token is a
-    // parameter when it begins at or after it.
-    var full = "";
-    for (var i = 0; i < tokens.length; i++) full += tokens[i].text;
-    var slash = full.charAt(0) === "/";
-    var sp = slash ? full.indexOf(" ") : -1;
-    var off = 0;
-    for (var i = 0; i < tokens.length; i++) {
-      var span = document.createElement("span");
-      if (slash) span.className = (sp !== -1 && off >= sp) ? "tok-command-param" : "tok-command";
-      // The accent is the colour class; a term/type token's role (binding/usage) is a second
-      // class, so the stylesheet can e.g. italicise .binding on top of the accent's colour.
-      else span.className = "tok-" + tokens[i].accent + (tokens[i].role ? " " + tokens[i].role : "")
-        + (tokens[i].mark ? " mark-" + tokens[i].mark : "");
-      span.textContent = tokens[i].text;
-      parent.appendChild(span);
-      off += tokens[i].text.length;
-    }
-  }
-
-  // Shows what the unfinished line has brought into scope: `given Unsafe` for a contextual binding
-  // (with its name too, where the user could write one), `x: Int` for a plain one; nothing when the
-  // line opens no scope.
-  function renderScope(bindings) {
-    scopeRow.innerHTML = "";
-    if (!bindings || !bindings.length) return;
-    var lead = document.createElement("span");
-    lead.textContent = "\u2937 scope: ";
-    scopeRow.appendChild(lead);
-    for (var i = 0; i < bindings.length; i++) {
-      var b = bindings[i];
-      if (i > 0) scopeRow.appendChild(document.createTextNode(", "));
-      if (b.contextual) {
-        var given = document.createElement("span");
-        given.className = "given";
-        given.textContent = "given ";
-        scopeRow.appendChild(given);
-      }
-      if (b.name) {
-        var name = document.createElement("span");
-        name.className = "tok-term";
-        name.textContent = b.name;
-        scopeRow.appendChild(name);
-        scopeRow.appendChild(document.createTextNode(": "));
-      }
-      var tpe = document.createElement("span");
-      tpe.className = "tok-typal";
-      tpe.textContent = b.tpe;
-      scopeRow.appendChild(tpe);
-    }
-  }
-
-  // Rebuilds the log line submitted as `seq` from `tokens` when any of them carries a diagnostic
-  // mark (an error's or warning's span), so the offending range shows underlined in the line
-  // itself; the prompt is kept and the cloned editor spans replaced.
-  function remarkLine(seq, tokens) {
-    if (!tokens || !tokens.some(function(t) { return t.mark; })) return;
-    var line = log.querySelector('[data-line="' + seq + '"]');
-    if (!line) return;
-    while (line.childNodes.length > 1) line.removeChild(line.lastChild);
-    makeSpans(line, tokens);
-  }
-
-  function highlight(tokens) {
-    var text = "";
-    for (var i = 0; i < tokens.length; i++) text += tokens[i].text;
-    // Only re-paint when the tokens describe the line as it stands now; a newer keystroke
-    // already has a fresh tokenize in flight, so stale tokens are dropped (and fast typing
-    // is naturally debounced — the paint lands once the typist pauses).
-    if (text !== editor.textContent) return;
-    var caret = getCaret();
-    editor.innerHTML = "";
-    makeSpans(editor, tokens);
-    setCaret(caret);
-  }
-
-  function logBlock(cls, text) {
-    if (!text) return;
-    var div = document.createElement("div");
-    if (cls) div.className = cls;
-    div.textContent = text;
-    log.appendChild(div);
-  }
-
-  // A result value is server-rendered HTML (the engine's HTML typeclass cascade), so it is inserted
-  // as innerHTML, not text. The value itself is already HTML-safe (honeycomb-escaped server-side).
-  function logHtml(cls, html) {
-    if (!html) return;
-    var div = document.createElement("div");
-    if (cls) div.className = cls;
-    div.innerHTML = html;
-    log.appendChild(div);
-  }
-
-  function escapeHtml(s) {
-    return s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
-  }
-
-  // Renders a result/error reply INTO `target` — output, then the value line (`name = value : type`,
-  // the value already server-rendered HTML, the rest escaped), then diagnostics. Shared by the normal
-  // result path and the async fill so a placeholder fills identically to an inline result.
-  function gutterHtml(stream) {
-    return "<span class='" + (stream === "err" ? "gutter-err" : "gutter-out") + "'>\u2591 </span>";
-  }
-
-  // Renders a reply's plain `output`, opening every line that lies within a captured run (`spans`,
-  // by offset) with that run's gutter; lines outside every run (an engine message) get none.
-  function outputHtml(text, spans) {
-    var html = "", offset = 0;
-    while (offset <= text.length) {
-      var nl = text.indexOf("\\n", offset);
-      var end = nl < 0 ? text.length : nl;
-      var line = text.slice(offset, end);
-      var covering = (spans || []).find(function(s) { return s.start <= offset && offset < s.start + s.length; });
-      if (line.length && covering) html += gutterHtml(covering.stream);
-      html += escapeHtml(line);
-      if (nl >= 0) html += "\\n";
-      offset = end + 1;
-    }
-    return html;
-  }
-
-  // Appends a streamed chunk of `stream` to the placeholder's output element, opening each line the
-  // chunk begins with a gutter; `data-linestart` remembers whether the next text opens a line.
-  function appendStream(os, text, stream) {
-    var lineStart = os.getAttribute("data-linestart") !== "no";
-    for (var i = 0; i < text.length; i++) {
-      var ch = text.charAt(i);
-      if (lineStart && ch !== "\\n") os.insertAdjacentHTML("beforeend", gutterHtml(stream));
-      os.appendChild(document.createTextNode(ch));
-      lineStart = ch === "\\n";
-    }
-    os.setAttribute("data-linestart", lineStart ? "yes" : "no");
-  }
-
-  function fillResult(target, msg) {
-    var html = "";
-    var out = msg.output;
-    if (out) { if (out.charAt(out.length - 1) === "\\n") out = out.slice(0, -1); }
-    if (out) html += "<div>" + outputHtml(out, msg.spans) + "</div>";
-    if (msg.value) {
-      // Syntax-colour the `name = value : type` line like code: the binding NAME as a binding (term
-      // colour, italicised via `.binding`), `=`/`:` as operator/symbol punctuation, and the TYPE in
-      // the type colour — matching the CLI. The value itself is already server-rendered HTML.
-      var line = msg.value;
-      if (msg.name)
-        line = "<span class='tok-term binding'>" + escapeHtml(msg.name) + "</span>"
-             + " <span class='tok-parens'>=</span> " + line;
-      if (msg.tpe)
-        line += "<span class='tok-symbol'>:</span> "
-              + "<span class='tok-typal'>" + escapeHtml(msg.tpe) + "</span>";
-      // A singleton's base type: the same type colouring, dimmed, so it reads as context about the
-      // type rather than as part of it.
-      if (msg.base)
-        line += "<span class='widened'><span class='tok-symbol'>&lt;:</span> "
-              + "<span class='tok-typal'>" + escapeHtml(msg.base) + "</span></span>";
-      html += "<div class='result'>" + line + "</div>";
-    }
-    // Diagnostics are server-rendered, trusted HTML (types re-rendered through stenography in
-    // `SemanticRender`, everything else already HTML-escaped there), so they are inserted as-is —
-    // like the value above — rather than re-escaped.
-    if (msg.diagnostics) html += "<div class='error'>" + msg.diagnostics + "</div>";
-    target.innerHTML = html;
-  }
-
-  function submit() {
-    // Refuse to send while disconnected: don't echo or clear the editor, so the user keeps
-    // their input until the connection is back (the indicator shows why nothing happened).
-    if (!connected) return;
-    var code = editor.textContent;
-    if (code.trim() === "") return;
-    renderScope([]);
-    var line = document.createElement("div");
-    var prompt = document.createElement("span");
-    prompt.className = "prompt";
-    prompt.textContent = "> ";
-    line.appendChild(prompt);
-    var node = editor.firstChild;
-    while (node) { line.appendChild(node.cloneNode(true)); node = node.nextSibling; }
-    log.appendChild(line);
-    // Cache the submitted line (with its highlighting) for history recall, skipping a
-    // consecutive duplicate; reset the cursor back to the newest position.
-    if (!history.length || history[history.length - 1].text !== code)
-      history.push({ html: editor.innerHTML, text: code });
-    histIdx = history.length;
-    draft = "";
-    // Tag the log line with the submission's seq, so a reply whose tokens carry diagnostic marks
-    // can rebuild it with the offending span underlined (see `remarkLine`).
-    line.setAttribute("data-line", send("submit", code));
-    editor.innerHTML = "";
-    setGhost("");
-    prevText = "";
-    log.scrollIntoView(false);
-  }
-
-  // Replace the editor with cached markup (a history entry or the saved draft) and put the
-  // caret at the end. Setting innerHTML directly fires no `input`, so the cached highlighting
-  // stands until the user edits (which re-tokenizes as usual).
-  function showHistory(html) {
-    editor.innerHTML = html;
-    var r = document.createRange();
-    r.selectNodeContents(editor);
-    r.collapse(false);
-    var s = window.getSelection();
-    s.removeAllRanges();
-    s.addRange(r);
-    setGhost("");
-    prevText = editor.textContent;
-  }
-
-  function historyUp() {
-    if (!history.length) return;
-    if (histIdx === history.length) draft = editor.innerHTML;
-    if (histIdx > 0) { histIdx--; showHistory(history[histIdx].html); }
-  }
-
-  function historyDown() {
-    if (histIdx >= history.length) return;
-    histIdx++;
-    showHistory(histIdx === history.length ? draft : history[histIdx].html);
-  }
-
-  function insertNewline() {
-    var sel = window.getSelection();
-    if (!sel.rangeCount) return;
-    // Auto-indent: when the caret is at the end of the current line (nothing to its right on that
-    // line, so the newline isn't splitting text), start the new line with the same leading whitespace
-    // as the line being left — matching the CLI front-end.
-    var text = editor.textContent, caret = getCaret();
-    var after = text.slice(caret);
-    var indent = "";
-    if (after === "" || after.charAt(0) === "\\n") {
-      var before = text.slice(0, caret);
-      var line = before.slice(before.lastIndexOf("\\n") + 1);
-      var m = line.match(/^[ \\t]*/);
-      indent = m ? m[0] : "";
-    }
-    var range = sel.getRangeAt(0);
-    range.deleteContents();
-    var nl = document.createTextNode("\\n" + indent);
-    range.insertNode(nl);
-    range.setStartAfter(nl);
-    range.collapse(true);
-    sel.removeAllRanges();
-    sel.addRange(range);
-  }
-
-  // --- Tab completion (asks the server, shows a popup, inserts the chosen name) ---
-  var popup = null;
-  var items = [];
-  var selIdx = 0;
-
-  function isIdentChar(c) {
-    return (c >= "a" && c <= "z") || (c >= "A" && c <= "Z") || (c >= "0" && c <= "9") || c === "_";
-  }
-
-  function hideCompletions() {
-    if (popup) { popup.remove(); popup = null; }
-    items = [];
-  }
-
-  function insertCompletion(name) {
-    var next, caretPos;
-    if (name.charAt(0) === "/") {
-      // A /-command candidate is the whole command; replace the entire line.
-      next = name;
-      caretPos = name.length;
-    } else {
-      // A code candidate replaces the partial identifier ending at the caret.
-      var text = editor.textContent;
-      var caret = getCaret();
-      var start = caret;
-      while (start > 0 && isIdentChar(text.charAt(start - 1))) start--;
-      next = text.slice(0, start) + name + text.slice(caret);
-      caretPos = start + name.length;
-    }
-    editor.textContent = next;
-    setCaret(caretPos);
-    setGhost("");
-    prevText = next;
-    send("tokenize", next);
-  }
-
-  function paintSelection() {
-    for (var i = 0; i < popup.children.length; i++)
-      popup.children[i].className = (i === selIdx) ? "sel" : "";
-    if (popup.children[selIdx]) popup.children[selIdx].scrollIntoView({ block: "nearest" });
-  }
-
-  function acceptCompletion() {
-    if (items.length) insertCompletion(items[selIdx].name);
-    hideCompletions();
-  }
-
-  function moveCompletion(delta) {
-    if (!items.length) return;
-    selIdx = (selIdx + delta + items.length) % items.length;
-    paintSelection();
-  }
-
-  function longestCommonPrefix(names) {
-    if (!names.length) return "";
-    var prefix = names[0];
-    for (var i = 1; i < names.length; i++) {
-      var s = names[i], j = 0;
-      while (j < prefix.length && j < s.length && prefix.charAt(j) === s.charAt(j)) j++;
-      prefix = prefix.slice(0, j);
-      if (!prefix) break;
-    }
-    return prefix;
-  }
-
-  // The stem already typed (so we only advance, never shorten): the whole line for a
-  // /-command, otherwise the partial identifier ending at the caret.
-  function currentStem(isSlash) {
-    var text = editor.textContent;
-    if (isSlash) return text;
-    var caret = getCaret(), start = caret;
-    while (start > 0 && isIdentChar(text.charAt(start - 1))) start--;
-    return text.slice(start, caret);
-  }
-
-  function showCompletions(list) {
-    if (!list || !list.length) { hideCompletions(); return; }
-    if (list.length === 1) { insertCompletion(list[0].name); hideCompletions(); return; }
-    // Several candidates: first extend the stem to the longest prefix common to them all
-    // (e.g. "pri" -> "print" when the options are print/println), then show the popup.
-    var isSlash = list[0].name.charAt(0) === "/";
-    var common = longestCommonPrefix(list.map(function(c) { return c.name; }));
-    var stem = currentStem(isSlash);
-    if (common.length > stem.length && common.indexOf(stem) === 0) insertCompletion(common);
-    hideCompletions();
-    items = list;
-    selIdx = 0;
-    popup = document.createElement("div");
-    popup.className = "completions";
-    for (var i = 0; i < items.length; i++) {
-      var row = document.createElement("div");
-      var nm = document.createElement("span");
-      nm.textContent = items[i].name;
-      row.appendChild(nm);
-      if (items[i].signature) {
-        var sg = document.createElement("span");
-        sg.className = "citem-sig";
-        sg.textContent = items[i].signature;
-        row.appendChild(sg);
-      }
-      (function(idx) {
-        row.addEventListener("mousedown", function(e) { e.preventDefault(); selIdx = idx; acceptCompletion(); });
-      })(i);
-      popup.appendChild(row);
-    }
-    document.body.appendChild(popup);
-    var rect = null;
-    var s = window.getSelection();
-    if (s.rangeCount) rect = s.getRangeAt(0).getBoundingClientRect();
-    if (!rect || (rect.left === 0 && rect.top === 0)) rect = editor.getBoundingClientRect();
-    popup.style.left = rect.left + "px";
-    popup.style.top = (rect.bottom + 2) + "px";
-    paintSelection();
-  }
-
-  editor.addEventListener("input", function() {
-    hideCompletions();
-    var text = editor.textContent;
-    // Keep the ghost only if the user typed exactly its next character at the end of the line;
-    // any other edit drops it (the debounced request below recomputes a fresh one).
-    if (ghost && text.length === prevText.length + 1 && text.slice(0, prevText.length) === prevText
-        && text.charAt(text.length - 1) === ghost.charAt(0)) {
-      var rest = ghost.slice(1);
-      setGhost((rest === "" || rest === "...") ? "" : rest);
-    } else {
-      setGhost("");
-    }
-    prevText = text;
-    send("tokenize", text);
-    scheduleGhost();
-  });
-  editor.addEventListener("blur", function() { setTimeout(hideCompletions, 150); });
-
-  editor.addEventListener("keydown", function(e) {
-    if (popup) {
-      if (e.key === "ArrowDown") { e.preventDefault(); moveCompletion(1); return; }
-      if (e.key === "ArrowUp") { e.preventDefault(); moveCompletion(-1); return; }
-      if (e.key === "Enter" || e.key === "Tab") { e.preventDefault(); acceptCompletion(); return; }
-      if (e.key === "Escape") { e.preventDefault(); hideCompletions(); return; }
-      hideCompletions();
-    }
-    // Right at the end of the line accepts the ghost suggestion (its common stem, dropping a
-    // trailing "..."), like fish; elsewhere it just moves the cursor.
-    if (e.key === "ArrowRight" && ghost && atEnd()) {
-      e.preventDefault();
-      var accept = (ghost.slice(-3) === "...") ? ghost.slice(0, -3) : ghost;
-      var text = editor.textContent + accept;
-      editor.textContent = text;
-      setCaret(text.length);
-      setGhost("");
-      prevText = text;
-      send("tokenize", text);
-      scheduleGhost();
-      return;
-    }
-    if (e.key === "Tab") {
-      e.preventDefault();
-      // With a ghost showing, Tab accepts it: insert its text (the common stem, dropping a
-      // trailing "...") and remove it. If several candidates shared that stem, then open the
-      // popup to choose among them; a unique completion just lands. With no ghost, ask the
-      // server and show the popup as before.
-      if (ghost && atEnd()) {
-        var multiple = ghost.slice(-3) === "...";
-        var accept = multiple ? ghost.slice(0, -3) : ghost;
-        var text = editor.textContent + accept;
-        editor.textContent = text;
-        setCaret(text.length);
-        setGhost("");
-        prevText = text;
-        send("tokenize", text);
-        if (multiple) popupSeq = send("complete", text, getCaret());
-        else scheduleGhost();
-      } else {
-        popupSeq = send("complete", editor.textContent, getCaret());
-      }
-      return;
-    }
-    // Enter submits a complete (or malformed) line and inserts a continuation newline for an
-    // incomplete one (per the engine's parser, cached as `incomplete`/`incompleteText`; a
-    // bracket-balance fallback covers the gap before the verdict for the current text lands).
-    // Shift+Enter always submits, matching the CLI front-end.
-    if (e.key === "Enter" && e.shiftKey) { e.preventDefault(); submit(); return; }
-    if (e.key === "Enter" && !e.shiftKey) {
-      e.preventDefault();
-      var text = editor.textContent;
-      var inc = (incompleteText === text) ? incomplete : !looksComplete(text);
-      if (inc) { insertNewline(); send("tokenize", editor.textContent); }
-      else submit();
-      return;
-    }
-    // Up/Down cycle through history, but only from the first/last line so multi-line entries
-    // still move the cursor between their lines.
-    if (e.key === "ArrowUp") {
-      var before = editor.textContent.slice(0, getCaret());
-      if (before.indexOf("\\n") === -1) { e.preventDefault(); setGhost(""); historyUp(); return; }
-    }
-    if (e.key === "ArrowDown") {
-      var after = editor.textContent.slice(getCaret());
-      if (after.indexOf("\\n") === -1) { e.preventDefault(); setGhost(""); historyDown(); return; }
-    }
-    // Any other caret movement drops the ghost (it is only valid at the end of the line).
-    if (e.key === "ArrowLeft" || e.key === "Home" || e.key === "End" || e.key === "Escape") setGhost("");
-  });
-
-  editor.addEventListener("mousedown", function() { setGhost(""); });
-
-  function onMessage(ev) {
-    var msg = JSON.parse(ev.data);
-    if (msg.kind === "pong") return;
-    if (msg.kind === "hello") {
-      if (serverInstance === null) serverInstance = msg.value;
-      else if (msg.value !== serverInstance) {
-        serverInstance = msg.value;
-        logBlock("notice", "${Repl.messages.serverRestarted}");
-        log.scrollIntoView(false);
-      }
-      // Show this connection's auto-started session name (and any later switch). The banner text
-      // (`msg.output`) is built in core, so it reads identically to the CLI's startup line.
-      if (msg.name && msg.name !== sessionName) {
-        sessionName = msg.name;
-        logBlock("notice", msg.output);
-        log.scrollIntoView(false);
-      }
-      return;
-    }
-    if (msg.kind === "completions") {
-      if (msg.seq === popupSeq) showCompletions(msg.completions);
-      else if (msg.seq === ghostSeq) applyGhost(msg.completions);
-      return;
-    }
-    if (msg.kind === "tokens") {
-      highlight(msg.tokens);
-      if (msg.seq in tokenizeCode) {
-        incompleteText = tokenizeCode[msg.seq]; incomplete = msg.incomplete;
-        // The scope row tracks the line on screen: a reply for older text is ignored (a newer
-        // tokenize is in flight), and the row keeps its last answer until that one lands.
-        if (incompleteText === editor.textContent) renderScope(msg.scope);
-        delete tokenizeCode[msg.seq];
-      }
-      return;
-    }
-    // Async mode: a "pending" ack appends an empty placeholder block tagged with the submission's seq;
-    // the later "async" message (same seq) fills that block in place, so the result lands where the
-    // submission was, even though the editor has moved on.
-    if (msg.kind === "pending") {
-      var ph = document.createElement("div");
-      ph.setAttribute("data-id", msg.seq);
-      // A span the streamed stdout accumulates into, then a faint "evaluating" spinner after it.
-      var out = document.createElement("span");
-      out.className = "stream-out";
-      var spin = document.createElement("span");
-      spin.className = "pending";
-      spin.textContent = "⋯ evaluating…";
-      ph.appendChild(out);
-      ph.appendChild(spin);
-      log.appendChild(ph);
-      log.scrollIntoView(false);
-      return;
-    }
-    // A streamed stdout chunk (async mode): append it to the matching placeholder's output span, so it
-    // shows as it is produced. The final "async" reply then re-renders the block in full.
-    if (msg.kind === "output") {
-      var ptarget = log.querySelector('[data-id="' + msg.seq + '"]');
-      if (ptarget) {
-        var os = ptarget.querySelector(".stream-out");
-        if (os) appendStream(os, msg.output, msg.stream);
-        log.scrollIntoView(false);
-      }
-      return;
-    }
-    if (msg.kind === "async") {
-      remarkLine(msg.seq, msg.tokens);
-      var target = log.querySelector('[data-id="' + msg.seq + '"]');
-      if (!target) { target = document.createElement("div"); log.appendChild(target); }
-      target.removeAttribute("data-id");
-      target.className = "";
-      fillResult(target, msg);
-      log.scrollIntoView(false);
-      return;
-    }
-    // A normal (synchronous) result or error: one block rendered by the shared helper — after the
-    // submitted line is re-marked with any diagnostic span.
-    remarkLine(msg.seq, msg.tokens);
-    var block = document.createElement("div");
-    fillResult(block, msg);
-    log.appendChild(block);
-    log.scrollIntoView(false);
-  }
-
-  function scheduleReconnect() {
-    if (reconnectTimer) return;
-    reconnectTimer = setTimeout(function() { reconnectTimer = null; connect(); }, 1000);
-  }
-
-  // The server closes an idle WebSocket after ~30s; a foreground tab is kept warm by the
-  // ping below, but a backgrounded tab has its timers throttled, so the socket may still
-  // drop. We reconnect automatically (the REPL session lives on the server, shared across
-  // connections, so a fresh socket resumes the same state) and surface the state through
-  // the indicator. Guard against opening a second socket while one is already live.
-  function connect() {
-    if (socket && (socket.readyState === WebSocket.CONNECTING || socket.readyState === WebSocket.OPEN)) return;
-    setStatus("connecting");
-    socket = new WebSocket("ws://" + location.host + "/socket");
-    socket.onmessage = onMessage;
-    socket.onopen = function() {
-      connected = true;
-      everConnected = true;
-      setStatus("connected");
-      send("hello", "");
-      editor.focus();
-      if (editor.textContent) send("tokenize", editor.textContent);
-    };
-    socket.onclose = function() {
-      connected = false;
-      hideCompletions();
-      setGhost("");
-      setStatus("connecting");
-      scheduleReconnect();
-    };
-    socket.onerror = function() { try { socket.close(); } catch (e) {} };
-  }
-
-  // Timers are throttled in a hidden tab, so reconnect promptly when the tab is shown or
-  // refocused rather than waiting for the (possibly throttled) retry timer.
-  function reconnectNow() {
-    if (socket && (socket.readyState === WebSocket.CONNECTING || socket.readyState === WebSocket.OPEN)) return;
-    if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null; }
-    connect();
-  }
-  document.addEventListener("visibilitychange", function() { if (!document.hidden) reconnectNow(); });
-  window.addEventListener("focus", reconnectNow);
-
-  connect();
-  setInterval(function() { send("ping", ""); }, 20000);
-})();
-"""
-
-// The REPL page: a heading, a scrollback log (`<pre>`), and the live editor (`<code>`,
-// made contenteditable by the script). Styling and behaviour come entirely from the
-// script, so the page itself stays minimal.
-class ReplPage() extends Archetype:
-  def content: Html of (? <: Flow) =
-    Fragment[Flow](H1(t"Flame REPL"), Pre(), Code(), Script(replScript))
-
-private def webTokens(tokens: List[Repl.Token]): List[WebToken] =
-  tokens.map { token => WebToken(token.text, token.accent, token.role.or(t""), token.mark.or(t"")) }
-
-private def webCompletions(items: List[Repl.CompletionItem]): List[WebCompletion] =
-  items.map { item => WebCompletion(item.name, item.kind, item.signature) }
-
-// Maps a typed `Repl.Reply` (from `react`) to the flat reply the browser renders.
-private def resultReply(seq: Int, reply: Repl.Reply): WebReply = reply match
-  case Repl.Reply.Ran(_, value, output, tpe, name, diagnostics, highlight, spans) =>
-    WebReply
-     ( t"result", seq, value.or(t""), tpe.let(_.text).or(t""), output, diagnostics,
-       webTokens(highlight),
-       name = name.or(t""), base = tpe.let(_.base).or(t""), spans = webSpans(spans) )
-
-  case Repl.Reply.Rejected(_, diagnostics, highlight) =>
-    WebReply(t"error", seq, t"", t"", t"", diagnostics, webTokens(highlight))
-
-  case Repl.Reply.Threw(_, output, diagnostics, highlight, spans) =>
-    WebReply(t"error", seq, t"", t"", output, diagnostics, webTokens(highlight), spans = webSpans(spans))
-
-  case Repl.Reply.Crashed(_, diagnostics, highlight) =>
-    WebReply(t"error", seq, t"", t"", t"", diagnostics, webTokens(highlight))
-
-  case Repl.Reply.Failed(_, message) =>
-    WebReply(t"error", seq, t"", t"", t"", message, Nil)
-
-  case _ =>
-    WebReply(t"error", seq, t"", t"", t"", t"", Nil)
-
-// The out-of-band fill for an async submission: the same content `resultReply` produces, but tagged
-// `async` so the browser fills the matching placeholder div (located by `seq`) rather than appending a
-// new block. The JS `async` handler renders value/output/diagnostics exactly like a normal result.
-private def asyncReply(seq: Int, reply: Repl.Reply): WebReply =
-  resultReply(seq, reply).copy(kind = t"async")
-
-// A streamed chunk of an async submission's stdout, correlated by `seq`; the browser appends its
-// `output` to the matching placeholder as it arrives (the final `async` reply then re-renders in full).
-private def outputReply(seq: Int, chunk: Text, stream: Text): WebReply =
-  WebReply(t"output", seq, t"", t"", chunk, t"", Nil, stream = stream)
-
-private def webSpans(spans: List[Repl.OutputSpan]): List[WebSpan] =
-  spans.map { span => WebSpan(span.stream, span.start, span.length) }
 
 // Maps a typed `Repl.Reply` (from `react`) to the flat JSON result the REST API returns. Unlike
 // `resultReply`, this carries no highlight tokens and the value is plain text (the API's sessions
 // render in `Rendering.Inspect`), so it is safe to serialize straight to JSON.
 private def apiResult(reply: Repl.Reply): ApiResult = reply match
-  case Repl.Reply.Ran(_, value, output, tpe, name, diagnostics, _, _) =>
+  case Repl.Reply.Ran(_, value, output, tpe, name, diagnostics, _, _, _) =>
     ApiResult
      ( t"ran", value.or(t""), tpe.let(_.text).or(t""), output, name.or(t""), plain(diagnostics),
        base = tpe.let(_.base).or(t"") )
 
-  case Repl.Reply.Threw(_, output, diagnostics, _, _) =>
+  case Repl.Reply.Threw(_, output, diagnostics, _, _, _) =>
     ApiResult(t"error", output = output, diagnostics = plain(diagnostics))
 
-  case Repl.Reply.Rejected(_, diagnostics, _) => ApiResult(t"error", diagnostics = plain(diagnostics))
-  case Repl.Reply.Crashed(_, diagnostics, _)  => ApiResult(t"error", diagnostics = plain(diagnostics))
+  case Repl.Reply.Rejected(_, diagnostics, _, _) => ApiResult(t"error", diagnostics = plain(diagnostics))
+  case Repl.Reply.Crashed(_, diagnostics, _, _)  => ApiResult(t"error", diagnostics = plain(diagnostics))
   case Repl.Reply.Failed(_, message)          => ApiResult(t"error", diagnostics = message)
   case _                                      => ApiResult(t"error")
 
@@ -999,254 +122,163 @@ private val jsonHeaders: List[Http.Header] =
 private def jsonResponse(status: Http.Status, body: Text): Http.Response =
   status(jsonHeaders, Http.Body.Fixed(body.in[Data]))
 
-// Serves the web REPL on `port`, blocking until the process is interrupted. The embedded
-// engine's compile classpath comes from the supplied `Classloader`, so each caller passes
-// the loader matching how it was launched: the standalone `web` main uses the
-// thread-context loader (correct when run from the fat assembly), while the CLI client
-// passes its `serverClassloader` (correct under the Burdock/Ethereal launcher).
-// Blocks until `quit` is fulfilled (the CLI completes it on Ctrl+C; the standalone `web`
-// main passes one that is never fulfilled and relies on the JVM's own signal handling).
+// The web's engine: a connection to the in-process sessions, called directly. Replies to a
+// request go to its callback; what the connection pushes of its own accord (an asynchronous
+// submission's streamed output and eventual result) goes to the sink, as over the socket.
+class LocalEngine(sessions: Sessions[3.9])(using Monitor, System, Probate) extends Engine:
+  private val nextId: juca.AtomicInteger = juca.AtomicInteger(1)
+  private val callbacks: TrieMap[Int, Repl.Reply -> Unit] = TrieMap()
+
+  @volatile private var sink: Repl.Reply -> Unit = _ => ()
+
+  private val connection: sessions.Connection =
+    caps.unsafe.unsafeAssumePure(sessions.connection { (reply: Repl.Reply) => deliver(reply) })
+
+  private def deliver(reply: Repl.Reply): Unit = reply match
+    case Repl.Reply.Output(_, _, _) => sink(reply)
+    case _ =>
+      callbacks.remove(Repl.replyId(reply)) match
+        case Some(callback) => callback(reply)
+        case None           => sink(reply)
+
+  def request(request: Int => Repl.Request)(reply: Repl.Reply => Unit): Unit =
+    val id = nextId.getAndIncrement
+    callbacks(id) = caps.unsafe.unsafeAssumePure(reply)
+    connection.respond(request(id)).let(deliver)
+
+  def send(request: Int => Repl.Request): Unit =
+    connection.respond(request(nextId.getAndIncrement))
+    ()
+
+  def pushed(sink: Repl.Reply => Unit): Unit = this.sink = caps.unsafe.unsafeAssumePure(sink)
+  def close(): Unit = ()
+
+// The JSON REST API: a plain request/response HTTP API over an INDEPENDENT plain-text session
+// registry, served alongside the browser UI. `POST /api/sessions` creates a session; `GET
+// /api/sessions` lists them; `POST /api/sessions/{name}/eval` runs the JSON body's `code` on that
+// session; `POST /api/sessions/{name}/complete` returns the tab-completion candidates at a cursor
+// `offset` in `code`. Routing is exact-string, so the `{name}` path segment is peeled off by
+// stripping the fixed prefix and suffix. Anything else is not the API's (`Unset`).
+private def restApi(apiSessions: Sessions[3.9])(request: Http.Request)(using Monitor): Optional[Http.Response] =
+  request.target match
+    case t"/api/sessions" if request.method == Http.Post =>
+      jsonResponse(Http.Ok, ApiSessionCreated(apiSessions.create()).in[Json].show)
+
+    case t"/api/sessions" if request.method == Http.Get =>
+      jsonResponse(Http.Ok, ApiSessionsList(apiSessions.names).in[Json].show)
+
+    case target if request.method == Http.Post
+                   && target.starts(t"/api/sessions/") && target.ends(t"/eval") =>
+      val name: Text = target.chomp(t"/api/sessions/").chomp(t"/eval", Rtl)
+
+      apiSessions.session(name).lay
+       (jsonResponse(Http.NotFound, ApiError(t"no session named '$name'").in[Json].show)): repl =>
+        // Read and parse the body as `{"code": "…"}`; a stream/parse failure yields `Unset` → 400.
+        // `react` is synchronous (async mode has no REST analogue), so evaluate directly with a
+        // fixed id.
+        safely(request.body().memoize.utf8.read[Json].as[ApiEval]) match
+          case eval: ApiEval =>
+            jsonResponse(Http.Ok, apiResult(repl.react(0, eval.code)).in[Json].show)
+
+          case _ =>
+            jsonResponse(Http.BadRequest, ApiError(t"the request body must be JSON: {\"code\": \"…\"}").in[Json].show)
+
+    case target if request.method == Http.Post
+                   && target.starts(t"/api/sessions/") && target.ends(t"/complete") =>
+      val name: Text = target.chomp(t"/api/sessions/").chomp(t"/complete", Rtl)
+
+      apiSessions.session(name).lay
+       (jsonResponse(Http.NotFound, ApiError(t"no session named '$name'").in[Json].show)): repl =>
+        // Body is `{"code": "…", "offset": N}`; a stream/parse failure yields `Unset` → 400. The
+        // cursor is clamped to the code, then the engine's completions at that point are returned:
+        // Scala members/keywords, or the `/`-command completions when `code` starts with `/`.
+        safely(request.body().memoize.utf8.read[Json].as[ApiComplete]) match
+          case req: ApiComplete =>
+            val offset: Int = req.offset.max(0).min(req.code.length)
+            val items: List[ApiCompletion] =
+              repl.completionsAt(req.code, offset).map: item =>
+                ApiCompletion(item.name, item.kind, item.signature)
+
+            jsonResponse(Http.Ok, ApiCompletions(items).in[Json].show)
+
+          case _ =>
+            jsonResponse
+             (Http.BadRequest,
+              ApiError(t"the request body must be JSON: {\"code\": \"…\", \"offset\": N}").in[Json].show)
+
+    case _ => Unset
+
+// Flame's web theme: the same Zed colours as the terminal's (see `FlameColours`).
+object FlameWebTheme extends pyrocosm.WebTheme:
+  import anticipation.Chroma
+  def background: Chroma = Chroma(FlameColours.background)
+  def surface: Chroma = Chroma(FlameColours.margin)
+  def foreground: Chroma = Chroma(FlameColours.foreground)
+  def muted: Chroma = Chroma(FlameColours.subdued)
+  def border: Chroma = Chroma(FlameColours.subdued)
+  def key: Chroma = Chroma(FlameColours.parameter)
+  def reference: Chroma = Chroma(FlameColours.term)
+  def figure: Chroma = Chroma(FlameColours.number)
+  def units: Chroma = Chroma(FlameColours.comment)
+  def link: Chroma = Chroma(FlameColours.string)
+  def selection: Chroma = Chroma(FlameColours.selection)
+
+  def tone(tone: pyrocosm.Tone): Chroma = tone match
+    case pyrocosm.Tone.Success => Chroma(FlameColours.tpe)
+    case pyrocosm.Tone.Failure => Chroma(FlameColours.error)
+    case pyrocosm.Tone.Warning => Chroma(FlameColours.parameter)
+    case pyrocosm.Tone.Muted   => Chroma(FlameColours.comment)
+    case pyrocosm.Tone.Accent  => Chroma(FlameColours.term)
+    case pyrocosm.Tone.Info    => Chroma(FlameColours.string)
+
+  def accent(accent: pyrocosm.Token.Accent): Chroma = accent match
+    case pyrocosm.Token.Accent.Keyword  => Chroma(FlameColours.keyword)
+    case pyrocosm.Token.Accent.Modifier => Chroma(FlameColours.keyword)
+    case pyrocosm.Token.Accent.Command  => Chroma(FlameColours.keyword)
+    case pyrocosm.Token.Accent.String   => Chroma(FlameColours.string)
+    case pyrocosm.Token.Accent.Number   => Chroma(FlameColours.number)
+    case pyrocosm.Token.Accent.Term     => Chroma(FlameColours.term)
+    case pyrocosm.Token.Accent.Typal    => Chroma(FlameColours.tpe)
+    case pyrocosm.Token.Accent.Symbol   => Chroma(FlameColours.symbol)
+    case pyrocosm.Token.Accent.Parens   => Chroma(FlameColours.operator)
+    case pyrocosm.Token.Accent.Error    => Chroma(FlameColours.error)
+    case pyrocosm.Token.Accent.Unparsed => Chroma(FlameColours.foreground)
+
+// Serves the web REPL on `port`: the REPL interface on Pyrocosm's web frontend, a session per
+// page, with the REST API answering what the frontend does not. The embedded engine's compile
+// classpath comes from the supplied `Classloader`, so each caller passes the loader matching how
+// it was launched: the standalone `web` main uses the thread-context loader (correct when run
+// from the fat assembly), while the CLI client passes its `serverClassloader` (correct under the
+// Burdock/Ethereal launcher). Blocks until `quit` is fulfilled (the CLI completes it on Ctrl+C;
+// the standalone `web` main passes one that is never fulfilled and relies on the JVM's own
+// signal handling).
 def serveHttp(port: Int, quit: Promise[Unit])(using Monitor, System, Probate, Classloader): Unit =
   given Scalac[3.9, Universe.Classfile] = Scalac(Nil)
 
-  // Multiple named sessions — each browser connection auto-starts a fresh randomly-named session and
-  // may `/session`-switch to any other. Result values render as HTML (via `flame.HtmlRender`'s
-  // Renderable→Showable→toString cascade), unlike the CLI's teletype `Inspect` rendering.
-  val sessions = Sessions(Repl.Rendering.Html)
+  // Each page auto-starts a fresh randomly-named session and may `/session`-switch to any other.
+  // Results are exhibited as blocks, without terminal colour.
+  val sessions = Sessions(Repl.Rendering.Exhibit(ansi = false))
 
-  // The JSON REST API's sessions are an INDEPENDENT registry, rendering results as plain text
-  // (`Rendering.Inspect`) rather than HTML — so an API caller gets a `value` field it can use, not
-  // browser markup. API session names and browser session names never collide (separate `Sessions`).
+  // The REST API's sessions are an INDEPENDENT registry, rendering results as plain text, so an
+  // API caller gets a `value` field it can use. API session names and browser session names never
+  // collide (separate `Sessions`).
   val apiSessions = Sessions(Repl.Rendering.Inspect)
 
-  // A token unique to this server process. The client remembers it and, on reconnecting,
-  // compares: a different token means it reached a fresh process (e.g. after a restart),
-  // whose `repl` has none of the previous session's definitions, imports, or settings —
-  // so the client can warn that the session was lost.
-  val instance: Text = Uuid().text
+  val frontend: pyrocosm.WebFrontend =
+    caps.unsafe.unsafeAssumePure(pyrocosm.WebFrontend(port, FlameWebTheme, { (request: Http.Request) => restApi(apiSessions)(request) }))
 
-  // Translate one JSON request from the browser into a JSON reply, dispatched on this connection's
-  // CURRENT session (`current`): `tokenize` (the fast, compiler-free lexer) is stateless; `submit`/
-  // `complete` run on the current session (with `/session` intercepted to switch it); `hello` reports
-  // the session name for the startup banner.
-  // `push` sends an unsolicited frame to THIS browser (via the connection's WebSocket channel), used
-  // to deliver an async submission's result out-of-band once it is ready.
-  def respondJson(current: juca.AtomicReference[Text], push: Text => Unit, payload: Text): Text =
-    def session: Optional[Repl[3.9]] = sessions.session(current.get.nn)
-
-    safely(payload.read[Json].as[WebRequest]).let: request =>
-      request.kind match
-        case t"tokenize" =>
-          // The scope the line has opened so far is the one session-dependent part of a tokenize
-          // (imports, history, classpath); a connection whose session does not exist yet has none.
-          val scope: List[WebScope] =
-            session.lay(Nil)(_.scopeAt(request.code)).map: binding =>
-              WebScope(binding.name.or(t""), binding.tpe, binding.contextual)
-
-          WebReply
-           ( t"tokens", request.seq, t"", t"", t"", t"", webTokens(Repl.tokenize(request.code)), Nil,
-             Repl.incomplete(request.code), scope = scope )
-          . in[Json].show
-
-        case t"submit" =>
-          val code = request.code
-          if code == t"/session" || code.starts(t"/session ") then
-            val name = code.skip(t"/session".length).trim
-            val message: Text =
-              if name == t"" then Repl.messages.sessionList(current.get.nn, sessions.names)
-              else if sessions.open(name) then
-                // Unknown, so started under that name (as the CLI's `--session`/`/session` do).
-                current.set(name)
-                Repl.messages.started(name)
-              else
-                current.set(name)
-                Repl.messages.switched(name)
-
-            WebReply(t"result", request.seq, t"", t"", message, t"", Nil).in[Json].show
-
-          // An unrecognised `/`-command gets the same message as the CLI, rather than being compiled
-          // as Scala (`Repl.isCommand` and the message text are shared with the CLI, via core).
-          else if code.starts(t"/") && !Repl.isCommand(code) then
-            WebReply(t"result", request.seq, t"", t"", Repl.messages.unknownCommand(code), t"", Nil).in[Json].show
-          else
-            session.lay
-             (WebReply(t"error", request.seq, t"", t"", t"", t"No active session", Nil).in[Json].show): repl =>
-              if !repl.asyncEnabled then resultReply(request.seq, repl.react(request.seq, code)).in[Json].show
-              else
-                // Async mode: acknowledge with `pending` IMMEDIATELY (pushed directly, so it is sent
-                // before any streamed output), then run on a worker — streaming stdout as `output`
-                // messages as it appears — and push the final result (tagged `async`) when done.
-                // Returns `t""` so the handler sends nothing more itself.
-                push(WebReply(t"pending", request.seq, t"", t"", t"", t"", Nil).in[Json].show)
-
-                async:
-                  val reply: Repl.Reply =
-                    safely
-                     (repl.react(request.seq, code, chunk => Repl.streamChunks(chunk).each { (stream, text) =>
-                       push(outputReply(request.seq, text, stream).in[Json].show) }))
-                    . or(Repl.Reply.Failed(request.seq, t"the submission could not be processed"))
-
-                  push(asyncReply(request.seq, reply).in[Json].show)
-
-                t""
-
-        case t"complete" =>
-          if request.code.starts(t"/session ") then
-            val partial = request.code.skip(t"/session ".length)
-            val items = sessions.names.filter(_.starts(partial)).map: name =>
-              WebCompletion(t"/session $name", t"command", t"")
-
-            WebReply(t"completions", request.seq, t"", t"", t"", t"", Nil, items).in[Json].show
-          else
-            val completions = session.lay(Nil)(_.completionsAt(request.code, request.offset))
-            WebReply(t"completions", request.seq, t"", t"", t"", t"", Nil, webCompletions(completions)).in[Json].show
-
-        case t"ping" =>
-          // The client's keep-alive heartbeat; the reply is ignored, but answering keeps
-          // both directions active so the connection never crosses the idle timeout.
-          WebReply(t"pong", request.seq, t"", t"", t"", t"", Nil).in[Json].show
-
-        case t"hello" =>
-          // Sent on every (re)connect; the instance token lets the client tell a resumed connection
-          // from a new one, `name` carries this connection's session (for the switch-detection), and
-          // `output` is the ready-to-show startup banner (built in core, identical to the CLI's).
-          WebReply
-           ( t"hello", request.seq, instance, t"", Repl.messages.session(current.get.nn), t"", Nil,
-             name = current.get.nn )
-          . in[Json].show
-
-        case _ =>
-          WebReply(t"error", request.seq, t"", t"", t"", t"Unknown request", Nil).in[Json].show
-
-    . or(t"")
-
-  val service = SocketServer(port).handle:
-    request.target match
-      case t"/" | t"/index.html" =>
-        // Serve the page as an EAGERLY-rendered `text/html` body (`Html.show` is synchronous) rather
-        // than via the Archetype's synthesised `Servable`, whose body is a lazy async text-stream
-        // producer (`document.source[Text]`, capturing a Monitor) that deadlocks under soundness's
-        // native HTTP/2 server (#1626) — the response headers never even start. The page is small, so
-        // a fixed body (with a known length) is strictly better here anyway.
-        val page: Text = t"<!DOCTYPE html>${ReplPage().html.show}"
-        Http.Ok
-         ( List(Http.Header(t"content-type", t"text/html; charset=utf-8")),
-           Http.Body.Fixed(page.in[Data]) )
-
-      case t"/socket" =>
-        // Per-connection: a fresh session, switchable with `/session`.
-        val current: juca.AtomicReference[Text] = juca.AtomicReference(sessions.create())
-
-        Http.Response:
-          // The handler pushes async results out-of-band through the connection's channel, which
-          // is only known once the `Websocket` is constructed — so it is delivered through this
-          // holder, set immediately below, before any message can arrive. (A `lazy val ws`
-          // self-reference expressed the same thing before capture checking, which now rejects a
-          // handler capturing the value it constructs.) `push` sends one Text frame —
-          // wire-identical to a normal reply.
-          val channelHolder: juca.AtomicReference[perihelion.Channel | Null] =
-            juca.AtomicReference()
-
-          def push(text: Text): Unit =
-            Optional(channelHolder.get).let(_.send(perihelion.Message.Text(text)))
-
-          // The handler is vouched pure (Soundness's codec-thunk seal idiom): it captures only
-          // this connection's locals, which live exactly as long as the Websocket itself.
-          val handler: perihelion.Message -> Control[Unit] =
-            caps.unsafe.unsafeAssumePure: (message: perihelion.Message) =>
-              message match
-                case perihelion.Message.Text(payload) =>
-                  // `t""` means `respondJson` already pushed everything itself (an async submit) — send
-                  // nothing more.
-                  val reply: Text = respondJson(current, push, payload)
-                  if reply == t"" then Continue(()) else Reply(perihelion.Message.Text(reply), ())
-
-                case perihelion.Message.Binary(_) => Continue(())
-
-          // Declared with a PURE inner arrow so the adaptation to `Websocket`'s handler
-          // parameter mints no fresh capture on the result (which could not flow into the
-          // parameter's own root). The `Websocket` is constructed directly rather than through
-          // the `webSocket` wrapper: forwarding the wrapper's own (impure-arrowed) `handle`
-          // parameter to the constructor re-mints exactly that fresh capture, so the inline
-          // wrapper cannot currently be called with any handler under capture checking. The
-          // identity `decode` is what the wrapper generates for a raw `Message` handler.
-          val handle: (state: Unit) ?=> perihelion.Message -> Control[Unit] = handler
-
-          // `summon[Http.Request]` resolves to the ambient `HttpConnection`, which carries the
-          // connection's `request`/`respond` capabilities; the `Websocket` constructor wants a pure
-          // `Http.Request` (it reads only the handshake headers and body). Seal it — the connection
-          // outlives the websocket it upgrades to — so the capture does not block construction.
-          val request: Http.Request = caps.unsafe.unsafeAssumePure(summon[Http.Request])
-
-          val ws =
-            perihelion.Websocket(request, (), (message: perihelion.Message) => message, handle)
-
-          channelHolder.set(ws.channel)
-
-          // The websocket captures this connection's handler and the ambient Monitor, both of
-          // which outlive it; the cast discards the tracked captures so it can serve as the
-          // (pure-typed) response body.
-          ws.asInstanceOf[perihelion.Websocket[perihelion.Message, Unit]]
-
-      // ── JSON REST API ──────────────────────────────────────────────────────────────────────────
-      // A plain request/response HTTP API over an INDEPENDENT plain-text session registry
-      // (`apiSessions`), served alongside the browser UI and WebSocket. `POST /api/sessions` creates a
-      // session; `GET /api/sessions` lists them; `POST /api/sessions/{name}/eval` runs the JSON body's
-      // `code` on that session; `POST /api/sessions/{name}/complete` returns the tab-completion
-      // candidates at a cursor `offset` in `code`. Routing is exact-string (like the arms above), so
-      // the `{name}` path segment is peeled off by stripping the fixed prefix and suffix.
-      case t"/api/sessions" if request.method == Http.Post =>
-        jsonResponse(Http.Ok, ApiSessionCreated(apiSessions.create()).in[Json].show)
-
-      case t"/api/sessions" if request.method == Http.Get =>
-        jsonResponse(Http.Ok, ApiSessionsList(apiSessions.names).in[Json].show)
-
-      case target if request.method == Http.Post
-                     && target.starts(t"/api/sessions/") && target.ends(t"/eval") =>
-        val name: Text = target.chomp(t"/api/sessions/").chomp(t"/eval", Rtl)
-
-        apiSessions.session(name).lay
-         (jsonResponse(Http.NotFound, ApiError(t"no session named '$name'").in[Json].show)): repl =>
-          // Read and parse the body as `{"code": "…"}`; a stream/parse failure yields `Unset` → 400.
-          // `react` is synchronous (async mode has no REST analogue), so evaluate directly with a
-          // fixed id.
-          safely(request.body().memoize.utf8.read[Json].as[ApiEval]) match
-            case eval: ApiEval =>
-              jsonResponse(Http.Ok, apiResult(repl.react(0, eval.code)).in[Json].show)
-
-            case _ =>
-              jsonResponse(Http.BadRequest, ApiError(t"the request body must be JSON: {\"code\": \"…\"}").in[Json].show)
-
-      case target if request.method == Http.Post
-                     && target.starts(t"/api/sessions/") && target.ends(t"/complete") =>
-        val name: Text = target.chomp(t"/api/sessions/").chomp(t"/complete", Rtl)
-
-        apiSessions.session(name).lay
-         (jsonResponse(Http.NotFound, ApiError(t"no session named '$name'").in[Json].show)): repl =>
-          // Body is `{"code": "…", "offset": N}`; a stream/parse failure yields `Unset` → 400. The
-          // cursor is clamped to the code, then the engine's completions at that point are returned —
-          // Scala members/keywords, or the `/`-command completions when `code` starts with `/`.
-          safely(request.body().memoize.utf8.read[Json].as[ApiComplete]) match
-            case req: ApiComplete =>
-              val offset: Int = req.offset.max(0).min(req.code.length)
-              val items: List[ApiCompletion] =
-                repl.completionsAt(req.code, offset).map: item =>
-                  ApiCompletion(item.name, item.kind, item.signature)
-
-              jsonResponse(Http.Ok, ApiCompletions(items).in[Json].show)
-
-            case _ =>
-              jsonResponse
-               (Http.BadRequest,
-                ApiError(t"the request body must be JSON: {\"code\": \"…\", \"offset\": N}").in[Json].show)
-
-      case _ =>
-        Http.Response(Http.NotFound)(t"not found")
+  async:
+    frontend.serve: () =>
+      val engine: LocalEngine = caps.unsafe.unsafeAssumePure(LocalEngine(sessions))
+      val options = ReplInterface.Options(navigation = true, quitAllowed = false)
+      val interface: ReplInterface = caps.unsafe.unsafeAssumePure(ReplInterface(engine, options))
+      interface.start()
+      (interface.interface, interface.handle)
 
   java.lang.System.out.nn.println("Serving the web REPL (press Ctrl+C to stop):")
   java.lang.System.out.nn.println(s"  http://localhost:$port/")
   quit.attend()
-  safely(service.cancel())
+  frontend.stop()
 
 @main
 def web(): Unit =

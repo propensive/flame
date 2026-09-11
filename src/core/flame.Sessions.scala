@@ -209,26 +209,23 @@ class Sessions[version <: Scalac.Versions]
         safely(task.await())
         ()
 
-  private def converse(input: ji.InputStream, output: ji.OutputStream)
-    ( using Monitor, System, Probate )
-  :   Unit logs CompileEvent =
-
-    // Each connection has a "current" session, created LAZILY on the first request — a bare probe
-    // (the no-args CLI opens and immediately closes a connection to test whether a server is live)
-    // sends nothing and so leaves no throwaway session behind. A `Session` request switches it.
-    @volatile var current: Optional[Text] = Unset
+  // One client's connection: its current session (created lazily, so a probe leaves none
+  // behind), its context, and `respond`, which answers a request or, for an asynchronous
+  // submission, pushes `Pending`, the streamed output and the final reply through `send` and
+  // answers nothing. Both the socket loop and the web front-end drive one of these.
+  class Connection(send: Repl.Reply => Unit)(using Monitor, System, Probate):
+    @volatile private var current: Optional[Text] = Unset
 
     def currentName: Text = current.or:
       val name = create()
       current = name
       name
 
-    // The client's reported context (see `Repl.Request.Context`), applied to whichever session is
-    // current — now, and again on every switch, so a joined session sees the joining client's
-    // directory and environment.
-    @volatile var context: Optional[(Text, List[Repl.Pair])] = Unset
+    def name: Optional[Text] = current
 
-    def applyContext(): Unit = context.let: (directory, environment) =>
+    @volatile private var context: Optional[(Text, List[Repl.Pair])] = Unset
+
+    private def applyContext(): Unit = context.let: (directory, environment) =>
       current.let: name =>
         session(name).let: repl =>
           val variables: scala.collection.immutable.Map[Text, Text] =
@@ -236,13 +233,79 @@ class Sessions[version <: Scalac.Versions]
 
           ReplContext.set(repl.session, ReplContext.Values(directory, variables))
 
+    def respond(request: Repl.Request): Optional[Repl.Reply] logs CompileEvent = request match
+      case Repl.Request.Tokenize(id, code) =>
+        val scope: List[Repl.ScopeBinding] = session(currentName).lay(Nil)(_.scopeAt(code))
+        Repl.Reply.Tokenized(id, Repl.tokenize(code), Repl.incomplete(code),
+            Repl.classify(code) == Repl.Verdict.Language, scope)
+
+      case Repl.Request.Submit(id, code) =>
+        session(currentName).lay(Repl.Reply.Failed(id, t"no active session")): repl =>
+          if !repl.asyncEnabled then repl.react(id, code)
+          else
+            send(Repl.Reply.Pending(id))
+
+            async:
+              val reply: Repl.Reply =
+                safely(repl.react(id, code, chunk => Repl.streamChunks(chunk).each { (stream, text) =>
+                  send(Repl.Reply.Output(id, text, stream)) })).or
+                 (Repl.Reply.Failed(id, t"the submission could not be processed"))
+
+              send(reply)
+
+            Unset
+
+      case Repl.Request.Complete(id, code, offset) =>
+        session(currentName).lay(Repl.Reply.Completed(id, Nil)): repl =>
+          Repl.Reply.Completed(id, repl.completionsAt(code, offset))
+
+      case Repl.Request.Session(id, name) =>
+        val wasAbsent: Boolean = current.absent
+        val created: Boolean = if name == t"" then wasAbsent else open(name)
+        if name != t"" then current = name
+        val outcome = if created then Repl.SessionOutcome.Created else Repl.SessionOutcome.Joined
+        val reply = Repl.Reply.Session(id, currentName, names, outcome)
+        applyContext()
+        reply
+
+      case Repl.Request.Join(id, name) =>
+        if session(name).present then
+          current = name
+          applyContext()
+          Repl.Reply.Session(id, name, names, Repl.SessionOutcome.Joined)
+        else Repl.Reply.Session(id, current.or(t""), names, Repl.SessionOutcome.Missing)
+
+      case Repl.Request.Create(id, name) =>
+        if open(name) then
+          current = name
+          applyContext()
+          Repl.Reply.Session(id, name, names, Repl.SessionOutcome.Created)
+        else Repl.Reply.Session(id, current.or(t""), names, Repl.SessionOutcome.Exists)
+
+      case Repl.Request.SessionList(id) =>
+        Repl.Reply.SessionList(id, names)
+
+      case Repl.Request.Context(_, directory, environment) =>
+        context = (directory, environment)
+        applyContext()
+        Unset
+
+      case Repl.Request.Quit(_) =>
+        quit.offer(()) yet Unset
+
+  // A connection holds its `send` and the monitor, both of which outlive it (they are the
+  // socket's or the page's); vouched pure so it can be kept and called from anywhere.
+  def connection(send: Repl.Reply => Unit)(using Monitor, System, Probate): Connection =
+    caps.unsafe.unsafeAssumePure(new Connection(send))
+
+  private def converse(input: ji.InputStream, output: ji.OutputStream)
+    ( using Monitor, System, Probate )
+  :   Unit logs CompileEvent =
+
     val writes: Mutex = Mutex()
     val out: ji.DataOutputStream = ji.DataOutputStream(ji.BufferedOutputStream(output))
 
-    // Frames one reply onto the socket, serialized by `writes` so the read loop's per-request replies
-    // and any out-of-band async fills never interleave. Total: a failed write (a dropped client) is
-    // swallowed. This is the ONLY writer, so an async run can push its reply through it at any later
-    // time, not just in direct response to a request.
+    // The one writer, so a reply pushed at any time cannot interleave with another.
     def send(payload: Data): Unit =
       writes:
         try
@@ -251,88 +314,7 @@ class Sessions[version <: Scalac.Versions]
           out.flush()
         catch case _: Throwable => ()
 
-    // Decodes one request and dispatches on the CURRENT session: `tokenize` is stateless (the lexer);
-    // `submit`/`complete` run on `current`'s `Repl`; `session` switches/reports sessions; `quit`
-    // stops the whole server (all sessions). `Unset` means no reply is sent.
-    def respond(message: Data): Optional[Data] =
-      safely(Bintel.read[Repl.Request](message)).lay
-       (encode(Repl.Reply.Failed(0, t"the request could not be parsed"))):
-
-        case Repl.Request.Tokenize(id, code) =>
-          // The scope the line has opened so far is the one thing about a tokenize that depends on
-          // the session (its imports, history and classpath); a connection with no session yet — one
-          // is created lazily — has no scope to report.
-          val scope: List[Repl.ScopeBinding] = session(currentName).lay(Nil)(_.scopeAt(code))
-
-          encode(Repl.Reply.Tokenized(id, Repl.tokenize(code), Repl.incomplete(code),
-              Repl.classify(code) == Repl.Verdict.Language, scope))
-
-        case Repl.Request.Submit(id, code) =>
-          session(currentName).lay(encode(Repl.Reply.Failed(id, t"no active session"))): repl =>
-            if !repl.asyncEnabled then encode(repl.react(id, code))
-            else
-              // Async mode: acknowledge with `Pending` IMMEDIATELY (sent directly, so it is written
-              // before any streamed output), then run on a worker — streaming the run's stdout as
-              // `Output` chunks as it appears — and push the final reply when it completes. `respond`
-              // returns `Unset` because it has already sent everything itself.
-              send(encode(Repl.Reply.Pending(id)))
-
-              async:
-                val reply: Repl.Reply =
-                  safely(repl.react(id, code, chunk => Repl.streamChunks(chunk).each { (stream, text) =>
-                    send(encode(Repl.Reply.Output(id, text, stream))) })).or
-                   (Repl.Reply.Failed(id, t"the submission could not be processed"))
-
-                send(encode(reply))
-
-              Unset
-
-        case Repl.Request.Complete(id, code, offset) =>
-          session(currentName).lay(encode(Repl.Reply.Completed(id, Nil))): repl =>
-            encode(Repl.Reply.Completed(id, repl.completionsAt(code, offset)))
-
-        case Repl.Request.Session(id, name) =>
-          // Empty name only reports (the bare-launch default creates one lazily through
-          // `currentName`); a known name switches; an unknown one is STARTED under that name and
-          // switched to. The `/session` command and the bare launch use this.
-          val wasAbsent: Boolean = current.absent
-          val created: Boolean = if name == t"" then wasAbsent else open(name)
-          if name != t"" then current = name
-          val outcome = if created then Repl.SessionOutcome.Created else Repl.SessionOutcome.Joined
-          val reply = encode(Repl.Reply.Session(id, currentName, names, outcome))
-          applyContext()
-          reply
-
-
-        case Repl.Request.Join(id, name) =>
-          // `--join`: switch to `name` only if it exists; otherwise report `Missing` and touch
-          // nothing (NOT `currentName`, which would create a throwaway session on the failure path).
-          if session(name).present then
-            current = name
-            applyContext()
-            encode(Repl.Reply.Session(id, name, names, Repl.SessionOutcome.Joined))
-          else encode(Repl.Reply.Session(id, current.or(t""), names, Repl.SessionOutcome.Missing))
-
-        case Repl.Request.Create(id, name) =>
-          // `--create`: start `name` only if it is free; otherwise report `Exists` and switch to
-          // nothing, so a name clash is an error rather than a silent join.
-          if open(name) then
-            current = name
-            applyContext()
-            encode(Repl.Reply.Session(id, name, names, Repl.SessionOutcome.Created))
-          else encode(Repl.Reply.Session(id, current.or(t""), names, Repl.SessionOutcome.Exists))
-
-        case Repl.Request.SessionList(id) =>
-          // Report only — no `currentName`, so a bare probe (a tab-completion) creates nothing.
-          encode(Repl.Reply.SessionList(id, names))
-
-        case Repl.Request.Context(_, directory, environment) =>
-          context = (directory, environment)
-          applyContext()
-          Unset
-
-        case Repl.Request.Quit(_) =>
-          quit.offer(()) yet Unset
+    val connection: Connection = this.connection(reply => send(encode(reply)))
 
     try
       val in: ji.DataInputStream = ji.DataInputStream(ji.BufferedInputStream(input))
@@ -348,10 +330,15 @@ class Sessions[version <: Scalac.Versions]
           val message: Data = bytes.immutable(using Unsafe)
 
           async:
-            val response: Optional[Data] =
-              try respond(message)
-              catch case error: Throwable => encode(Repl.Reply.Failed(0, error.toString.tt))
+            val response: Optional[Repl.Reply] =
+              try
+                safely(Bintel.read[Repl.Request](message)).lay(Repl.Reply.Failed(0, t"the request could not be parsed")): request =>
+                  connection.respond(request)
+              catch case error: Throwable => Repl.Reply.Failed(0, error.toString.tt)
 
-            response.let(send)
-
+            response.let { reply => send(encode(reply)) }
     catch case _: Throwable => ()
+
+    // Decodes one request and dispatches on the CURRENT session: `tokenize` is stateless (the lexer);
+    // `submit`/`complete` run on `current`'s `Repl`; `session` switches/reports sessions; `quit`
+    // stops the whole server (all sessions). `Unset` means no reply is sent.

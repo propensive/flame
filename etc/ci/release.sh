@@ -96,7 +96,7 @@ done
 ./mill flame.launcher.assembly
 cp out/flame/launcher/assembly.dest/out.jar flame.jar
 java -cp flame.jar soundness.repackage \
-  --github propensive/flame,propensive/soundness,propensive/proscala | tee /tmp/flame-release-repackage.log
+  --github propensive/flame,propensive/pyrocosm,propensive/soundness,propensive/proscala | tee /tmp/flame-release-repackage.log
 
 # The whole point of the two-step dance: refuse to ship an executable that quietly inlined a
 # library instead of referring to the release.
