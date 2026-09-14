@@ -39,8 +39,6 @@ import scala.caps
 
 // Like `ReplModuleCompiler`, this file drives the compiler API directly, which speaks stdlib
 // collections; `sci` names them explicitly, since `scala` is out of `-Yimports`.
-import scala.collection.immutable as sci
-
 import dotty.tools.dotc.core.Contexts.Context
 import dotty.tools.dotc.core.Contexts.NoContext
 import dotty.tools.dotc.core.Flags
@@ -52,6 +50,7 @@ import dotty.tools.dotc.util.SourcePosition
 import dotty.tools.dotc.util.Spans
 
 import anticipation.*
+import symbolism.*
 import gossamer.*
 import rudiments.*
 import stenography.Syntax
@@ -133,8 +132,8 @@ class ScopeInspector(arguments: List[Text]):
     val path     = Interactive.pathTo(driver.openedTrees(uri), position)
 
     var scope: Context = Interactive.contextOfPath(path)
-    var seen: sci.Set[Text] = sci.Set()
-    var bindings: sci.List[Repl.ScopeBinding] = sci.Nil
+    var seen: Set[Text] = Set()
+    var bindings: List[Repl.ScopeBinding] = Nil
     var depth: Int = 0
 
     // Outwards from the marker to the wrapper object (the first CLASS owner): each context's scope
@@ -145,14 +144,14 @@ class ScopeInspector(arguments: List[Text]):
         if relevant(symbol) then
           val binding = render(symbol, imports).copy(level = depth)
           val key = t"${binding.name.or(t"")}:${binding.tpe}"
-          if !seen.contains(key) then
-            seen += key
-            bindings = bindings :+ binding
+          if !seen.has(key) then
+            seen = seen + Set(key)
+            bindings = binding :: bindings
 
       scope = scope.outer
       depth += 1
 
-    List.from(bindings)
+    bindings.reverse
 
   // A term binding the user could refer to (or that a `using` clause could pick up): a parameter
   // or a local value — not the synthetic `$anonfun` method a context function desugars into, and

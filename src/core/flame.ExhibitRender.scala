@@ -64,8 +64,8 @@ object ExhibitRender:
     case block: Block   => t"block:${block.in[Tel].show}"
 
   def decode(text: Text): Inline | Block =
-    if text.starts(t"block:") then text.s.substring(6).nn.tt.read[Tel].as[Block]
-    else if text.starts(t"inline:") then unquoted(text.s.substring(7).nn.tt.read[Tel].as[Inline])
+    if text.starts(t"block:") then text.skip(6).read[Tel].as[Block]
+    else if text.starts(t"inline:") then unquoted(text.skip(7).read[Tel].as[Inline])
     else Inline.Textual(text)
 
   // An inspection that found no instance marks the `toString` it fell back on with curly
@@ -73,8 +73,8 @@ object ExhibitRender:
   private def unquoted(inline: Inline): Inline = inline match
     case Inline.Textual(text0) =>
       val text = text0.trim
-      if text.length > 1 && text.s.charAt(0) == '\u201c' && text.s.charAt(text.length - 1) == '\u201d'
-      then Inline.Textual(text.s.substring(1, text.length - 1).nn.tt)
+      if text.length > 1 && text.starts(t"\u201c") && text.ends(t"\u201d")
+      then Inline.Textual(text.skip(1).keep(text.length - 2))
       else Inline.Textual(text0)
 
     case Inline.Phrase(content)      => Inline.Phrase(content.map(unquoted))

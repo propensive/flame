@@ -32,8 +32,6 @@
                                                                                                   */
 package flame
 
-import scala.collection.concurrent.TrieMap
-
 import soundness.*
 
 import filesystemBackends.javaBaseFilesystem
@@ -80,7 +78,9 @@ object Workspace:
 
   private case class Cached(modified: Long, size: Long, config: Optional[Tel])
 
-  private val cache: TrieMap[Text, Cached] = TrieMap()
+  // An atomic cell holding an immutable map: an entry is installed whole, so a reader sees either
+  // the previous configuration or the reloaded one, never a half-built entry.
+  private val cache: Atomic.Ref[Map[Text, Cached]] = Atomic.Ref(Map())
 
   // The nearest `.pyrocosm/flame/config.tel` at or above `directory`, or `Unset` if no ancestor
   // has one. The FILE is what is sought: a `.pyrocosm` holding only other tools' directories does
@@ -129,15 +129,14 @@ object Workspace:
 
         def reload(): Optional[Tel] =
           val parsed: Optional[Tel] = parse(file)
-          cache(key) = Cached(stat.modified, stat.size, parsed)
+          cache.revise(_.define(key, Cached(stat.modified, stat.size, parsed)))
           parsed
 
-        cache.get(key) match
-          case Some(cached) if cached.modified == stat.modified && cached.size == stat.size =>
-            cached.config
-
-          case _ =>
-            reload()
+        // A cached entry whose file is unchanged answers even when its config is `Unset` (an
+        // unreadable or unparseable file), so a bad file is not re-read on every lookup.
+        cache().at(key).lay(reload()): cached =>
+          if cached.modified == stat.modified && cached.size == stat.size then cached.config
+          else reload()
 
   // The configuration governing `directory`: `empty` when there is no (readable) file. Relative
   // `classpath` entries are made absolute here — against the project root, three levels above the

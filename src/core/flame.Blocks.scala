@@ -32,11 +32,10 @@
                                                                                                   */
 package flame
 
-import scala.collection.immutable as sci
-
 import anticipation.*
 import contingency.*
 import denominative.*
+import denominative.dysasymptotics.linearSize
 import digression.*
 import gossamer.*
 import rudiments.*
@@ -46,10 +45,9 @@ import symbolism.*
 import turbulence.*
 import vacuous.*
 
-import contingency.strategies.throwUnsafely
 import hieroglyph.charEncoders.utf8Encoder
 
-import pyrocosm.{Block, Inline, Language, Token, Tone}
+import pyrocosm.{Block, Inline, Language, Token}
 import pyrocosm.exhibit
 
 // The REPL's replies as Pyrocosm's semantic blocks: tokens with their marks as code with
@@ -78,42 +76,44 @@ object Blocks:
 
   // A `/`-command line: the command word, then its parameters.
   def command(line: Text): List[Repl.Token] =
-    val space: Int = line.s.indexOf(' ')
-    if space < 0 then List(Repl.Token(line, t"command", Unset))
-    else List(Repl.Token(line.keep(space), t"command", Unset), Repl.Token(line.skip(space), t"unparsed", Unset))
+    line.where(_ == ' ').lay(List(Repl.Token(line, t"command", Unset))): space =>
+      List(Repl.Token(line.keep(space.n0), t"command", Unset),
+           Repl.Token(line.skip(space.n0), t"unparsed", Unset))
 
   // The tokens as a code block: lines split at the newline tokens `Repl.project` inserts, and
   // every marked token a note on its line (an error span erroneous, a warning cautionary).
   def code(tokens: List[Repl.Token]): Block.Code =
-    val lines = sci.List.newBuilder[Block.Line]
-    val notes = sci.List.newBuilder[Block.Note]
-    var current: sci.List[Token] = sci.Nil
+    // Three accumulators built in reverse and turned round as they are drained: the completed
+    // lines, the notes gathered across all of them, and the tokens of the line in hand.
+    var lines: List[Block.Line] = Nil
+    var notes: List[Block.Note] = Nil
+    var current: List[Token] = Nil
     var line: Int = 0
     var column: Int = 0
 
     def flush(): Unit =
-      lines += Block.Line(List.from(current.reverse))
-      current = sci.Nil
+      lines = Block.Line(current.reverse) :: lines
+      current = Nil
 
     tokens.each: (token: Repl.Token) =>
-      val parts = token.text.cut(t"\n").stdlib
-      parts.zipWithIndex.foreach: (part, index) =>
-        if index > 0 then
-          flush()
-          line += 1
-          column = 0
+      token.text.cut(t"\n").each: ordinal ?=>
+        part =>
+          if ordinal != Prim then
+            flush()
+            line += 1
+            column = 0
 
-        if part != t"" then
-          current = Blocks.token(token.copy(text = part)) :: current
+          if part != t"" then
+            current = Blocks.token(token.copy(text = part)) :: current
 
-          token.mark.let: (mark: Text) =>
-            val style = if mark == Repl.warningMark then Block.Note.Style.Caution else Block.Note.Style.Erroneous
-            notes += Block.Note(line, column, column + part.length, style)
+            token.mark.let: (mark: Text) =>
+              val style = if mark == Repl.warningMark then Block.Note.Style.Caution else Block.Note.Style.Erroneous
+              notes = Block.Note(line, column, column + part.length, style) :: notes
 
-          column += part.length
+            column += part.length
 
     flush()
-    Block.Code(Language.Scala, List.from(lines.result()), List.from(notes.result()))
+    Block.Code(Language.Scala, lines.reverse, notes.reverse)
 
   // The marks alone, as notes by line, for a field's decoration.
   def marks(tokens: List[Repl.Token]): List[Block.Note] = code(tokens).notes
@@ -122,23 +122,28 @@ object Blocks:
   // gutter; whatever lies between the spans (the engine's own messages) as preformatted text,
   // stripped of ANSI when the medium cannot show it.
   def output(plain: Text, spans: List[Repl.OutputSpan], ansi: Boolean): List[Block] =
-    val blocks = sci.List.newBuilder[Block]
+    var blocks: List[Block] = Nil
     var at: Int = 0
 
     // A message ends in a newline, which is not a line of its own.
     def gap(text: Text): Unit =
       val shown: Text = if ansi then text else SemanticRender.stripAnsi(text)
       if shown.trim != t"" then
-        val lines: scala.List[Text] = shown.cut(t"\n").stdlib.reverse.dropWhile(_ == t"").reverse
-        blocks += Block.Code(Language.Plain, List.from(lines.map { (line: Text) => Block.Line(if line == t"" then Nil else List(Token.plain(line))) }))
+        val lines: List[Text] = shown.cut(t"\n").skip(_ == t"", Rtl)
+
+        blocks =
+          Block.Code
+           ( Language.Plain,
+             lines.map { (line: Text) => Block.Line(if line == t"" then Nil else List(Token.plain(line))) } )
+          :: blocks
 
     spans.each: (span: Repl.OutputSpan) =>
       if span.start > at then gap(plain.skip(at).keep(span.start - at))
-      blocks += Block.Output(plain.skip(span.start).keep(span.length), error = span.stream == Repl.stderrStream)
+      blocks = Block.Output(plain.skip(span.start).keep(span.length), error = span.stream == Repl.stderrStream) :: blocks
       at = span.start + span.length
 
     if at < plain.length then gap(plain.skip(at))
-    List.from(blocks.result())
+    blocks.reverse
 
   // The result line, `name = value : Type <: base`, as code around the value's exhibit: one
   // paragraph when the value is phrasing, a group around it when it is flow.

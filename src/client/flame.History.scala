@@ -32,13 +32,6 @@
                                                                                                   */
 package flame
 
-import java.io as ji
-
-// This module drives BinTEL and java.io over stdlib lists, so `List`/`Nil` here are the stdlib
-// ones (the client's prelude `List` is proscenium's opaque collection, whose API differs).
-import scala.collection.immutable.{List, Nil}
-import scala.collection.mutable.ArrayBuffer
-
 import soundness.*
 
 // The persistent prompt history for a project: the lines submitted at the REPL, stored as a
@@ -50,51 +43,51 @@ import soundness.*
 // earlier sessions.
 object History:
   import strategies.throwUnsafely
+  import filesystemBackends.javaBaseFilesystem
 
   // Every entry in `file`, oldest first; empty when the file is absent or unreadable. A trailing
-  // frame that does not fully read (an interrupted append) ends the scan without failing.
+  // frame that does not fully read (an interrupted append) ends the scan without failing: the
+  // framing raises, and everything read before it is kept.
   def load(file: Text): List[Text] =
-    val handle: ji.File = ji.File(file.s)
-    if !handle.exists.nn then Nil else
-      val entries: ArrayBuffer[Text] = ArrayBuffer()
+    safely:
+      val path: Path on Linux = file.as[Path on Linux]
 
-      val in: ji.DataInputStream = ji.DataInputStream(ji.BufferedInputStream(ji.FileInputStream(handle)))
+      if !path.existent() then Nil else
+        var entries: List[Text] = Nil
 
-      try
-        var continue: Boolean = true
-        while continue do
-          val length: Int = try in.readInt() catch case _: ji.IOException => -1
-          if length < 0 then continue = false
-          else
-            val bytes: scala.Array[Byte] = new scala.Array[Byte](length)
-            try
-              in.readFully(bytes)
-              safely(Bintel.read[Repl.HistoryEntry](bytes.immutable(using Unsafe)))
-                .let { entry => entries += entry.line; () }
-            catch case _: ji.IOException => continue = false
-      catch case _: Throwable => ()
-      finally try in.close() catch case _: Throwable => ()
+        // `safely` around the whole walk, not around each record: a truncated final frame raises
+        // out of the iterator, and the entries gathered before it are what the history holds.
+        safely:
+          val frames = Iterator(path.read[Data]).frames[LengthPrefix]
 
-      entries.toList
+          while frames.hasNext do
+            safely(Bintel.read[Repl.HistoryEntry](frames.next())).let: entry =>
+              entries = entry.line :: entries
+
+        entries.reverse
+
+    . or(Nil)
 
   // Appends one framed `HistoryEntry` record to `file` (created if absent). Best-effort: a failure
   // to persist a line never disrupts the session.
-  def append(file: Text, line: Text): Unit =
-    write(file, List(line), appending = true)
+  def append(file: Text, line: Text): Unit = write(file, List(line), appending = true)
 
   // Rewrites `file` to hold exactly `lines` (used to compact the log). Best-effort.
-  def replace(file: Text, lines: List[Text]): Unit =
-    write(file, lines, appending = false)
+  def replace(file: Text, lines: List[Text]): Unit = write(file, lines, appending = false)
 
   private def write(file: Text, lines: List[Text], appending: Boolean): Unit =
-    val out: ji.DataOutputStream =
-      ji.DataOutputStream(ji.BufferedOutputStream(ji.FileOutputStream(file.s, appending)))
+    safely:
+      val path: Path on Linux = file.as[Path on Linux]
+      val records: Chain[Data] = Chain(lines.map { line => frame(line) }*)
 
-    try
-      lines.foreach: line =>
-        val body: Data = unsafely(Repl.HistoryEntry(line).bintel)
-        out.writeInt(body.length)
-        out.write(body.mutable(using Unsafe))
-      out.flush()
-    catch case _: Throwable => ()
-    finally try out.close() catch case _: Throwable => ()
+      // `Eof(path)` is galilei's append mode: the same file, opened positioned at its end.
+      // `Eof(path)` is galilei's append mode: the same file, opened positioned at its end.
+      // `Create` as well, since the first line of a session appends to a file that does not exist
+      // yet — without it the append is a no-op and no history is ever persisted.
+      if appending then Eof(path).open(Write, OpenFlag.Create) { handle ?=> handle.write(records) }
+      else path.open[File](Write, OpenFlag.Create, OpenFlag.Truncate) { handle ?=> handle.write(records) }
+
+    ()
+
+  private def frame(line: Text): Data =
+    LengthPrefix.encode(unsafely(Repl.HistoryEntry(line).bintel))

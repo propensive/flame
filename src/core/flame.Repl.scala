@@ -44,7 +44,6 @@ import scala.quoted.*
 // opaque `List`/`Set`/`Map`. `compat` restores the stdlib-shaped operations on them, and `sci` names
 // the stdlib collections the Dotty compiler API — which flame drives directly — speaks throughout.
 import scala.collection.immutable as sci
-import scala.collection.mutable as scm
 
 
 // Dotty parser internals, used (aliased, to avoid clashing with Soundness names) only to
@@ -69,12 +68,14 @@ import galilei.*
 import gossamer.*
 import harlequin.*
 import hellenism.*
+import hieroglyph.*
 import inimitable.*
 import parasite.*
 import prepositional.*
 import rudiments.*
 import symbolism.*
 import denominative.dysasymptotics.linearSize
+import rudiments.sortingAlgorithms.timsort
 import serpentine.*
 import stratiform.*
 import vacuous.*
@@ -84,7 +85,7 @@ import pathInterfaces.pathOnLinux
 import stenography.Syntax
 
 // Named imports only: a wildcard would make `Text is Tel.Decodable` ambiguous with the anchor above.
-import pyrocosm.{Block, Inline}
+import pyrocosm.Block
 
 object Repl:
   object Layout:
@@ -196,20 +197,20 @@ object Repl:
 
   // The plain text of a tagged `output`, with the spans of its captured runs.
   def segments(tagged: Text): (Text, List[OutputSpan]) =
-    val plain: jl.StringBuilder = jl.StringBuilder()
-    val spans: scm.ArrayBuffer[OutputSpan] = scm.ArrayBuffer()
+    val plain: StringBuilder = StringBuilder()
+    var spans: List[OutputSpan] = Nil
     var open: Optional[(Text, Int)] = Unset
 
-    tagged.s.foreach: char =>
+    tagged.each: char =>
       if char == stdoutStart || char == stderrStart then
         open = ((if char == stderrStart then stderrStream else stdoutStream), plain.length)
       else if char == streamEnd then
         open.let: (stream, start) =>
-          if plain.length > start then spans += OutputSpan(stream, start, plain.length - start)
+          if plain.length > start then spans = OutputSpan(stream, start, plain.length - start) :: spans
         open = Unset
       else plain.append(char)
 
-    (plain.toString.tt, List.from(spans))
+    (plain.toString.tt, spans.reverse)
 
   // The captured runs of a tagged `output` as (stream, text) pairs — for streaming a chunk.
   def streamChunks(tagged: Text): List[(Text, Text)] =
@@ -262,61 +263,74 @@ object Repl:
   // running line/column; the newline tokens `project` inserts advance the line. A zero-width span
   // (a diagnostic at a point) marks the single character at that point, so it still shows.
   def mark(tokens: List[Token], notices: List[Notice]): List[Token] =
-    val spans: sci.List[(Span, Int)] = notices.stdlib.flatMap: (notice: Notice) =>
+    val spans: List[(Span, Int)] = notices.flatMap: (notice: Notice) =>
       val level: Int = notice.importance match
         case Importance.Error   => 2
         case Importance.Warning => 1
         case _                  => 0
 
-      if level == 0 then sci.Nil
-      else notice.span.lay(sci.Nil) { (span: Span) => sci.List((span, level)) }
+      if level == 0 then Nil else notice.span.lay(Nil) { (span: Span) => List((span, level)) }
 
-    if spans.isEmpty then tokens else
-      val out: scm.ArrayBuffer[Token] = scm.ArrayBuffer()
+    if spans.nil then tokens else
+      var out: List[Token] = Nil
       var line: Int = 0
       var col:  Int = 0
 
       tokens.each: (token: Token) =>
-        val text: String = token.text.s
+        val text: Text = token.text
 
-        if text.contains("\n") then
-          out += token
+        if text.contains(t"\n") then
+          out = token :: out
           line += text.count(_ == '\n')
-          col = text.length - text.lastIndexOf('\n') - 1
+          col = text.length - text.pinpoint(_ == '\n', bidi = Rtl).let(_.n0).or(-1) - 1
         else
           val length: Int = text.length
-          val marks: scala.Array[Int] = new scala.Array[Int](length)
 
-          spans.foreach: (span, level) =>
+          // The half-open character range of each span that reaches this token's line, in the
+          // token's own coordinates, paired with the level it marks at. A zero-width span (a
+          // diagnostic at a point) covers the single character it points at, so it still shows.
+          val ranges: List[((Int, Int), Int)] = spans.flatMap: (span, level) =>
             val startLine: Int = span.startLine.let(_.n0).or(-1)
             val endLine:   Int = span.endLine.let(_.n0).or(-1)
 
-            if line >= startLine && line <= endLine then
+            if line < startLine || line > endLine then Nil else
               val startColumn: Int = span.startColumn.let(_.n0).or(0)
               val endColumn:   Int = span.endColumn.let(_.n0).or(Int.MaxValue)
-              val from:  Int = (if line == startLine then startColumn - col else 0).max(0)
+              val from:   Int = (if line == startLine then startColumn - col else 0).max(0)
               val until0: Int = (if line == endLine then endColumn - col else length).min(length)
-              val until: Int = if until0 <= from && startLine == endLine && startColumn == endColumn then (from + 1).min(length) else until0
-              var i: Int = from
-              while i < until do
-                if marks(i) < level then marks(i) = level
-                i += 1
 
+              val until: Int =
+                if until0 <= from && startLine == endLine && startColumn == endColumn
+                then (from + 1).min(length) else until0
+
+              List(((from, until), level))
+
+          // The level the character at `index` is marked at: the highest any covering span
+          // assigns, and zero where none does.
+          def level(index: Int): Int =
+            ranges.fuse(0):
+              val ((from, until), level) = next
+              if index >= from && index < until then state.max(level) else state
+
+          // The token split at the boundaries between equal runs, each piece carrying its mark.
           var start: Int = 0
+
           while start < length do
             var end: Int = start
-            while end < length && marks(end) == marks(start) do end += 1
-            val piece: Text = text.substring(start, end).nn.tt
-            val mark: Optional[Text] = marks(start) match
+            while end < length && level(end) == level(start) do end += 1
+            val piece: Text = text.skip(start).keep(end - start)
+
+            val mark: Optional[Text] = level(start) match
               case 2 => errorMark
               case 1 => warningMark
               case _ => Unset
-            out += token.copy(text = piece, mark = mark)
+
+            out = token.copy(text = piece, mark = mark) :: out
             start = end
 
           col += length
 
-      List.from(out)
+      out.reverse
 
   // One tab-completion candidate. The Harlequin `Completion`'s `Syntax` signature is rendered
   // to text here so the reply serializes simply.
@@ -510,7 +524,7 @@ object Repl:
   // distinct from an ordinary syntax error. So `1 +` is incomplete, but `1 ++ 2` (a real
   // error) is not — it submits and the compiler reports the problem.
   def incomplete(code: Text): Boolean =
-    code.s.trim.nn.length > 0 && {
+    code.trim != t"" && {
       val outcome = probe(code)
       outcome.needsMore && !outcome.errors
     }
@@ -534,7 +548,7 @@ object Repl:
     }
 
     var errors     = false
-    var firstError = code.s.length
+    var firstError = code.length
 
     reporter.removeBufferedMessages(using context).foreach: diagnostic =>
       if diagnostic.level >= DottyInterfaces.Diagnostic.ERROR then
@@ -559,10 +573,10 @@ object Repl:
     val closers: Text = unclosed(code).map { (closer: Char) => t"\n$closer" }.join
 
     lines.reverse.seek(_.trim != t"").let: last =>
-      val indent: Int = last.s.length - last.s.stripLeading.nn.length
+      val indent: Int = last.length - last.skip(_.whitespace).length
 
       def candidate(depth: Int): Text =
-        t"$code\n${" ".repeat(depth).nn.tt}${ScopeInspector.marker}$closers"
+        t"$code\n${t" "*depth}${ScopeInspector.marker}$closers"
 
       List(candidate(indent), candidate(indent + 2)).seek: text =>
         val outcome = probe(text)
@@ -572,30 +586,34 @@ object Repl:
   // approximation that skips string literals (with escapes) and line comments, which is all an
   // unfinished line's bracket structure needs.
   private def unclosed(code: Text): List[Char] =
-    var stack: sci.List[Char] = sci.Nil
-    val text: String = code.s
+    var stack: List[Char] = Nil
     var i: Int = 0
 
-    while i < text.length do
-      text.charAt(i) match
+    // `at` is total on an index the loop has already bounded, so the character is read with
+    // `.vouch`-free `.or`: a past-the-end read never happens, and the space it would yield ends
+    // the inner scans harmlessly.
+    def char(index: Int): Char = code.at(Ordinal.zerary(index)).or(' ')
+
+    while i < code.length do
+      char(i) match
         case '"' =>
           i += 1
-          while i < text.length && text.charAt(i) != '"' do
-            if text.charAt(i) == '\\' then i += 1
+          while i < code.length && char(i) != '"' do
+            if char(i) == '\\' then i += 1
             i += 1
 
-        case '/' if i + 1 < text.length && text.charAt(i + 1) == '/' =>
-          while i < text.length && text.charAt(i) != '\n' do i += 1
+        case '/' if i + 1 < code.length && char(i + 1) == '/' =>
+          while i < code.length && char(i) != '\n' do i += 1
 
         case '(' => stack = ')' :: stack
         case '[' => stack = ']' :: stack
         case '{' => stack = '}' :: stack
-        case ')' | ']' | '}' => stack = if stack.isEmpty then stack else stack.tail
+        case ')' | ']' | '}' => stack = stack.tail
         case _ => ()
 
       i += 1
 
-    List.from(stack)
+    stack
 
   // How a submitted line should be treated: as Scala (`Code`) — including malformed Scala, which
   // runs and surfaces its error — or as natural language (`Language`), which a front-end may hand
@@ -612,65 +630,50 @@ object Repl:
   // misleading here — those live in the keyword tiers below, weighted low for the same reason).
   // `hardKeywords` are distinctly Scala; `softKeywords` read as code but also occur in prose
   // (`what does this match`), so they count less.
-  private val strongWords: sci.Set[String] = sci.Set
-    ("the", "an", "what", "how", "why", "who", "whose", "whom", "please", "could", "would",
-     "should", "you", "your", "yours", "me", "my", "mine", "does", "did", "done", "are", "were",
-     "was", "am", "we", "us", "our", "ours", "they", "them", "their", "theirs", "he", "she",
-     "him", "her", "hers", "his", "there", "hello", "thanks", "thank")
+  private val strongWords: Set[Text] = Set
+    (t"the", t"an", t"what", t"how", t"why", t"who", t"whose", t"whom", t"please", t"could", t"would",
+     t"should", t"you", t"your", t"yours", t"me", t"my", t"mine", t"does", t"did", t"done", t"are", t"were",
+     t"was", t"am", t"we", t"us", t"our", t"ours", t"they", t"them", t"their", t"theirs", t"he", t"she",
+     t"him", t"her", t"hers", t"his", t"there", t"hello", t"thanks", t"thank")
 
-  private val weakWords: sci.Set[String] = sci.Set
-    ("is", "of", "by", "in", "on", "to", "at", "as", "and", "or", "from", "has", "have", "had",
-     "be", "been", "being", "it", "its", "that", "this", "not", "no", "but", "so", "with",
-     "when", "can", "will", "into", "over", "under", "all", "any", "some", "more", "than")
+  private val weakWords: Set[Text] = Set
+    (t"is", t"of", t"by", t"in", t"on", t"to", t"at", t"as", t"and", t"or", t"from", t"has", t"have", t"had",
+     t"be", t"been", t"being", t"it", t"its", t"that", t"this", t"not", t"no", t"but", t"so", t"with",
+     t"when", t"can", t"will", t"into", t"over", t"under", t"all", t"any", t"some", t"more", t"than")
 
-  private val hardKeywords: sci.Set[String] = sci.Set
-    ("val", "var", "def", "trait", "enum", "extension", "given", "import", "export", "package",
-     "yield", "sealed", "override", "implicit", "lazy", "private", "protected", "abstract",
-     "final", "derives", "using", "extends", "super", "opaque", "inline", "transparent", "infix")
+  private val hardKeywords: Set[Text] = Set
+    (t"val", t"var", t"def", t"trait", t"enum", t"extension", t"given", t"import", t"export", t"package",
+     t"yield", t"sealed", t"override", t"implicit", t"lazy", t"private", t"protected", t"abstract",
+     t"final", t"derives", t"using", t"extends", t"super", t"opaque", t"inline", t"transparent", t"infix")
 
-  private val softKeywords: sci.Set[String] = sci.Set
-    ("if", "then", "else", "do", "while", "for", "new", "case", "match", "object", "class",
-     "type", "catch", "try", "finally", "throw", "return", "true", "false", "null")
+  private val softKeywords: Set[Text] = Set
+    (t"if", t"then", t"else", t"do", t"while", t"for", t"new", t"case", t"match", t"object", t"class",
+     t"type", t"catch", t"try", t"finally", t"throw", t"return", t"true", t"false", t"null")
 
   // The characters that read as code when they appear outside a string literal. Deliberately
   // excludes the punctuation prose also uses — `,`, `.`, `?`, `!`, quotes — with selections
   // (`foo.bar`) and trailing `?` handled as their own features instead.
-  private val symbolChars: String = "=<>+-*/%&|!^~#\\$(){}[]:;@_"
+  private val symbolChars: Text = t"=<>+-*/%&|!^~#\\$$(){}[]:;@_"
 
   // A word containing an apostrophe in contraction position (`don't`, `it's`, `t'appelles`) — but
   // not a character literal's trailing quote, which scans into its word (`'a'` yields `a'`).
-  private def contraction(word: String): Boolean =
-    var index = word.indexOf('\'')
-    if index < 0 then index = word.indexOf('’')
+  private def contraction(word: Text): Boolean =
+    val index: Int =
+      word.where(_ == '\'').lay(word.where(_ == '’').let(_.n0).or(-1))(_.n0)
+
     val after = word.length - index - 1
+
     index >= 1 && after >= 1 && (index >= 2 || after >= 2)
 
   // A word with a non-ASCII letter: prose in a language the word tiers cannot see. (Unicode
   // identifiers are legal Scala, but vanishingly rare at a REPL prompt next to this.)
-  private def accented(word: String): Boolean =
-    var i     = 0
-    var found = false
-
-    while i < word.length && !found do
-      if word.charAt(i) > 127 && jl.Character.isLetter(word.charAt(i)) then found = true
-      i += 1
-
-    found
+  private def accented(word: Text): Boolean =
+    word.exists { char => char > 127 && char.letter }
 
   // An uppercase letter after the first character alongside a lowercase one: camelCase, or a
   // library name like `ListBuffer` — code-shaped either way.
-  private def mixedCase(word: String): Boolean =
-    var upperLater = false
-    var lower      = false
-    var i          = 0
-
-    while i < word.length do
-      val ch = word.charAt(i)
-      if i > 0 && jl.Character.isUpperCase(ch) then upperLater = true
-      if jl.Character.isLowerCase(ch) then lower = true
-      i += 1
-
-    upperLater && lower
+  private def mixedCase(word: Text): Boolean =
+    word.skip(1).exists(_.majuscular) && word.exists(_.minuscular)
 
   // The parser-free lexical evidence for `classify`, from one scan of `code`: the prose-shaped
   // score, the code-shaped score, and how many strong-tier English words contributed. The scan
@@ -681,99 +684,83 @@ object Repl:
   // one long run; Scala's grammar rarely tolerates four), and a trailing question mark. Input of
   // one or two words, or with a leading space (the escape hatch), is summarily code.
   private def lexicalScores(code: Text): (Int, Int, Int) =
-    val text: String = code.s
+    def char(index: Int): Char = code.at(Ordinal.zerary(index)).or(' ')
 
-    if text.length == 0 || text.charAt(0) == ' ' || text.charAt(0) == '\t' then (0, 10, 0) else
-      val words    = scm.ArrayBuffer[String]()
-      val bare     = scm.ArrayBuffer[Boolean]()  // whitespace-only separation from the previous word
+    if code.length == 0 || char(0) == ' ' || char(0) == '\t' then (0, 10, 0) else
+      // Each word, paired with whether only whitespace separated it from the word before it.
+      var words: List[(Text, Boolean)] = Nil
       var symbols  = 0
       var dotted   = 0
       var strings  = 0
       var sepClean = true
       var i        = 0
 
-      while i < text.length do
-        val ch = text.charAt(i)
+      while i < code.length do
+        val ch = char(i)
 
-        if jl.Character.isLetter(ch) then
+        if ch.letter then
           val start = i
 
-          while i < text.length
-                && (jl.Character.isLetter(text.charAt(i))
-                    || text.charAt(i) == '\'' || text.charAt(i) == '’')
+          while i < code.length && (char(i).letter || char(i) == '\'' || char(i) == '’')
           do i += 1
 
-          words += text.substring(start, i).nn
-          bare += sepClean
+          words = (code.skip(start).keep(i - start), sepClean) :: words
           sepClean = true
         else
           if ch == '"' then     // skip a string literal: its content is not the user's own prose
             strings += 1
             i += 1
-            while i < text.length && text.charAt(i) != '"' do
-              if text.charAt(i) == '\\' then i += 1
+            while i < code.length && char(i) != '"' do
+              if char(i) == '\\' then i += 1
               i += 1
-          else if !jl.Character.isWhitespace(ch) then
-            if symbolChars.indexOf(ch.toInt) >= 0 then symbols += 1
+          else if !ch.whitespace then
+            if symbolChars.contains(ch) then symbols += 1
 
-            if ch == '.' && i > 0 && i + 1 < text.length
-               && jl.Character.isLetterOrDigit(text.charAt(i - 1))
-               && jl.Character.isLetter(text.charAt(i + 1))
+            if ch == '.' && i > 0 && i + 1 < code.length && char(i - 1).alphanumeric
+               && char(i + 1).letter
             then dotted += 1
 
-          if !jl.Character.isWhitespace(ch) then sepClean = false
+          if !ch.whitespace then sepClean = false
           i += 1
 
-      val count = words.length
+      // A `Sequence`, not a `List`: the scoring pass below indexes it, and looks at each word's
+      // neighbours as well as the word itself.
+      val scanned: Sequence[(Text, Boolean)] = words.reverse.to[Sequence]
+      val count = scanned.size
 
       if count <= 2 then (0, 10, 0) else
-        // runs(k): the length of the maximal whitespace-only-separated run of words containing
-        // word k, from the `bare` flags.
-        val runs = new scala.Array[Int](count)
-        var from = 0
-        var k    = 1
+        // The length of the maximal whitespace-only-separated run each word belongs to, from the
+        // `bare` flags: a run ends where a word was NOT cleanly separated from its predecessor.
+        val longest: Int =
+          val (best, run) = scanned.fuse((0, 0)):
+            val (_, bare) = next
+            val (best, run) = state
+            if bare && run > 0 then (best.max(run + 1), run + 1) else (best.max(1), 1)
 
-        while k <= count do
-          if k == count || !bare(k) then
-            var j = from
+          best.max(run)
 
-            while j < k do
-              runs(j) = k - from
-              j += 1
-
-            from = k
-          k += 1
-
-        var longest = 0
-        k = 0
-
-        while k < count do
-          if runs(k) > longest then longest = runs(k)
-          k += 1
-
-        def strongAt(k: Int): Boolean =
-          k >= 0 && k < count && strongWords.contains(words(k).toLowerCase.nn)
+        def word(k: Int): Optional[Text] = scanned.at(Ordinal.zerary(k)).let(_(0))
+        def strongAt(k: Int): Boolean = word(k).let(_.lower).lay(false)(strongWords.has(_))
 
         var prose     = 0
         var codeish   = symbols.min(8) + 2*dotted.min(3) + strings.min(2)
         var strong    = 0
         var accents   = 0
         var camels    = 0
-
-        k = 0
+        var k         = 0
 
         while k < count do
-          val word  = words(k)
-          val lower = word.toLowerCase.nn
+          val word  = scanned.at(Ordinal.zerary(k)).let(_(0)).or(t"")
+          val lower = word.lower
 
-          if strongWords.contains(lower) then
+          if strongWords.has(lower) then
             strong += 1
             prose  += 3
           else if contraction(word) then prose += 3
-          else if weakWords.contains(lower) then
+          else if weakWords.has(lower) then
             if strongAt(k - 1) || strongAt(k + 1) then prose += 1
-          else if hardKeywords.contains(lower) then codeish += 2
-          else if softKeywords.contains(lower) then codeish += 1
+          else if hardKeywords.has(lower) then codeish += 2
+          else if softKeywords.has(lower) then codeish += 1
 
           if accents < 2 && accented(word) then
             accents += 1
@@ -788,10 +775,10 @@ object Repl:
         prose += (if longest >= 7 then 6 else if longest >= 5 then 4
                   else if longest == 4 then 3 else 0)
 
-        val trimmed = text.trim.nn
+        val trimmed = code.trim
 
-        if trimmed.length > 1 && trimmed.charAt(trimmed.length - 1) == '?'
-           && jl.Character.isLetter(trimmed.charAt(trimmed.length - 2))
+        if trimmed.length > 1 && trimmed.ends(t"?")
+           && trimmed.at(Ordinal.zerary(trimmed.length - 2)).lay(false)(_.letter)
         then prose += 2
 
         (prose, codeish, strong)
@@ -814,7 +801,7 @@ object Repl:
   // everything of one or two words — is `Code`, preserving the REPL's existing behaviour; a
   // `/`-command or a leading space (the escape hatch for a misclassified line) is always `Code`.
   def classify(code: Text): Verdict =
-    if code.s.trim.nn.length == 0 || code.starts(t"/") then Verdict.Code else
+    if code.trim == t"" || code.starts(t"/") then Verdict.Code else
       val (prose, codeish, strong) = lexicalScores(code)
       val outcome                  = probe(code)
 
@@ -840,12 +827,13 @@ object Repl:
     // newline token between consecutive lines — otherwise multi-line code collapses
     // to a single line on the client and its cursor maths drift apart.
     lines match
-      case Nil          => Nil
       case head :: rest =>
         val separated: List[List[Token]] = rest.map: (line: List[Token]) =>
           List(Token(t"\n", t"unparsed", Unset)) + line
 
         head + separated.flat
+
+      case _ => Nil
 
   // Tab completions at character `offset` in `code`, from Harlequin's typechecked
   // pipeline (so it needs the session's `Scalac` and compile classpath). `context` is the
@@ -892,7 +880,7 @@ object Repl:
   // The offset at which the partial identifier ending at `offset` begins.
   private def identifierStart(code: Text, offset: Int): Int =
     var start: Int = offset
-    while start > 0 && identifierChar(code.s.charAt(start - 1)) do start -= 1
+    while start > 0 && code.at(Ordinal.zerary(start - 1)).lay(false)(identifierChar) do start -= 1
     start
 
   // Splits `code` at the cursor into the member-selection base — everything up to and
@@ -903,7 +891,7 @@ object Repl:
     val start:  Int  = identifierStart(code, offset)
     val prefix: Text = code.keep(offset).skip(start)
 
-    if start > 0 && code.s.charAt(start - 1) == '.' then (code.keep(start), prefix)
+    if start > 0 && code.at(Ordinal.zerary(start - 1)).lay(false)(_ == '.') then (code.keep(start), prefix)
     else (Unset, prefix)
 
   // Keywords that make a following identifier a NAME/TYPE/PATH rather than a value, so it is not
@@ -931,7 +919,7 @@ object Repl:
   // (after which an expression is expected) from a value. `symbolic` (all non-word, non-space
   // characters) distinguishes them by text.
   private def symbolic(text: Text): Boolean =
-    text.s.length > 0 && text.s.forall { char => !identifierChar(char) && !char.isWhitespace }
+    text.length > 0 && text.all { char => !identifierChar(char) && !char.whitespace }
 
   // Keyword completion (the Scala compiler offers none), via Soundness's prophesy engine:
   // `harlequin.Lexis.context` extracts the partial identifier at the cursor and the reversed
@@ -945,7 +933,7 @@ object Repl:
     val (prefix, context) = Lexis.context(code, offset.z)
     val found = prophesy.ScalaKeywords.pattern(context)
     val words = prefix.lay(found.keywords) { partial => found.keywords.filter(_.starts(partial)) }
-    val items = List.from(words.stdlib.toList.sortBy(_.s)).map(CompletionItem(_, t"keyword", t""))
+    val items = words.to[List].order(_.s).map(CompletionItem(_, t"keyword", t""))
 
     val binding =
       found.expectation == prophesy.KeywordPattern.Expectation.TermBinding
@@ -969,8 +957,7 @@ object Repl:
       val sig: List[Token] =
         tokenize(before).filter { tok => tok.accent != t"unparsed" && tok.text.trim != t"" }
 
-      if sig.nil then (Unset, prefix) else
-        val last = sig.stdlib.last
+      sig.last.lay((Unset: Optional[Text], prefix)): last =>
         val text = last.text
         val closeBracket = text == t")" || text == t"]" || text == t"}"
 
@@ -985,14 +972,14 @@ object Repl:
           // Strip the trailing whitespace, find where the value expression begins, and reject it
           // if it is a bare name/path introduced by a definition/import/`new` keyword.
           var end = start
-          while end > 0 && s.charAt(end - 1).isWhitespace do end -= 1
+          while end > 0 && code.at(Ordinal.zerary(end - 1)).lay(false)(_.whitespace) do end -= 1
           val baseStart = expressionStart(code.keep(end))
           val base: Text = code.keep(end).skip(baseStart)
 
           val preceding: Text =
             tokenize(code.keep(baseStart))
             . filter { tok => tok.accent != t"unparsed" && tok.text.trim != t"" }
-            . stdlib.lastOption.optional.let(_.text).or(t"")
+            . last.let(_.text).or(t"")
 
           if infixExcluded.has(preceding) then (Unset, prefix) else (t"$base.", prefix)
 
@@ -1108,25 +1095,27 @@ object Repl:
   // filesystem root. Hidden entries appear only when the partial's final segment itself starts with `.`.
   def classloadCompletions(partial: Text)(using System): List[CompletionItem] =
     val cwd:     Text = safely(System.properties.user.dir()).or(t"/")
-    val slash:   Int  = partial.s.lastIndexOf('/')
-    val dirPart: Text   = if slash < 0 then t"" else partial.keep(slash + 1)
-    val prefix:  String = if slash < 0 then partial.s else partial.s.substring(slash + 1).nn
+    val slash:   Int  = partial.pinpoint(_ == '/', bidi = Rtl).let(_.n0).or(-1)
+    val dirPart: Text = if slash < 0 then t"" else partial.keep(slash + 1)
+    val prefix:  Text = if slash < 0 then partial else partial.skip(slash + 1)
 
-    val baseDir: ji.File =
-      if partial.starts(t"/") then ji.File(if dirPart == t"" then "/" else dirPart.s)
-      else if dirPart == t"" then ji.File(cwd.s)
-      else ji.File(cwd.s, dirPart.s)
+    val baseText: Text =
+      if partial.starts(t"/") then (if dirPart == t"" then t"/" else dirPart)
+      else if dirPart == t"" then cwd
+      else t"$cwd/$dirPart"
 
-    val children: List[ji.File] = Optional(baseDir.listFiles).lay(Nil): array =>
-      List.from(sci.ArraySeq.unsafeWrapArray(array.nn).map(_.nn))
+    val children: List[Path on Linux] =
+      safely(baseText.as[Path on Linux]).lay(Nil): base =>
+        safely(base.children.to[List]).or(Nil)
 
     children
-     . filter { file => file.getName.nn.startsWith(prefix) }
-     . filter { file => prefix.startsWith(".") || !file.getName.nn.startsWith(".") }
-     . pipe { files => List.from(files.stdlib.sortBy(_.getName.nn)) }
-     . map: (file: ji.File) =>
-         val name:  Text    = file.getName.nn.tt
-         val isDir: Boolean = file.isDirectory
+     . filter { path => path.name.starts(prefix) }
+     . filter { path => prefix.starts(t".") || !path.name.starts(t".") }
+     . order(_.name.s)
+     . map: (path: Path on Linux) =>
+         val name:  Text    = path.name
+         import filesystemOptions.dereferenceSymlinks
+         val isDir: Boolean = safely(path.entry() == Directory).or(false)
          val label: Text    = t"$dirPart$name${if isDir then t"/" else t""}"
          CompletionItem(t"/classload $label", if isDir then t"directory" else t"file", t"")
 
@@ -1170,11 +1159,11 @@ object Repl:
   // commands (`/session`, `/clear`, `/quit`, `/disconnect`) belong to the front-end and are handled
   // before this check.
   lazy val commandTokens: Set[Text] =
-    Set.from(slashCommands.map { (entry: (Text, Text)) => entry(0).cut(t" ").stdlib.head }.stdlib)
+    slashCommands.map { (entry: (Text, Text)) => entry(0).cut(t" ").prim.or(t"") }.to[Set]
 
   // True when `line` begins with a `/`-command the engine recognises. Used by both front-ends to give
   // the identical `unknown command` message (see `messages.unknownCommand`) for anything else.
-  def isCommand(line: Text): Boolean = commandTokens.has(line.cut(t" ").stdlib.head)
+  def isCommand(line: Text): Boolean = line.cut(t" ").prim.lay(false)(commandTokens.has(_))
 
   // The user-facing status/notice lines that BOTH front-ends show, kept here so the CLI and the web
   // stay word-for-word identical. Each is a complete line, e.g. `/tasty` usage, already do); the
@@ -1305,7 +1294,7 @@ object Repl:
       val simple: String = name.s
 
       if simple.length > 0 && simple.charAt(0).isLetter && simple.forall(identifierChar)
-      then (simple.charAt(0).toLower.toString + simple.substring(1).nn).tt
+      then simple.tt.uncapitalize
       else Unset
 
   // A binding name for a new result: `base` if free, else `base2`, `base3`, … A candidate is
@@ -1335,7 +1324,7 @@ object Repl:
 
   def neverExpression(line: Text): Boolean =
     definitionKind(line).present || {
-      val first: Text = line.trim.s.takeWhile(_.isLetter).nn.tt
+      val first: Text = line.trim.keep(_.letter)
       declarationKeywords.has(first)
     }
 
@@ -1345,12 +1334,11 @@ object Repl:
   // has a name, so there is no reason to mint another. Keywords — including the literals `true`,
   // `false` and `null` — are excluded, so those still take a type-derived name.
   def isBareIdentifier(code: Text): Boolean =
-    val identifier: String = code.s.trim.nn
+    val identifier: Text = code.trim
 
-    identifier.length > 0
-    && !identifier.charAt(0).isDigit
-    && identifier.forall { char => identifierChar(char) || char == '$' }
-    && !allKeywords.has(identifier.tt)
+    identifier.prim.lay(false)(!_.digit)
+    && identifier.all { char => identifierChar(char) || char == '$' }
+    && !allKeywords.has(identifier)
 
   // A `val`/`var`/`def` line's kind and the name it binds, past any leading modifiers — so the REPL
   // can show a definition's name/value/signature the way it shows an auto-named expression's. `Unset`
@@ -1361,33 +1349,35 @@ object Repl:
         t"implicit", t"sealed", t"abstract", t"open")
 
   def definitionKind(line: Text): Optional[(Text, Text)] =
-    def scan(rest: String): Optional[(Text, Text)] =
-      val word:  String = rest.takeWhile(!_.isWhitespace).nn
-      val after: String = rest.drop(word.length).nn.dropWhile(_.isWhitespace).nn
+    def scan(rest: Text): Optional[(Text, Text)] =
+      val word:  Text = rest.keep(!_.whitespace)
+      val after: Text = rest.skip(word.length).skip(_.whitespace)
 
-      if definitionModifiers.has(word.tt) then scan(after)
-      else if (word == "val" || word == "var" || word == "def") && after.length > 0 then
-        val name: String = after.takeWhile { char => identifierChar(char) || char == '$' }.nn
-        if name.length == 0 || name.charAt(0).isDigit then Unset else (word.tt, name.tt)
+      if definitionModifiers.has(word) then scan(after)
+      else if (word == t"val" || word == t"var" || word == t"def") && after.length > 0 then
+        val name: Text = after.keep { char => identifierChar(char) || char == '$' }
+        if name.prim.lay(true)(_.digit) then Unset else (word, name)
       else Unset
 
-    scan(line.trim.s)
+    scan(line.trim)
 
   // The index in `line` of the `def` body's `=` — the first `=` at bracket depth 0 that is not part
   // of `=>`, `==`, `<=`, `>=` or `!=` (so default-argument `=`s, inside parens, and a `Int => String`
   // return type are all skipped). `-1` if there is none (an abstract `def`, not valid at the REPL).
   private def defBodyEquals(line: Text): Int =
-    val s: String = line.s
+    def char(index: Int): Char = line.at(Ordinal.zerary(index)).or(' ')
+
     var depth: Int = 0
     var i: Int = 0
     var found: Int = -1
-    while found < 0 && i < s.length do
-      s.charAt(i) match
+
+    while found < 0 && i < line.length do
+      char(i) match
         case '(' | '[' | '{' => depth += 1
         case ')' | ']' | '}' => depth -= 1
         case '=' if depth == 0 =>
-          val prev = if i > 0 then s.charAt(i - 1) else ' '
-          val next = if i + 1 < s.length then s.charAt(i + 1) else ' '
+          val prev = char(i - 1)
+          val next = char(i + 1)
           if next != '>' && next != '=' && prev != '<' && prev != '>' && prev != '!' && prev != '='
           then found = i
         case _ => ()
@@ -1399,22 +1389,19 @@ object Repl:
   // String`. Used to display the signature without invoking the method.
   private def defHeader(line: Text): Text =
     val equals = defBodyEquals(line)
-    (if equals < 0 then line else line.s.substring(0, equals).nn.tt).trim
+    (if equals < 0 then line else line.keep(equals)).trim
 
   // Whether a `def` header annotates its return type: a `:` at bracket depth 0 (a parameter's `:` is
   // inside `(…)`, a type-parameter bound's inside `[…]`, so only the return-type colon is at depth 0).
   private def annotatesReturnType(header: Text): Boolean =
-    val s: String = header.s
-    var depth: Int = 0
-    var i: Int = 0
-    var found: Boolean = false
-    while !found && i < s.length do
-      s.charAt(i) match
-        case '(' | '[' | '{' => depth += 1
-        case ')' | ']' | '}' => depth -= 1
-        case ':' if depth == 0 => found = true
-        case _ => ()
-      i += 1
+    val (found, _) = header.fuse((false, 0)):
+      val (found, depth) = state
+
+      if found then state else next match
+        case '(' | '[' | '{'   => (false, depth + 1)
+        case ')' | ']' | '}'   => (false, depth - 1)
+        case ':' if depth == 0 => (true, depth)
+        case _                 => state
 
     found
 
@@ -1425,28 +1412,28 @@ object Repl:
   private def defApplication(header: Text, name: Text): Text =
     // Each top-level `(…)` group's contents, in order.
     def groups(text: Text): List[Text] =
-      val (found, _, _) = text.s.foldLeft[(List[Text], Text, Int)]((List[Text](), t"", 0)):
-        case ((found, current, depth), '(') =>
-          if depth == 0 then (found, current, 1) else (found, t"$current(", depth + 1)
+      val (found, _, _) = text.fuse((Nil: List[Text], t"", 0)):
+        val (found, current, depth) = state
 
-        case ((found, current, depth), ')') =>
-          if depth == 1 then (List(current) + found, t"", 0) else (found, t"$current)", depth - 1)
-
-        case ((found, current, depth), char) =>
-          if depth > 0 then (found, t"$current$char", depth) else (found, current, depth)
+        next match
+          case '(' => if depth == 0 then (found, current, 1) else (found, t"$current(", depth + 1)
+          case ')' => if depth == 1 then (List(current) + found, t"", 0) else (found, t"$current)", depth - 1)
+          case char => if depth > 0 then (found, t"$current$char", depth) else (found, current, depth)
 
       found.reverse
 
     // The number of top-level (comma-separated) parameters in one clause's contents.
     def params(clause: Text): Int =
       if clause.trim == t"" then 0 else
-        var depth: Int = 0
-        var commas: Int = 0
-        clause.s.foreach:
-          case '(' | '[' | '{' => depth += 1
-          case ')' | ']' | '}' => depth -= 1
-          case ',' if depth == 0 => commas += 1
-          case _ => ()
+        val (commas, _) = clause.fuse((0, 0)):
+          val (commas, depth) = state
+
+          next match
+            case '(' | '[' | '{'   => (commas, depth + 1)
+            case ')' | ']' | '}'   => (commas, depth - 1)
+            case ',' if depth == 0 => (commas + 1, depth)
+            case _                 => state
+
         commas + 1
 
     val clauses: List[Text] = groups(header)
@@ -1556,7 +1543,7 @@ class Repl[version <: Scalac.Versions]
   // scope concurrently corrupted a scope's hash chain, and a `lookupEntry` then walked it forever —
   // a session that "hung on `Out`" with a thread at 100% CPU allocating nothing. The monitor is
   // reentrant, so `renderDiagnostics` may take it and then call `semanticImports`.
-  private val reifierLock: AnyRef = new AnyRef()
+  private val reifierLock: Mutex = Mutex()
 
   @scala.caps.unsafe.untrackedCaptures
   private var index:   Int        = 0
@@ -1629,21 +1616,24 @@ class Repl[version <: Scalac.Versions]
   // limitation.
   private def wrapperMembers(name: Text): Set[Text] =
     try
-      def names[member](array: scala.Array[member | Null] | Null)(name: member => String)
-      :   List[String] =
+      // Java reflection hands back a nullable JVM array, so each element is read by index
+      // rather than traversed.
+      def names[member](array: scala.Array[member | Null] | Null)(name: member => Text)
+      :   List[Text] =
         val elements = array.nn
         List.range(0, elements.length).map { index => name(elements(index).nn) }
 
       val cls     = Class.forName(t"$name$$".s, false, replLoader).nn
-      val methods = names(cls.getDeclaredMethods)(_.getName.nn)
-      val fields  = names(cls.getDeclaredFields)(_.getName.nn)
-      val classes = names(cls.getDeclaredClasses)(_.getSimpleName.nn)
+      val methods = names(cls.getDeclaredMethods)(_.getName.nn.tt)
+      val fields  = names(cls.getDeclaredFields)(_.getName.nn.tt)
+      val classes = names(cls.getDeclaredClasses)(_.getSimpleName.nn.tt)
 
+      // `NameTransformer` is the compiler's own mangling, so undoing it is the compiler's job;
+      // there is no Soundness equivalent.
       (methods + fields + classes)
-        .map { each => scala.reflect.NameTransformer.decode(each) }
-        .filter { each => each.indexOf('$') < 0 }
-        .map(_.tt)
-        .pipe { names => Set.from(names.stdlib) }
+        .map { each => scala.reflect.NameTransformer.decode(each.s).tt }
+        .filter { each => !each.contains(t"$$") }
+        .to[Set]
 
     catch case _: Throwable => Set()
 
@@ -1671,19 +1661,17 @@ class Repl[version <: Scalac.Versions]
   // binding per name.
   private def historyImports: List[Text] =
     val exports: List[Set[Text]] =
-      history.map { (name: Text) => historyMembers.stdlib.getOrElse(name, Set()) }
+      history.map { (name: Text) => historyMembers.at(name).or(Set()) }
 
-    val imports = history.zip(exports).stdlib.zipWithIndex.map: (line, position) =>
-      val (name, members) = line
-      val later: Set[Text] = exports.skip(position + 1).fold(Set())(_ + _)
-      val hidden: List[Text] = List.from(members.intersect(later).stdlib.toList.sortBy(_.s))
+    history.zip(exports).indexed.map: (entry, ordinal) =>
+        val (name, members) = entry
+        val later: Set[Text] = exports.skip(ordinal.n0 + 1).fold(Set())(_ + _)
+        val hidden: List[Text] = members.intersect(later).to[List].order(_.s)
 
-      if hidden.nil then t"import $name.{given, *}"
-      else
-        val exclusions = hidden.map { (member: Text) => t"`$member` as _" }.join(t", ")
-        t"import $name.{$exclusions, given, *}"
-
-    List.from(imports)
+        if hidden.nil then t"import $name.{given, *}"
+        else
+          val exclusions = hidden.map { (member: Text) => t"`$member` as _" }.join(t", ")
+          t"import $name.{$exclusions, given, *}"
 
   // The compile classpath must come from the *same* loader the wrapper objects
   // are run against (`classloader`, below), not from `classloaders.threadContext`:
@@ -1705,7 +1693,7 @@ class Repl[version <: Scalac.Versions]
   // The shared reifier for semantic diagnostics, built lazily against the current classpath (its
   // types resolve there). `reifierCache` is cleared by `/classload`, so the next diagnostic rebuilds
   // it with the enlarged classpath.
-  private def semanticReifier(using System): delicious.Reifier = reifierLock.synchronized:
+  private def semanticReifier(using System): delicious.Reifier = reifierLock:
     reifierCache.or:
       val created = delicious.Reifier(classpath)
       reifierCache = created
@@ -1725,7 +1713,7 @@ class Repl[version <: Scalac.Versions]
   // names is `jacinta.Json`, which no `soundness` prefix shortens. The reifier resolves the exports of
   // every wildcard scope against the session classpath (`Reifier#imports`, Soundness #1959), adding
   // each export's target to `direct`, so `Json` reads as `Json` under `import soundness.*` too.
-  private def semanticImports(using System): stenography.Imports = reifierLock.synchronized:
+  private def semanticImports(using System): stenography.Imports = reifierLock:
     val key: List[Text] = (prelude.imports.map(_.tt) + imports) + history :+ layout.objectName(index)
 
     def rebuild: stenography.Imports =
@@ -1760,22 +1748,24 @@ class Repl[version <: Scalac.Versions]
     // prefixes involved. (The same wrinkle `directType` handles below for a specific import.)
     def wildcard(prefix: Text): Unit =
       if prefix != t"" then prefix.cut(t".") match
-        case Nil           => ()
         case first :: rest =>
           val nodes: List[Designator] =
-            rest.stdlib.foldLeft(List[Designator](Designator.Top(first))):
-              (parents: List[Designator], name: Text) =>
-                parents.flatMap: (parent: Designator) =>
-                  List(Designator.Term(parent, name), Designator.Type(parent, name))
+            rest.fuse(List[Designator](Designator.Top(first))):
+              val parents: List[Designator] = state
+
+              parents.flatMap: (parent: Designator) =>
+                List(Designator.Term(parent, next), Designator.Type(parent, next))
 
           designators ++= nodes.stdlib
+
+        case _ => ()
 
     def directType(full: Text): Unit =
       // `hasDirect` is an EXACT `Designator` match. A reified type is a `Designator.Type` (its final node
       // is a class/trait/type), but `Designator.apply` always builds the final node as a `Term` — so the
       // two never match unless we construct the `Type` node ourselves. Seed both the `Type` shape (a
       // class/trait/type — the usual case) and the `Term` shape (an object member) so either matches.
-      val dot = full.s.lastIndexOf('.')
+      val dot = full.pinpoint(_ == '.', bidi = Rtl).let(_.n0).or(-1)
       if dot < 0 then direct += Designator(full)
       else
         val parent: Designator = Designator(full.keep(dot))
@@ -1820,13 +1810,13 @@ class Repl[version <: Scalac.Versions]
         wildcard(prefix)
         exportable += Designator(prefix)
       else if body.contains(t"{") then
-        val prefix: Text = body.cut(t"{").stdlib.head.trim.chomp(t".", Rtl)
-        body.cut(t"{").stdlib.last.cut(t"}").stdlib.head.cut(t",").map(_.trim).filter(_ != t"").each: selector =>
+        val prefix: Text = body.cut(t"{").prim.or(t"").trim.chomp(t".", Rtl)
+        body.cut(t"{").last.or(t"").cut(t"}").prim.or(t"").cut(t",").map(_.trim).filter(_ != t"").each: selector =>
           if selector == t"*" || selector == t"given" then
             wildcard(prefix)
             exportable += Designator(prefix)
           else
-            val name: Text = selector.cut(t"=>").stdlib.head.trim  // a renamed import (`Foo => Bar`) keeps `Foo`
+            val name: Text = selector.cut(t"=>").prim.or(t"").trim  // a renamed import (`Foo => Bar`) keeps `Foo`
             if name != t"" then directType(t"$prefix.$name")
       else directType(body)
 
@@ -1859,7 +1849,7 @@ class Repl[version <: Scalac.Versions]
   // it (`Reifier#imports`, Soundness #1959), which extends the direct imports with the targets of the
   // `export` aliases in every wildcard-imported scope, so a type reached through a prelude's export
   // (`jacinta.Json` under `import soundness.*`) renders by its leaf name, as the user would write it.
-  private def renderDiagnostics(notices: List[Notice])(using System): Text = reifierLock.synchronized:
+  private def renderDiagnostics(notices: List[Notice])(using System): Text = reifierLock:
     if notices.nil then t"" else
       val reifier: Optional[delicious.Reifier] =
         if notices.exists { (notice: Notice) => notice.markup.present } then semanticReifier
@@ -1949,8 +1939,11 @@ class Repl[version <: Scalac.Versions]
   // starts a fresh one. That costs one cold compile and loses nothing: every prior line is a
   // classfile on the classpath, not a retained symbol.
   // An escape hatch for A/B-ing the warm session against the old cold compiles.
+  // The DAEMON's own environment, not the client's: this is a developer switch on the process that
+  // runs the compiles, so it is read from the JVM directly rather than through `ReplContext`.
   private lazy val coldCompiles: Boolean =
-    safely(java.lang.System.getenv("FLAME_COLD").nn.tt) != Unset
+    import environments.javaBaseEnvironment
+    safely(Environment(t"FLAME_COLD")).present
 
   private object Warm:
     // 64MB: dotc's typer/erasure recursion is deep, and the compile thread is a singleton, so the
@@ -2069,7 +2062,7 @@ class Repl[version <: Scalac.Versions]
   @volatile
   @scala.caps.unsafe.untrackedCaptures
   private var scopeCache: Optional[(Text, List[Repl.ScopeBinding])] = Unset
-  private val scopeLock: AnyRef = new AnyRef()
+  private val scopeLock: Mutex = Mutex()
 
   // The bindings the unfinished line `code` has introduced into scope so far — what its next
   // statement would see beyond the session's own definitions and imports (see `ScopeInspector`).
@@ -2084,7 +2077,7 @@ class Repl[version <: Scalac.Versions]
       val found: List[Repl.ScopeBinding] = Repl.scopeProbe(code).lay(Nil): body =>
         val content: Text = if Repl.neverExpression(code) then body else t"final val __scope = $body"
         val source: Text = layout.wrap(index, historyImports, contextImports(code), content)
-        val offset: Int = source.s.lastIndexOf(ScopeInspector.marker.s)
+        val offset: Int = source.offsetOf(ScopeInspector.marker, Rtl).let(_.n0).or(-1)
         val scalac: Scalac[version, Universe.Classfile] = effectiveScalac
         val path: Text = classpath()
         // The line index is part of the key: a fresh inspector per submitted line, since one that is
@@ -2098,7 +2091,7 @@ class Repl[version <: Scalac.Versions]
           inspectorKey = key
           fresh
 
-        val active: ScopeInspector = scopeLock.synchronized:
+        val active: ScopeInspector = scopeLock:
           inspector.lay(open()): existing =>
             if inspectorKey.lay(true)(_ != key) then
               existing.retire()
@@ -2240,8 +2233,9 @@ class Repl[version <: Scalac.Versions]
           // rendered tagged (see `Repl.segments`). A sink's flush (an auto-flushing `PrintStream`
           // flushes after every write/`println`) decodes the bytes written since its last flush and
           // hands them, tagged, to `onOutput`, so async mode can stream either stream as it appears.
-          val runs: scm.ArrayBuffer[(Text, ji.ByteArrayOutputStream)] = scm.ArrayBuffer()
-          val runsLock: AnyRef = new AnyRef()
+          // Most recent run first, so the run in hand is the head; reversed when it is drained.
+          var runs: List[(Text, ji.ByteArrayOutputStream)] = Nil
+          val runsLock: Mutex = Mutex()
 
           // Captures `onOutput` (impure), so the sinks' types are left to infer rather than pinned pure.
           def sink(stream: Text) = new ji.OutputStream:
@@ -2249,23 +2243,22 @@ class Repl[version <: Scalac.Versions]
             private var pending: ji.ByteArrayOutputStream = ji.ByteArrayOutputStream()
 
             private def current(): ji.ByteArrayOutputStream =
-              if runs.nonEmpty && runs.last(0) == stream then runs.last(1)
-              else
+              runs.prim.let { run => if run(0) == stream then run(1) else Unset }.or:
                 val fresh = ji.ByteArrayOutputStream()
-                runs += ((stream, fresh))
+                runs = (stream, fresh) :: runs
                 fresh
 
-            def write(byte: Int): Unit = runsLock.synchronized:
+            def write(byte: Int): Unit = runsLock:
               current().write(byte)
               pending.write(byte)
 
             override def write(bytes: scala.Array[Byte] | Null, off: Int, len: Int): Unit =
-              runsLock.synchronized:
+              runsLock:
                 current().write(bytes, off, len)
                 pending.write(bytes, off, len)
 
             override def flush(): Unit =
-              val chunk: Optional[Text] = runsLock.synchronized:
+              val chunk: Optional[Text] = runsLock:
                 if pending.size == 0 then Unset else
                   val text: Text = pending.toString("UTF-8").nn.tt
                   pending.reset()
@@ -2279,9 +2272,9 @@ class Repl[version <: Scalac.Versions]
           def output: Text =
             out.flush()
             err.flush()
-            runsLock.synchronized:
-              runs.map { (stream, bytes) => Repl.tagged(stream, bytes.toString("UTF-8").nn.tt) }
-              . mkString.tt
+            runsLock:
+              runs.reverse.map { (stream, bytes) => Repl.tagged(stream, bytes.toString("UTF-8").nn.tt) }
+              . join
 
           try
             // Seed accessors read their session from this thread-local.
@@ -2319,11 +2312,14 @@ class Repl[version <: Scalac.Versions]
   // (or `[…]`/`(…)`), which are separators between clauses, not within one — trimming each clause
   // and dropping empties. E.g. `a.*, b.{c, d}, e.given` → `a.*`, `b.{c, d}`, `e.given`.
   private def importClauses(clauses: Text): List[Text] =
-    val (parts, last, _) = clauses.s.foldLeft[(List[Text], Text, Int)]((List[Text](), t"", 0)):
-      case ((parts, current, depth), char @ ('{' | '[' | '(')) => (parts, t"$current$char", depth + 1)
-      case ((parts, current, depth), char @ ('}' | ']' | ')')) => (parts, t"$current$char", depth - 1)
-      case ((parts, current, 0),     ',')                      => (List(current.trim) + parts, t"", 0)
-      case ((parts, current, depth), char)                     => (parts, t"$current$char", depth)
+    val (parts, last, _) = clauses.fuse((Nil: List[Text], t"", 0)):
+      val (parts, current, depth) = state
+
+      next match
+        case char @ ('{' | '[' | '(') => (parts, t"$current$char", depth + 1)
+        case char @ ('}' | ']' | ')') => (parts, t"$current$char", depth - 1)
+        case ',' if depth == 0        => (List(current.trim) + parts, t"", 0)
+        case char                     => (parts, t"$current$char", depth)
 
     val collected: List[Text] = List(last.trim) + parts
     collected.reverse.filter { (part: Text) => part != t"" }
@@ -2341,10 +2337,10 @@ class Repl[version <: Scalac.Versions]
   // match the import as it was typed.
   private def qualifyImport(statement: Text): Text =
     val body: Text = importClause(statement)
-    val root: Text = body.cut(t".").stdlib.head.trim
+    val root: Text = body.cut(t".").prim.or(t"").trim
 
     val owner: Optional[Text] =
-      history.reverse.seek { wrapper => historyMembers.stdlib.getOrElse(wrapper, Set()).has(root) }
+      history.reverse.seek { wrapper => historyMembers.at(wrapper).or(Set()).has(root) }
 
     owner match
       case wrapper: Text => t"import $wrapper.$body"
@@ -2608,7 +2604,7 @@ class Repl[version <: Scalac.Versions]
       safely(Repl.resultType(context, t"{ $line\n$bound }")).let(typeText)
 
     val lazyVal: Boolean =
-      line.trim.cut(t" ").stdlib.takeWhile { word => word != t"val" && word != t"var" }.contains(t"lazy")
+      line.trim.cut(t" ").keep { word => word != t"val" && word != t"var" }.has(t"lazy")
 
     if lazyVal then
       mapRan(compile(contextImports(line), line, onOutput)(Unset)):
@@ -2651,7 +2647,7 @@ class Repl[version <: Scalac.Versions]
     val trimmed = statement.trim
     if trimmed.starts(t"import ") then trimmed.skip(t"import ".length).trim else trimmed
 
-  private def importKey(text: Text): Text = importClause(text).s.filterNot(_.isWhitespace).tt
+  private def importKey(text: Text): Text = importClause(text).filter(!_.whitespace)
 
   // `/unimport <tokens>` removes an earlier persistent import, named by the same tokens it was
   // imported with (e.g. `import soundness.*` → `/unimport soundness.*`); with no argument it
@@ -2674,7 +2670,7 @@ class Repl[version <: Scalac.Versions]
   // The `on`/`off` word of a `/set`/`/language <name> [on|off]` line — defaulting to on when omitted.
   private def enabledBy(rest: List[Text]): Boolean = rest match
     case value :: _ => !(value.lower == t"off" || value.lower == t"false")
-    case Nil        => true
+    case _          => true
 
   // `/set <name> [on|off]` toggles a compiler setting for every subsequent line (no argument = on);
   // `/set` with no name lists the compiler settings (plus `async`) and their state. `async` is a plain
@@ -2767,7 +2763,9 @@ class Repl[version <: Scalac.Versions]
       // `/classpath` shows a stable absolute path.
       val cwd: Text = safely(System.properties.user.dir()).or(t"/")
       val raw: Text = if arg.starts(t"/") then arg else t"$cwd/$arg"
-      val resolved: Text = safely(ji.File(raw.s).getCanonicalPath.nn.tt).or(raw)
+      // `Path` decoding normalizes `.`/`..` segments itself, so the path is canonicalized by
+      // parsing it rather than by asking the JVM.
+      val resolved: Text = safely(raw.as[Path on Linux].encode).or(raw)
 
       safely(resolved.as[Path on Linux]).lay
        (Outcome.Ran(Nil, Unset, t"'$arg' is not a valid path\n")): path =>
@@ -2865,7 +2863,7 @@ class Repl[version <: Scalac.Versions]
     // ones always, the experimental ones only once `experimental` is on (SESSION-aware, unlike the
     // static `slashCommands`). The partial is the token being typed after the `/language ` prefix.
     else if code.starts(t"/language ") then
-      val partial = code.keep(offset).cut(t" ").stdlib.last
+      val partial = code.keep(offset).cut(t" ").last.or(t"")
       Repl.languageCompletions(partial, enabledSettings.has(t"experimental"))
 
     // `/classload <partial>` completes its argument against the filesystem (see `classloadCompletions`).
@@ -2901,7 +2899,7 @@ class Repl[version <: Scalac.Versions]
     // fixed within a line; the cache is cleared on the next submission (`interpret`). Shared
     // by member selection (`expr.partial`) and infix completion (`expr partial`).
     def members(base: Text): List[Repl.CompletionItem] =
-      completionCache.stdlib.get(base).getOrElse:
+      completionCache.at(base).or:
         val items = safely(Repl.complete(context, base, base.length, semanticImports)).or(Nil)
         completionCache = completionCache.define(base, items)
         items
@@ -2965,7 +2963,7 @@ class Repl[version <: Scalac.Versions]
       case _                            => true
 
     def noticeBlocks(notices: List[Notice]): List[Block] =
-      if !exhibiting || notices.nil then Nil else reifierLock.synchronized:
+      if !exhibiting || notices.nil then Nil else reifierLock:
         val reifier: Optional[delicious.Reifier] =
           if notices.exists { (notice: Notice) => notice.markup.present } then semanticReifier else Unset
 

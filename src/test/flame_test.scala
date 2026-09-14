@@ -34,16 +34,15 @@ package flame
 
 import scala.caps
 
-import _root_.java.io as ji
-import _root_.java.net as jn
-import _root_.java.nio.channels as jnc
-
 import soundness.*
 
 import pyrocosm.{Block, Event, Inline, Token, Tone}
 
 
 import classloaders.threadContextClassloader
+import dysasymptotics.{linearSize, linearAccess}
+import internetAccess.online
+import socketBackends.javaBaseSockets
 import filesystemBackends.javaBaseFilesystem
 import pathInterfaces.pathOnLinux
 import probates.awaitProbate
@@ -53,30 +52,36 @@ import systems.javaBaseSystem
 import temporaryDirectories.systemTemporaryDirectory
 import threading.platformThreading
 
-// Sends `request` to `output` as a length-prefixed BinTEL frame — the on-wire protocol
-// the server speaks (a 4-byte big-endian length, then that many BinTEL body bytes).
-private def send(output: ji.OutputStream, request: Repl.Request): Unit =
-  val body = request.bintel
-  val out  = ji.DataOutputStream(output)
-  out.writeInt(body.length)
-  out.write(body.mutable(using Unsafe))
-  out.flush()
+// One framed connection to a REPL server, as the client speaks it: each request and reply is a
+// record framed by its four-byte big-endian length (`obligatory.LengthPrefix`) carrying a BinTEL
+// body. The reply frames are pulled from one iterator held for the connection's lifetime, so a
+// test may exchange several requests over the same connection.
+// A capability: the connection and its reply iterator are live resources, so a `Wire` carries
+// them in its capture set rather than laundering them away.
+class Wire(duplex: Duplex) extends caps.ExclusiveCapability:
+  private lazy val replies: Iterator[Data]^ = duplex.source.chunks.frames[LengthPrefix]
 
-private def send(socket: jn.Socket, request: Repl.Request): Unit =
-  send(socket.getOutputStream.nn, request)
+  def send(request: Repl.Request): Unit =
+    duplex.send(zephyrine.Stream(LengthPrefix.encode(request.bintel)))
 
-// Sends `request` and reads the framed BinTEL reply, decoding it to a typed `Reply`.
-private def exchange(input: ji.InputStream, output: ji.OutputStream, request: Repl.Request)
-:   Repl.Reply =
-  send(output, request)
-  val in     = ji.DataInputStream(input)
-  val length = in.readInt()
-  val bytes  = new scala.Array[Byte](length)
-  in.readFully(bytes)
-  Bintel.read[Repl.Reply](bytes.immutable(using Unsafe))
+  def exchange(request: Repl.Request): Repl.Reply =
+    send(request)
+    // `hasNext` is what pulls the next frame from the connection; `next()` hands back what it
+    // read.
+    if !replies.hasNext then panic(m"the server closed the connection without replying")
+    Bintel.read[Repl.Reply](replies.next())
 
-private def exchange(socket: jn.Socket, request: Repl.Request): Repl.Reply =
-  exchange(socket.getInputStream.nn, socket.getOutputStream.nn, request)
+  def close(): Unit = safely(duplex.close())
+
+object Wire:
+  // The connection is made through the `Connectable` instance directly rather than the `duplex`
+  // loan, so it outlives a single block and the tests keep their `try`/`finally` shape.
+  def tcp(port: Port over Tcp)(using Online): Wire^ =
+    val endpoint: Endpoint[Tcp.Port] = t"localhost".as[Hostname] on port
+    Wire(caps.unsafe.unsafeAssumePure(Connectable.tcpEndpoint).connect(endpoint, Unset))
+
+  def domain(path: Text): Wire^ =
+    Wire(Connectable.domainSocket.connect(DomainSocket(path), Unset))
 
 // Mimics a standard-REPL session: `size` references `greeting`, a field of the
 // enclosing object, by simple name (as `var name = …` would be in the Scala REPL).
@@ -966,12 +971,14 @@ object Tests extends Suite(m"Flame Tests"):
       // (Written the other way round, this failed the moment `jsr45` was added, which is exactly the
       // change it should have been indifferent to.)
       test(m"the documented settings are all addressable by name"):
-        Repl.settings.map(_.name).stdlib.toSet
-      . assert(Set(t"experimental", t"explain", t"explicit-nulls", t"deprecation", t"feature",
-            t"new-syntax", t"postfixOps", t"implicitConversions", t"reflectiveCalls", t"dynamics",
-            t"existentials", t"strictEquality", t"adhocExtensions", t"unsafeNulls",
-            t"captureChecking", t"saferExceptions", t"pureFunctions", t"namedTuples", t"modularity",
-            t"betterFors", t"erasedDefinitions", t"genericNumberLiterals").subsetOf(_))
+        Repl.settings.map(_.name).to[Set]
+      . assert: (names: Set[Text]) =>
+          List(t"experimental", t"explain", t"explicit-nulls", t"deprecation", t"feature",
+              t"new-syntax", t"postfixOps", t"implicitConversions", t"reflectiveCalls", t"dynamics",
+              t"existentials", t"strictEquality", t"adhocExtensions", t"unsafeNulls",
+              t"captureChecking", t"saferExceptions", t"pureFunctions", t"namedTuples", t"modularity",
+              t"betterFors", t"erasedDefinitions", t"genericNumberLiterals")
+          . all { (name: Text) => names.has(name) }
 
       test(m"`experimental` and `feature` are compiler settings, so `--experimental`/`--feature` map to /set"):
         Repl.settings.filter { s => s.name == t"experimental" || s.name == t"feature" }
@@ -1034,7 +1041,7 @@ object Tests extends Suite(m"Flame Tests"):
         supervise(exhibiting.react(0, t"java.lang.System.out.println(\"hi\"); java.lang.System.err.println(\"oh\")"))
       . assert:
           case Repl.Reply.Ran(_, _, _, _, _, _, _, _, blocks) =>
-            Blocks.decode(blocks).stdlib.collect { case Block.Output(text, error) => (text.trim, error) } == scala.List((t"hi", false), (t"oh", true))
+            Blocks.decode(blocks).sweep { case Block.Output(text, error) => (text.trim, error) } == List((t"hi", false), (t"oh", true))
           case _ => false
 
       test(m"a rejection's diagnostics are notices of failure"):
@@ -1068,14 +1075,22 @@ object Tests extends Suite(m"Flame Tests"):
       test(m"a connection answers a submission and pushes an asynchronous one"):
         supervise:
           val sessions = Sessions(Repl.Rendering.Exhibit(true))
-          val sent = scala.collection.mutable.ArrayBuffer[Repl.Reply]()
-          val connection = sessions.connection { reply => sent.synchronized { sent += reply; () } }
+          val lock = Mutex()
+          var sent: List[Repl.Reply] = Nil
+          val connection = sessions.connection { reply => lock { sent = reply :: sent } }
           val first = connection.respond(Repl.Request.Submit(1, t"1 + 1"))
           connection.respond(Repl.Request.Submit(2, t"/set async"))
           val third = connection.respond(Repl.Request.Submit(3, t"6 * 7"))
-          val deadline = java.lang.System.currentTimeMillis + 20000L
-          while sent.synchronized(sent.length) < 2 && java.lang.System.currentTimeMillis < deadline do Thread.sleep(50)
-          (first, third, sent.synchronized(sent.toList))
+
+          // The asynchronous submission answers on another strand, so the replies are awaited
+          // rather than assumed: two of them, or a generous deadline, whichever comes first.
+          var waited: Int = 0
+
+          while lock(sent.size) < 2 && waited < 20000 do
+            snooze(50*Milli(Second))
+            waited += 50
+
+          (first, third, lock(sent.reverse))
       . assert:
           case (Repl.Reply.Ran(1, _, _, _, _, _, _, _, _), Unset, replies) =>
             replies.exists { case Repl.Reply.Pending(3) => true; case _ => false }
@@ -1085,33 +1100,36 @@ object Tests extends Suite(m"Flame Tests"):
     suite(m"REPL interface"):
       // An engine whose replies the test supplies, recording every request it is given.
       class FakeEngine extends Engine:
-        val requests: scala.collection.mutable.ArrayBuffer[Repl.Request] = scala.collection.mutable.ArrayBuffer()
-        var callbacks: scala.collection.immutable.Map[Int, Repl.Reply -> Unit] = scala.collection.immutable.Map()
+        // Recorded newest-first and reversed when read, so appending is a cons.
+        var recorded: List[Repl.Request] = Nil
+        var callbacks: Map[Int, Repl.Reply -> Unit] = Map()
         var sink: Repl.Reply -> Unit = _ => ()
         var next: Int = 0
         var closed: Boolean = false
 
+        def requests: List[Repl.Request] = recorded.reverse
+
         def request(request: Int => Repl.Request)(reply: Repl.Reply => Unit): Unit =
           next += 1
-          requests += request(next)
-          callbacks = callbacks.updated(next, scala.caps.unsafe.unsafeAssumePure(reply))
+          recorded = request(next) :: recorded
+          callbacks = callbacks.define(next, scala.caps.unsafe.unsafeAssumePure(reply))
 
         def send(request: Int => Repl.Request): Unit =
           next += 1
-          requests += request(next)
+          recorded = request(next) :: recorded
 
         def pushed(sink: Repl.Reply => Unit): Unit = this.sink = scala.caps.unsafe.unsafeAssumePure(sink)
         def close(): Unit = closed = true
-        def answer(id: Int, reply: Repl.Reply): Unit = callbacks(id)(reply)
+        def answer(id: Int, reply: Repl.Reply): Unit = callbacks.at(id).let(_(reply))
         def push(reply: Repl.Reply): Unit = sink(reply)
 
-        def submissions: scala.List[Repl.Request.Submit] =
-          requests.toList.collect { case submit: Repl.Request.Submit => submit }
+        def submissions: List[Repl.Request.Submit] =
+          requests.sweep { case submit: Repl.Request.Submit => submit }
 
       def blocksOf(text: Text): Text = Blocks.encode(List(Block.paragraph(text)))
 
       def pendingEntry(block: Block): Boolean = block match
-        case Block.Group(content) => content.stdlib.lastOption.exists { case Block.Gauge(_, _) => true; case _ => false }
+        case Block.Group(content) => content.last.lay(false) { case Block.Gauge(_, _) => true; case _ => false }
         case _                    => false
 
       def texts(blocks: List[Block]): Text =
@@ -1142,16 +1160,16 @@ object Tests extends Suite(m"Flame Tests"):
           val (engine, interface) = fresh()
           interface.handle(Event.Submitted(interface.field.input, t"1 + 1"))
           (engine.submissions, interface.transcript())
-      . assert:
-          case (scala.List(Repl.Request.Submit(_, t"1 + 1")), entries) => entries.stdlib.length == 1 && pendingEntry(entries.stdlib.head)
-          case _ => false
+      . assert: (submissions, entries) =>
+          submissions.prim.lay(false)(_.code == t"1 + 1") && submissions.size == 1
+          && entries.size == 1 && entries.prim.lay(false)(pendingEntry)
 
       test(m"a trailing blank line is stripped from a submission"):
         supervise:
           val (engine, interface) = fresh()
           interface.handle(Event.Submitted(interface.field.input, t"val x = 1\n  x\n"))
           engine.submissions.map(_.code)
-      . assert(_ == scala.List(t"val x = 1\n  x"))
+      . assert(_ == List(t"val x = 1\n  x"))
 
       test(m"an engine answering before the request returns still settles the entry"):
         supervise:
@@ -1169,23 +1187,23 @@ object Tests extends Suite(m"Flame Tests"):
           prompt.handle(Event.Submitted(prompt.field.input, t"1 + 1"))
           prompt.transcript()
       . assert: entries =>
-          entries.stdlib.length == 1 && !pendingEntry(entries.stdlib.head) && texts(entries).contains(t"at once")
+          entries.size == 1 && !entries.prim.lay(false)(pendingEntry) && texts(entries).contains(t"at once")
 
       test(m"the reply settles the entry in place"):
         supervise:
           val (engine, interface) = fresh()
           interface.handle(Event.Submitted(interface.field.input, t"1 + 1"))
-          val id = engine.submissions.head.id
+          val id = engine.submissions.prim.let(_.id).or(0)
           engine.answer(id, Repl.Reply.Ran(id, Unset, t"", Unset, Unset, t"", Nil, Nil, blocksOf(t"res0: Int = 2")))
           interface.transcript()
       . assert: entries =>
-          entries.stdlib.length == 1 && !pendingEntry(entries.stdlib.head) && texts(entries).contains(t"res0: Int = 2")
+          entries.size == 1 && !entries.prim.lay(false)(pendingEntry) && texts(entries).contains(t"res0: Int = 2")
 
       test(m"an asynchronous run streams its output before its reply fills the entry"):
         supervise:
           val (engine, interface) = fresh()
           interface.handle(Event.Submitted(interface.field.input, t"slow()"))
-          val id = engine.submissions.head.id
+          val id = engine.submissions.prim.let(_.id).or(0)
           engine.answer(id, Repl.Reply.Pending(id))
           engine.push(Repl.Reply.Output(id, t"hi\n", Repl.stdoutStream))
           val streaming = interface.transcript()
@@ -1195,18 +1213,18 @@ object Tests extends Suite(m"Flame Tests"):
           case (streaming, settled) =>
             // The streamed chunk shows while the run is pending; the reply then carries the whole
             // output itself, shown once.
-            pendingEntry(streaming.stdlib.head) && texts(streaming).contains(t"hi")
-              && !pendingEntry(settled.stdlib.head) && texts(settled).s.split("hi").nn.length == 2
+            streaming.prim.lay(false)(pendingEntry) && texts(streaming).contains(t"hi")
+              && !settled.prim.lay(false)(pendingEntry) && texts(settled).cut(t"hi").size == 2
 
       test(m"editing decorates the prompt at once and asks the engine for the scope"):
         supervise:
           val (engine, interface) = fresh()
           interface.handle(Event.Edited(interface.field.input, t"val x = (", 9))
-          (engine.requests.toList, interface.field.decoration())
-      . assert:
-          case (scala.List(Repl.Request.Tokenize(_, t"val x = (")), decoration) =>
-            decoration.incomplete && decoration.tokens.exists(_.text == t"val")
-          case _ => false
+          (engine.requests, interface.field.decoration())
+      . assert: (requests, decoration) =>
+          requests.size == 1
+          && requests.prim.lay(false) { case Repl.Request.Tokenize(_, t"val x = (") => true; case _ => false }
+          && decoration.incomplete && decoration.tokens.exists(_.text == t"val")
 
       test(m"a multi-line entry submits only after a blank line"):
         supervise:
@@ -1223,39 +1241,40 @@ object Tests extends Suite(m"Flame Tests"):
           interface.handle(Event.Edited(interface.field.input, t"/set async", 10))
           interface.field.decoration()
       . assert: decoration =>
-          !decoration.incomplete && decoration.tokens.stdlib.headOption.exists(_.accent == Token.Accent.Command)
+          !decoration.incomplete && decoration.tokens.prim.lay(false)(_.accent == Token.Accent.Command)
 
       test(m"/clear empties the transcript"):
         supervise:
           val (engine, interface) = fresh()
           interface.handle(Event.Submitted(interface.field.input, t"1 + 1"))
           interface.handle(Event.Submitted(interface.field.input, t"/clear"))
-          (interface.transcript(), engine.submissions.length)
+          (interface.transcript(), engine.submissions.size)
       . assert(_ == (Nil, 1))
 
       test(m"/session asks the engine and notes the answer"):
         supervise:
           val (engine, interface) = fresh()
           interface.handle(Event.Submitted(interface.field.input, t"/session other"))
-          val id = engine.requests.toList.collect { case Repl.Request.Session(id, t"other") => id }.head
+          val id = engine.requests.sweep { case Repl.Request.Session(id, t"other") => id }.prim.or(0)
           engine.answer(id, Repl.Reply.Session(id, t"other", List(t"default", t"other"), Repl.SessionOutcome.Joined))
           texts(interface.transcript())
       . assert(_.contains(Repl.messages.switched(t"other")))
 
       test(m"submissions join the history and are persisted"):
         supervise:
-          val persisted = scala.collection.mutable.ArrayBuffer[Text]()
-          val (engine, interface) = fresh(ReplInterface.Options(history = List(t"earlier"), persist = persisted += _))
+          // Recorded newest-first, as elsewhere in this harness, and reversed when read.
+          var persisted: List[Text] = Nil
+          val (engine, interface) = fresh(ReplInterface.Options(history = List(t"earlier"), persist = line => persisted = line :: persisted))
           interface.handle(Event.Submitted(interface.field.input, t"1 + 1"))
           interface.handle(Event.Submitted(interface.field.input, t"1 + 1"))
-          (interface.field.history(), persisted.toList)
-      . assert(_ == (List(t"earlier", t"1 + 1"), scala.List(t"1 + 1")))
+          (interface.field.history(), persisted.reverse)
+      . assert(_ == (List(t"earlier", t"1 + 1"), List(t"1 + 1")))
 
       test(m"an unknown command is refused without troubling the engine"):
         supervise:
           val (engine, interface) = fresh()
           interface.handle(Event.Submitted(interface.field.input, t"/nonsense"))
-          (engine.submissions.length, texts(interface.transcript()))
+          (engine.submissions.size, texts(interface.transcript()))
       . assert:
           case (0, text) => text.contains(Repl.messages.unknownCommand(t"/nonsense"))
           case _ => false
@@ -1274,9 +1293,9 @@ object Tests extends Suite(m"Flame Tests"):
         supervise:
           val tcpPort = Port[Tcp]()
           val service = Sessions().serve(tcpPort)
-          val socket  = jn.Socket("localhost", tcpPort.number)
+          val socket  = Wire.tcp(tcpPort)
 
-          try exchange(socket, Repl.Request.Submit(1, t"1 + 1"))
+          try socket.exchange(Repl.Request.Submit(1, t"1 + 1"))
           finally
             socket.close()
             service.stop()
@@ -1294,18 +1313,15 @@ object Tests extends Suite(m"Flame Tests"):
           val tcpPort  = Port[Tcp]()
           val sessions = Sessions()
           val service  = sessions.serve(tcpPort)
-          val socket   = jn.Socket("localhost", tcpPort.number)
+          val socket   = Wire.tcp(tcpPort)
 
           try
-            send(socket, Repl.Request.Quit(0))
+            socket.send(Repl.Request.Quit(0))
 
-            // Wait (bounded) for the quit signal rather than blocking forever. `awaitQuit` now takes
-            // a `Monitor`, which the lambda captures; seal it so it can serve as a plain `Runnable`.
-            val runnable: Runnable = caps.unsafe.unsafeAssumePure(() => sessions.awaitQuit())
-            val waiter = Thread(runnable)
-            waiter.start()
-            waiter.join(5000L)
-            !waiter.isAlive
+            // Wait (bounded) for the quit signal rather than blocking forever: the wait runs on
+            // its own strand, and the test passes if it finishes within the timeout.
+            val waiter = async(sessions.awaitQuit())
+            safely(waiter.await(5*Second)).present
           finally
             socket.close()
             service.stop()
@@ -1316,16 +1332,12 @@ object Tests extends Suite(m"Flame Tests"):
           val directory: Path on Linux = temporaryDirectory/Uuid()
           directory.create[Directory]()
           val socketPath: Text = (directory/t"repl.sock").encode
-          val service      = Sessions().serve(socketPath)
-          val address      = jn.UnixDomainSocketAddress.of(socketPath.s).nn
-          val channel      = jnc.SocketChannel.open(address).nn
+          val service = Sessions().serve(socketPath)
+          val socket  = Wire.domain(socketPath)
 
-          try
-            exchange
-             (jnc.Channels.newInputStream(channel).nn, jnc.Channels.newOutputStream(channel).nn,
-              Repl.Request.Submit(3, t"6 * 7"))
+          try socket.exchange(Repl.Request.Submit(3, t"6 * 7"))
           finally
-            channel.close()
+            socket.close()
             service.stop()
       . assert:
           case Repl.Reply.Ran(_, value, _, _, _, _, _, _, _) => value.let(_ == t"42").or(false)
@@ -1353,17 +1365,14 @@ object Tests extends Suite(m"Flame Tests"):
           directory.create[Directory]()
           val socketPath: Text = (directory/t"repl2.sock").encode
           val sessions = Sessions()
-          val service  = sessions.serve(socketPath)
-          val address  = jn.UnixDomainSocketAddress.of(socketPath.s).nn
-          val channel  = jnc.SocketChannel.open(address).nn
-          val in  = jnc.Channels.newInputStream(channel).nn
-          val out = jnc.Channels.newOutputStream(channel).nn
+          val service = sessions.serve(socketPath)
+          val socket  = Wire.domain(socketPath)
 
           try
             // Connecting auto-starts a session; querying reports it plus the list.
-            exchange(in, out, Repl.Request.Session(1, t""))
+            socket.exchange(Repl.Request.Session(1, t""))
           finally
-            channel.close()
+            socket.close()
             service.stop()
       . assert:
           case Repl.Reply.Session(_, name, names, Repl.SessionOutcome.Created) =>
@@ -1378,11 +1387,11 @@ object Tests extends Suite(m"Flame Tests"):
         supervise:
           val tcpPort = Port[Tcp]()
           val service = Sessions().serve(tcpPort)
-          val socket  = jn.Socket("localhost", tcpPort.number)
+          val socket  = Wire.tcp(tcpPort)
 
           try
-            val first  = exchange(socket, Repl.Request.Session(1, t"work"))
-            val second = exchange(socket, Repl.Request.Session(2, t"work"))
+            val first  = socket.exchange(Repl.Request.Session(1, t"work"))
+            val second = socket.exchange(Repl.Request.Session(2, t"work"))
             (first, second)
           finally
             socket.close()
@@ -1401,11 +1410,11 @@ object Tests extends Suite(m"Flame Tests"):
         supervise:
           val tcpPort = Port[Tcp]()
           val service = Sessions().serve(tcpPort)
-          val socket  = jn.Socket("localhost", tcpPort.number)
+          val socket  = Wire.tcp(tcpPort)
 
           try
-            val first  = exchange(socket, Repl.Request.Create(1, t"work"))
-            val second = exchange(socket, Repl.Request.Create(2, t"work"))
+            val first  = socket.exchange(Repl.Request.Create(1, t"work"))
+            val second = socket.exchange(Repl.Request.Create(2, t"work"))
             (first, second)
           finally
             socket.close()
@@ -1424,13 +1433,13 @@ object Tests extends Suite(m"Flame Tests"):
         supervise:
           val tcpPort = Port[Tcp]()
           val service = Sessions().serve(tcpPort)
-          val socket  = jn.Socket("localhost", tcpPort.number)
+          val socket  = Wire.tcp(tcpPort)
 
           try
-            val missing = exchange(socket, Repl.Request.Join(1, t"work"))
-            exchange(socket, Repl.Request.Create(2, t"work"))
-            val joined  = exchange(socket, Repl.Request.Join(3, t"work"))
-            val names   = exchange(socket, Repl.Request.SessionList(4))
+            val missing = socket.exchange(Repl.Request.Join(1, t"work"))
+            socket.exchange(Repl.Request.Create(2, t"work"))
+            val joined  = socket.exchange(Repl.Request.Join(3, t"work"))
+            val names   = socket.exchange(Repl.Request.SessionList(4))
             (missing, joined, names)
           finally
             socket.close()
@@ -1473,7 +1482,7 @@ object Tests extends Suite(m"Flame Tests"):
         supervise:
           val repl = Repl()
           ReplContext.set(repl.session, ReplContext.Values(t"/tmp/flame-client",
-            scala.collection.immutable.Map(t"FLAME_TEST_VARIABLE" -> t"present")))
+            Map(t"FLAME_TEST_VARIABLE" -> t"present")))
           repl.react(0, t"/set experimental")
           repl.react(0, t"import soundness.*")
           repl.interpret(t"(summon[WorkingDirectory].directory(), summon[Environment].variable(t\"FLAME_TEST_VARIABLE\"), summon[System](t\"user.dir\"))")
@@ -1489,7 +1498,7 @@ object Tests extends Suite(m"Flame Tests"):
       test(m"a user-defined WorkingDirectory overrides the ambient one"):
         supervise:
           val repl = Repl()
-          ReplContext.set(repl.session, ReplContext.Values(t"/tmp/flame-client", scala.collection.immutable.Map()))
+          ReplContext.set(repl.session, ReplContext.Values(t"/tmp/flame-client", Map()))
           repl.react(0, t"/set experimental")
           repl.react(0, t"import soundness.*")
           repl.react(1, t"given mine: WorkingDirectory = () => t\"/mine\"")
@@ -1516,14 +1525,14 @@ object Tests extends Suite(m"Flame Tests"):
         supervise:
           val tcpPort = Port[Tcp]()
           val service = Sessions().serve(tcpPort)
-          val socket  = jn.Socket("localhost", tcpPort.number)
+          val socket  = Wire.tcp(tcpPort)
 
           try
-            exchange(socket, Repl.Request.Session(1, t""))
-            send(socket, Repl.Request.Context(2, t"/tmp/flame-over-the-wire", List(Repl.Pair(t"K", t"v"))))
-            exchange(socket, Repl.Request.Submit(3, t"/set experimental"))
-            exchange(socket, Repl.Request.Submit(4, t"import soundness.*"))
-            exchange(socket, Repl.Request.Submit(5, t"summon[WorkingDirectory].directory()"))
+            socket.exchange(Repl.Request.Session(1, t""))
+            socket.send(Repl.Request.Context(2, t"/tmp/flame-over-the-wire", List(Repl.Pair(t"K", t"v"))))
+            socket.exchange(Repl.Request.Submit(3, t"/set experimental"))
+            socket.exchange(Repl.Request.Submit(4, t"import soundness.*"))
+            socket.exchange(Repl.Request.Submit(5, t"summon[WorkingDirectory].directory()"))
           finally
             socket.close()
             service.stop()
@@ -1615,13 +1624,13 @@ object Tests extends Suite(m"Flame Tests"):
         supervise:
           val tcpPort = Port[Tcp]()
           val service = Sessions().serve(tcpPort)
-          val socket  = jn.Socket("localhost", tcpPort.number)
+          val socket  = Wire.tcp(tcpPort)
 
           try
-            val before = exchange(socket, Repl.Request.SessionList(1))
-            val second = exchange(socket, Repl.Request.SessionList(2))
-            exchange(socket, Repl.Request.Session(3, t"work"))
-            val after  = exchange(socket, Repl.Request.SessionList(4))
+            val before = socket.exchange(Repl.Request.SessionList(1))
+            val second = socket.exchange(Repl.Request.SessionList(2))
+            socket.exchange(Repl.Request.Session(3, t"work"))
+            val after  = socket.exchange(Repl.Request.SessionList(4))
             (before, second, after)
           finally
             socket.close()
@@ -1639,9 +1648,9 @@ object Tests extends Suite(m"Flame Tests"):
         supervise:
           val tcpPort = Port[Tcp]()
           val service = Sessions().serve(tcpPort)
-          val socket  = jn.Socket("localhost", tcpPort.number)
+          val socket  = Wire.tcp(tcpPort)
 
-          try exchange(socket, Repl.Request.Complete(1, t"List(1, 2, 3).m", 15))
+          try socket.exchange(Repl.Request.Complete(1, t"List(1, 2, 3).m", 15))
           finally
             socket.close()
             service.stop()
@@ -1655,11 +1664,11 @@ object Tests extends Suite(m"Flame Tests"):
         supervise:
           val tcpPort = Port[Tcp]()
           val service = Sessions().serve(tcpPort)
-          val socket  = jn.Socket("localhost", tcpPort.number)
+          val socket  = Wire.tcp(tcpPort)
 
           try
-            exchange(socket, Repl.Request.Submit(1, t"val xs = scala.List(1, 2)"))
-            exchange(socket, Repl.Request.Tokenize(2, t"xs.map { y =>\n  "))
+            socket.exchange(Repl.Request.Submit(1, t"val xs = scala.List(1, 2)"))
+            socket.exchange(Repl.Request.Tokenize(2, t"xs.map { y =>\n  "))
           finally
             socket.close()
             service.stop()

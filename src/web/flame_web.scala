@@ -32,9 +32,6 @@
                                                                                                   */
 package flame
 
-import java.util.concurrent.atomic as juca
-import scala.collection.concurrent.TrieMap
-
 import scala.caps
 
 import soundness.*
@@ -126,8 +123,12 @@ private def jsonResponse(status: Http.Status, body: Text): Http.Response =
 // request go to its callback; what the connection pushes of its own accord (an asynchronous
 // submission's streamed output and eventual result) goes to the sink, as over the socket.
 class LocalEngine(sessions: Sessions[3.9])(using Monitor, System, Probate) extends Engine:
-  private val nextId: juca.AtomicInteger = juca.AtomicInteger(1)
-  private val callbacks: TrieMap[Int, Repl.Reply -> Unit] = TrieMap()
+  private val nextId: Atomic.Int = Atomic(1)
+
+  // The reply callbacks still awaited, by request id: an atomic cell holding an immutable map, so
+  // a registration and its delivery cannot interleave.
+  private val callbacks: Atomic.Ref[proscenium.Map[Int, Repl.Reply -> Unit]] =
+    Atomic.Ref(proscenium.Map())
 
   @volatile private var sink: Repl.Reply -> Unit = _ => ()
 
@@ -137,17 +138,21 @@ class LocalEngine(sessions: Sessions[3.9])(using Monitor, System, Probate) exten
   private def deliver(reply: Repl.Reply): Unit = reply match
     case Repl.Reply.Output(_, _, _) => sink(reply)
     case _ =>
-      callbacks.remove(Repl.replyId(reply)) match
-        case Some(callback) => callback(reply)
-        case None           => sink(reply)
+      val id = Repl.replyId(reply)
+
+      // Claimed atomically: the callback is removed and read in one transition, so a reply can
+      // be delivered only once.
+      val callback: Optional[Repl.Reply -> Unit] = callbacks().at(id)
+      callbacks.revise(_.omit(id))
+      callback.lay(sink(reply))(_(reply))
 
   def request(request: Int => Repl.Request)(reply: Repl.Reply => Unit): Unit =
-    val id = nextId.getAndIncrement
-    callbacks(id) = caps.unsafe.unsafeAssumePure(reply)
+    val id = nextId.ere(_ + 1)
+    callbacks.revise(_.define(id, caps.unsafe.unsafeAssumePure(reply)))
     connection.respond(request(id)).let(deliver)
 
   def send(request: Int => Repl.Request): Unit =
-    connection.respond(request(nextId.getAndIncrement))
+    connection.respond(request(nextId.ere(_ + 1)))
     ()
 
   def pushed(sink: Repl.Reply => Unit): Unit = this.sink = caps.unsafe.unsafeAssumePure(sink)
@@ -275,8 +280,9 @@ def serveHttp(port: Int, quit: Promise[Unit])(using Monitor, System, Probate, Cl
       interface.start()
       (interface.interface, interface.handle)
 
-  java.lang.System.out.nn.println("Serving the web REPL (press Ctrl+C to stop):")
-  java.lang.System.out.nn.println(s"  http://localhost:$port/")
+  import stdios.javaLangSystemStdio, termcapDefinitions.basicTermcap
+  Out.println(t"Serving the web REPL (press Ctrl+C to stop):")
+  Out.println(t"  http://localhost:$port/")
   quit.attend()
   frontend.stop()
 

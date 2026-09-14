@@ -154,6 +154,7 @@ object settings:
     "turbulence-stdio",      // Stdio
     "stratiform-core",
     "stratiform-binary",     // BinTEL, the session wire format
+    "obligatory-core",       // LengthPrefix: the session protocol's record framing
     "distillate-core",
     "spectacular-core",      // /inspect
     "inimitable-core",       // Uuid
@@ -181,6 +182,7 @@ object settings:
     "profanity-core",            // the terminal and line editor
     "ultimatum-core",            // panes and layout
     "zephyrine-core",            // streams over the session socket
+    "obligatory-core",           // LengthPrefix: the session protocol's record framing
     "urticose-core",
     "escapade-core",
     "iridescence-core",

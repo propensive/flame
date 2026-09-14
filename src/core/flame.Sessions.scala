@@ -32,10 +32,6 @@
                                                                                                   */
 package flame
 
-import java.io as ji
-import java.net as jn
-import java.nio.channels as jnc
-
 import scala.caps
 
 
@@ -54,8 +50,12 @@ import rudiments.*
 import denominative.*
 import symbolism.*
 import denominative.dysasymptotics.linearSize
+import rudiments.sortingAlgorithms.timsort
 import stratiform.*
+import obligatory.*
+import socketBackends.javaBaseSockets
 import turbulence.*
+import zephyrine.*
 import urticose.*
 import vacuous.*
 
@@ -102,21 +102,21 @@ class Sessions[version <: Scalac.Versions]
   def awaitQuit()(using Monitor): Unit = quit.attend()
 
   // Every session's name, sorted — for the startup display and `/session` tab-completion.
-  def names: List[Text] = lock(List.from(registry.keys.stdlib.toList.sortBy(_.s)))
+  def names: List[Text] = lock(registry.keys.to[List].order(_.s))
 
-  def session(name: Text): Optional[Repl[version]] = lock(registry.stdlib.get(name).optional)
+  def session(name: Text): Optional[Repl[version]] = lock(registry.at(name))
 
   // Registers a fresh session under a random animal name not already in use (falling back to a
   // numbered suffix in the astronomically-unlikely event every animal is taken), and returns the name.
   def create(): Text =
     lock:
-      val free: List[Text] = Sessions.animals.filter { animal => !registry.stdlib.contains(animal) }
+      val free: List[Text] = Sessions.animals.filter { animal => !registry.defines(animal) }
 
       val name: Text =
-        if !free.nil then Random.global.shuffle(free).stdlib.head else
+        Random.global.shuffle(free).prim.or:
           var n = 2
-          val base = Random.global.shuffle(Sessions.animals).stdlib.head
-          while registry.stdlib.contains(t"$base$n") do n += 1
+          val base = Random.global.shuffle(Sessions.animals).prim.or(t"session")
+          while registry.defines(t"$base$n") do n += 1
           t"$base$n"
 
       registry = registry.define(name, Repl.make[version](Repl.Prelude.empty, render))
@@ -126,7 +126,7 @@ class Sessions[version <: Scalac.Versions]
   // or `/session` — unless one of that name already exists. `true` when it was created.
   def open(name: Text): Boolean =
     lock:
-      if registry.stdlib.contains(name) then false
+      if registry.defines(name) then false
       else
         registry = registry.define(name, Repl.make[version](Repl.Prelude.empty, render))
         true
@@ -134,80 +134,57 @@ class Sessions[version <: Scalac.Versions]
   // Serializes a `Reply` to BinTEL body bytes; a valid reply always type-assigns, so this is total.
   private def encode(reply: Repl.Reply): Data = unsafely(reply.bintel)
 
-  // Starts a TCP server on `port`; each connection is an interactive session over its own current
-  // session. Returns a handle whose `stop()` shuts the server down. Coaxial's `listen` is now a
-  // scoped loan (`listen(lambda)(block)`) that closes the service when its block returns, and it
-  // hands the lambda a kernel-stream `Duplex` rather than a stream-bearing `Connection` — neither
-  // fits this "bind now, return a stoppable handle, block elsewhere on `awaitQuit`" shape. So the
-  // TCP path binds a raw `ServerSocket` directly (exactly as the domain-socket path below binds a
-  // raw NIO channel), keeping the byte-framed protocol wire-identical to the coaxial client.
+  // Starts a server on `target` — a TCP port or a UNIX domain socket — with each accepted
+  // connection an interactive session over its own current session. Returns a handle whose
+  // `stop()` shuts the server down.
+  //
+  // Coaxial's `listen` is a scoped loan (`listen(lambda)(block)`) that closes the service when its
+  // block returns, which does not fit this "bind now, return a stoppable handle, block elsewhere
+  // on `awaitQuit`" shape. The `Bindable` instance underneath it does: it binds, accepts a
+  // `Duplex` per connection, and stops — the same socket machinery the coaxial client connects
+  // with, so the two ends cannot drift apart.
+  // The evidence is taken as plain `using` parameters rather than through the `logs`/`raises`
+  // sugar: a context-function result would introduce a fresh root capability of its own, which
+  // could not then flow into `serve`'s.
+  private def accept[target](target: target)(using bindable: target is Bindable)
+    ( using Monitor, System, Probate, bindable.Input =:= Duplex )
+    ( using (CompileEvent is Loggable)^, Tactic[Bind.Error]^ )
+  :   Socket.Service^ =
+
+    val binding: bindable.Binding =
+      safely(bindable.bind(target, Unset)).lest(Bind.Error(Bind.Error.Reason.PortInUse))
+
+    @volatile var listening: Boolean = true
+
+    val task = async:
+      while listening do
+        safely:
+          val duplex: Duplex = summon[bindable.Input =:= Duplex](bindable.connect(binding))
+
+          // Fire-and-forget: the fresh task handle is discarded (and the block yields `()`), so
+          // the connection's capability is confined to this per-accept task and never leaks into
+          // the enclosing accept loop's capture set.
+          async:
+            try converse(duplex) finally safely(duplex.close())
+
+          ()
+
+    // Vouched pure: the stop closure captures the accept task, whose capabilities outlive the
+    // service (the caller `stop()`s it inside the same `supervise` scope).
+    Sessions.vouchPure:
+      Socket.Service: () =>
+        listening = false
+        safely(bindable.stop(binding))
+        safely(task.await())
+        ()
+
   def serve(port: Port over Tcp)(using Monitor, System, Probate)
   :   Socket.Service logs CompileEvent raises Bind.Error =
-    val server: jn.ServerSocket =
-      try jn.ServerSocket(port.number)
-      catch case _: ji.IOException => abort(Bind.Error(Bind.Error.Reason.PortInUse))
+    accept(port)
 
-    @volatile var listening: Boolean = true
-
-    val task = async:
-      while listening do
-        safely:
-          val client: jn.Socket = server.accept().nn
-
-          // Fire-and-forget: the fresh task handle is discarded (and the block yields `()`), so the
-          // connection's `client` capability is confined to this per-accept task and never leaks
-          // into the enclosing accept loop's capture set.
-          async:
-            try converse(client.getInputStream.nn, client.getOutputStream.nn)
-            finally safely(client.close())
-
-          ()
-
-    // Vouched pure: the stop closure captures the accept task, whose capabilities outlive the
-    // service (the caller `stop()`s it inside the same `supervise` scope).
-    Sessions.vouchPure:
-      Socket.Service: () =>
-        listening = false
-        safely(server.close())
-        safely(task.await())
-        ()
-
-  // Serves over a UNIX domain socket at `socketPath`. Coaxial's domain-socket `Connection` does not
-  // expose its streams for the bidirectional, asynchronously-written protocol this needs, so the
-  // accept loop runs directly over an NIO channel.
   def serve(socketPath: Text)(using Monitor, System, Probate)
-  :   Socket.Service logs CompileEvent =
-    val address: jn.UnixDomainSocketAddress = jn.UnixDomainSocketAddress.of(socketPath.s).nn
-
-    val channel: jnc.ServerSocketChannel =
-      jnc.ServerSocketChannel.open(jn.StandardProtocolFamily.UNIX).nn
-
-    channel.configureBlocking(true)
-    channel.bind(address)
-
-    @volatile var listening: Boolean = true
-
-    val task = async:
-      while listening do
-        safely:
-          val client: jnc.SocketChannel = channel.accept().nn
-          val input  = jnc.Channels.newInputStream(client).nn
-          val output = jnc.Channels.newOutputStream(client).nn
-
-          // Fire-and-forget (as above): discard the task handle so `client` stays confined.
-          async:
-            try converse(input, output) finally safely(client.close())
-
-          ()
-
-    // Vouched pure: the stop closure captures the accept task, whose capabilities outlive the
-    // service (the caller `stop()`s it inside the same `supervise` scope).
-    Sessions.vouchPure:
-      Socket.Service: () =>
-        listening = false
-        safely(channel.close())
-        safely(task.await())
-        ()
+  :   Socket.Service logs CompileEvent raises Bind.Error =
+    accept(DomainSocket(socketPath))
 
   // One client's connection: its current session (created lazily, so a probe leaves none
   // behind), its context, and `respond`, which answers a request or, for an asynchronous
@@ -228,8 +205,8 @@ class Sessions[version <: Scalac.Versions]
     private def applyContext(): Unit = context.let: (directory, environment) =>
       current.let: name =>
         session(name).let: repl =>
-          val variables: scala.collection.immutable.Map[Text, Text] =
-            environment.stdlib.map { pair => (pair.key, pair.value) }.toMap
+          val variables: Map[Text, Text] =
+            environment.map { pair => (pair.key, pair.value) }.to[Map]
 
           ReplContext.set(repl.session, ReplContext.Values(directory, variables))
 
@@ -298,45 +275,39 @@ class Sessions[version <: Scalac.Versions]
   def connection(send: Repl.Reply => Unit)(using Monitor, System, Probate): Connection =
     caps.unsafe.unsafeAssumePure(new Connection(send))
 
-  private def converse(input: ji.InputStream, output: ji.OutputStream)
-    ( using Monitor, System, Probate )
+  private def converse(duplex: Duplex)(using Monitor, System, Probate)
   :   Unit logs CompileEvent =
 
-    val writes: Mutex = Mutex()
-    val out: ji.DataOutputStream = ji.DataOutputStream(ji.BufferedOutputStream(output))
+    import strategies.throwUnsafely
 
-    // The one writer, so a reply pushed at any time cannot interleave with another.
+    val writes: Mutex = Mutex()
+
+    // The one writer, so a reply pushed at any time cannot interleave with another: `Duplex.send`
+    // leaves serialization to its caller.
     def send(payload: Data): Unit =
       writes:
-        try
-          out.writeInt(payload.length)
-          out.write(payload.mutable(using Unsafe))
-          out.flush()
+        try duplex.send(zephyrine.Stream(LengthPrefix.encode(payload)))
         catch case _: Throwable => ()
 
     val connection: Connection = this.connection(reply => send(encode(reply)))
 
     try
-      val in: ji.DataInputStream = ji.DataInputStream(ji.BufferedInputStream(input))
-      var continue: Boolean = true
+      // One record per request, framed by its four-byte big-endian length. A framing or truncation
+      // error (a client that vanished mid-record) raises, and the `catch` below ends the
+      // conversation exactly as the end of the stream does.
+      val requests = duplex.source.chunks.frames[LengthPrefix]
 
-      while continue do
-        val length: Int = try in.readInt() catch case _: ji.IOException => -1
+      while requests.hasNext do
+        val message: Data = requests.next()
 
-        if length < 0 then continue = false
-        else
-          val bytes: scala.Array[Byte] = new scala.Array[Byte](length)
-          in.readFully(bytes)
-          val message: Data = bytes.immutable(using Unsafe)
+        async:
+          val response: Optional[Repl.Reply] =
+            try
+              safely(Bintel.read[Repl.Request](message)).lay(Repl.Reply.Failed(0, t"the request could not be parsed")): request =>
+                connection.respond(request)
+            catch case error: Throwable => Repl.Reply.Failed(0, error.toString.tt)
 
-          async:
-            val response: Optional[Repl.Reply] =
-              try
-                safely(Bintel.read[Repl.Request](message)).lay(Repl.Reply.Failed(0, t"the request could not be parsed")): request =>
-                  connection.respond(request)
-              catch case error: Throwable => Repl.Reply.Failed(0, error.toString.tt)
-
-            response.let { reply => send(encode(reply)) }
+          response.let { reply => send(encode(reply)) }
     catch case _: Throwable => ()
 
     // Decodes one request and dispatches on the CURRENT session: `tokenize` is stateless (the lexer);

@@ -32,12 +32,7 @@
                                                                                                   */
 package flame
 
-import java.lang as jl
-import java.util.concurrent as juc
-
 import scala.caps
-import scala.collection.concurrent.TrieMap
-import scala.collection.mutable as scm
 
 import soundness.*
 
@@ -51,55 +46,29 @@ object SocketEngine:
   // encode is total.
   def encode(request: Repl.Request): Data = unsafely(request.bintel)
 
-  // Prefixes BinTEL body bytes with a 4-byte big-endian length, the on-wire frame the server
-  // reads with `DataInputStream.readInt` + `readFully`.
-  def framed(data: Data): Data =
-    val length: Int = data.length
-    val bytes: scala.Array[Byte] = new scala.Array[Byte](4 + length)
-    bytes(0) = (length >>> 24).toByte
-    bytes(1) = (length >>> 16).toByte
-    bytes(2) = (length >>> 8).toByte
-    bytes(3) = length.toByte
-    jl.System.arraycopy(Array.unsafeJvm(data), 0, bytes, 4, length)
-    Array.unsafeFrozen(bytes)
-
-  // Reassembles length-prefixed frames from the chunk-at-a-time socket stream, keeping a buffer
-  // across calls so a frame split over chunks, or several frames in one chunk, is handled.
-  // `next()` yields one frame's body, or `Unset` when the stream ends.
-  class FrameReader(chunks: Iterator[Data]^):
-    private val buffer: scm.ArrayBuffer[Byte] = scm.ArrayBuffer()
-
-    private def fill(count: Int): Boolean =
-      while buffer.length < count && chunks.hasNext do chunks.next().each(buffer += _)
-      buffer.length >= count
-
-    def next(): Optional[Data] =
-      if !fill(4) then Unset else
-        val length: Int =
-          ((buffer(0) & 0xff) << 24) | ((buffer(1) & 0xff) << 16)
-          | ((buffer(2) & 0xff) << 8) | (buffer(3) & 0xff)
-
-        if !fill(4 + length) then Unset else
-          val body: Data = Array.from(buffer.slice(4, 4 + length))
-          buffer.remove(0, 4 + length)
-          body
-
 class SocketEngine(duplex: Duplex)(using Monitor, Probate) extends Engine:
-  private val nextId: juc.atomic.AtomicInteger = juc.atomic.AtomicInteger(1)
-  private val callbacks: TrieMap[Int, Repl.Reply -> Unit] = TrieMap()
+  private val nextId: Atomic.Int = Atomic(1)
+
+  // The reply callbacks still awaited, by request id: an atomic cell holding an immutable map, so
+  // a registration and the reader strand's removal cannot interleave.
+  private val callbacks: Atomic.Ref[Map[Int, Repl.Reply -> Unit]] = Atomic.Ref(Map())
+
+  // The one writer: `Duplex.send` leaves serialization to its caller.
+  private val writes: Mutex = Mutex()
 
   @volatile private var sink: Repl.Reply -> Unit = _ => ()
   @volatile private var live: Boolean = true
 
-  private def transmit(request: Repl.Request): Unit = synchronized:
-    if live then duplex.send(zephyrine.Stream(SocketEngine.framed(SocketEngine.encode(request))))
+  private def transmit(request: Repl.Request): Unit = writes:
+    if live then
+      duplex.send(zephyrine.Stream(LengthPrefix.encode(SocketEngine.encode(request))))
 
   def request(request: Int => Repl.Request)(reply: Repl.Reply => Unit): Unit =
-    val id = nextId.getAndIncrement
-    callbacks(id) = caps.unsafe.unsafeAssumePure(reply)
+    val id = nextId.ere(_ + 1)
+    callbacks.revise(_.define(id, caps.unsafe.unsafeAssumePure(reply)))
     transmit(request(id))
 
-  def send(request: Int => Repl.Request): Unit = transmit(request(nextId.getAndIncrement))
+  def send(request: Int => Repl.Request): Unit = transmit(request(nextId.ere(_ + 1)))
   def pushed(sink: Repl.Reply => Unit): Unit = this.sink = caps.unsafe.unsafeAssumePure(sink)
   def close(): Unit = live = false
 
@@ -108,18 +77,24 @@ class SocketEngine(duplex: Duplex)(using Monitor, Probate) extends Engine:
   // first read, and the server sends nothing before it is asked.
   def start(ended: () -> Unit): Unit =
     async:
-      val frames = SocketEngine.FrameReader(duplex.source.chunks)
+      import strategies.throwUnsafely
 
-      while live do
-        frames.next().lay({ live = false }): bytes =>
-          safely(Bintel.read[Repl.Reply](bytes)).let: reply =>
-            val id = Repl.replyId(reply)
+      // One record per reply, framed by its four-byte big-endian length; the iterator ends when
+      // the server closes the stream.
+      val frames = duplex.source.chunks.frames[LengthPrefix]
 
-            reply match
-              case Repl.Reply.Output(_, _, _) => sink(reply)
-              case _ =>
-                callbacks.remove(id) match
-                  case Some(callback) => callback(reply)
-                  case None           => sink(reply)
+      while live && frames.hasNext do
+        safely(Bintel.read[Repl.Reply](frames.next())).let: reply =>
+          val id = Repl.replyId(reply)
 
+          reply match
+            case Repl.Reply.Output(_, _, _) => sink(reply)
+            case _ =>
+              // Claimed atomically: the callback is removed and read in one transition, so a
+              // reply can be delivered only once.
+              val callback: Optional[Repl.Reply -> Unit] = callbacks().at(id)
+              callbacks.revise(_.omit(id))
+              callback.lay(sink(reply))(_(reply))
+
+      live = false
       ended()

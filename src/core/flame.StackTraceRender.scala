@@ -36,6 +36,7 @@ import java.lang as jl
 
 
 import anticipation.*
+import gossamer.*
 import denominative.*
 import denominative.dysasymptotics.linearSize
 // `stackTraceTeletype` must be named: it is a given, and a wildcard import does not bring givens into
@@ -78,7 +79,7 @@ object StackTraceRender:
     var i:    Int                                = 0
 
     while i < raw.length do
-      if raw(i).nn.getClassName.nn.startsWith("rs$line$") then last = i
+      if raw(i).nn.getClassName.nn.tt.starts(t"rs$$line$$") then last = i
       i += 1
 
     last

@@ -35,15 +35,7 @@ package flame
 import java.io as ji
 import java.lang as jl
 import java.net as jn
-import java.nio.channels as jnc
-import java.util.concurrent as juc
-
 import scala.caps
-import scala.collection.immutable as sci
-
-import scala.collection.concurrent.TrieMap
-import scala.collection.mutable as scm
-
 import soundness.*
 import dysasymptotics.linearSize
 
@@ -143,7 +135,7 @@ private def flaggedSettings(using Cli, Interpreter): List[Repl.Setting] =
 // and the file is applied once.
 private def startupCommands(flagged: List[Repl.Setting], workspace: Workspace.Config): List[Text] =
   def named(kind: Repl.Kind): List[Text] = flagged.filter(_.kind == kind).map(_.name)
-  def distinct(names: List[Text]): List[Text] = List.from(names.stdlib.distinct)
+  def distinct(names: List[Text]): List[Text] = names.distinct
 
   distinct(named(Repl.Kind.Set) + workspace.sets).map { (name: Text) => t"/set $name" }
   + distinct(named(Repl.Kind.Language) + workspace.languages).map { (name: Text) => t"/language $name" }
@@ -217,31 +209,24 @@ private def sessionIntent
 // a socket that refuses is skipped. A short timeout keeps a wedged server from stalling the shell.
 private def liveSessionNames(): List[Text] =
   def ask(path: Text): List[Text] =
-    var channel: jnc.SocketChannel | Null = null
+    import strategies.throwUnsafely
 
-    try
-      channel = jnc.SocketChannel.open(jn.UnixDomainSocketAddress.of(path.s).nn).nn
+    connectDomain(DomainSocket(path)): duplex =>
+      duplex.send(zephyrine.Stream(LengthPrefix.encode(SocketEngine.encode(Repl.Request.SessionList(0)))))
 
-      val out = ji.DataOutputStream(jnc.Channels.newOutputStream(channel).nn)
-      val body = SocketEngine.encode(Repl.Request.SessionList(0))
-      out.writeInt(body.length)
-      out.write(body.mutable(using Unsafe))
-      out.flush()
+      safely:
+        val frames = duplex.source.chunks.frames[LengthPrefix]
 
-      val in     = ji.DataInputStream(jnc.Channels.newInputStream(channel).nn)
-      val length = in.readInt()
-      val bytes  = new scala.Array[Byte](length)
-      in.readFully(bytes)
+        if !frames.hasNext then Nil else
+          Bintel.read[Repl.Reply](frames.next()) match
+            case Repl.Reply.SessionList(_, names) => names
+            case _                                => Nil
 
-      safely(Bintel.read[Repl.Reply](bytes.immutable(using Unsafe))).lay(Nil):
-        case Repl.Reply.SessionList(_, names) => names
-        case _                                => Nil
+      . or(Nil)
 
-    catch case _: Exception => Nil
-    finally if channel != null then channel.close()
+    . or(Nil)
 
-  val names: List[Text] = socketPaths(socketDirectory).bind[List[Text], Text, List[Text]](ask)
-  List.from(names.stdlib.distinct)
+  socketPaths(socketDirectory).bind[List[Text], Text, List[Text]](ask).distinct
 
 // The default TCP port for `flame listen` (a remote-reachable REPL server) and for `flame --host`
 // when no `--port` is given. Arbitrary, but stable so the two ends agree without configuration.
@@ -371,7 +356,10 @@ private def basicRepl(settings: List[Text])(using Stdio, Monitor, Probate, Syste
   given Scalac[3.9, Universe.Classfile] = Scalac(Nil)
   given Classloader = serverClassloader
 
-  val repl:   Repl[3.9]         = Repl.make[3.9](Repl.Prelude.empty)
+  val repl: Repl[3.9] = Repl.make[3.9](Repl.Prelude.empty)
+
+  // A `BufferedReader` over the `Stdio`'s own input: turbulence reads bytes and characters, but
+  // has no line-at-a-time reader, and this mode's whole input model is one line per prompt.
   val reader: ji.BufferedReader = ji.BufferedReader(ji.InputStreamReader(summon[Stdio].in, "UTF-8"))
   var id:     Int              = 0
   var buffer: Text             = t""
@@ -496,10 +484,12 @@ private def installCompletions()(using stdio: Stdio, service: DaemonService[?])(
 // The directory holding per-process REPL sockets, and this process's socket file.
 // UNIX domain sockets are a Unix-only feature, so the directory follows
 // `$XDG_RUNTIME_DIR` (then `$TMPDIR`, then `/tmp`) directly, as plain `Text`.
-private def envText(name: String): Optional[Text] = Optional(jl.System.getenv(name)).let(_.nn.tt)
+private def envText(name: Text): Optional[Text] =
+  import environments.javaBaseEnvironment
+  safely(Environment(name))
 
 private def socketDirectory: Text =
-  t"${envText("XDG_RUNTIME_DIR").or(envText("TMPDIR")).or(t"/tmp")}/flame"
+  t"${envText(t"XDG_RUNTIME_DIR").or(envText(t"TMPDIR")).or(t"/tmp")}/flame"
 
 private def socketFile: Text = t"$socketDirectory/${ProcessHandle.current.nn.pid}.sock"
 
@@ -535,17 +525,26 @@ private def serveSocket()(using Stdio, Monitor, Probate, System): Exit =
       socketPath.as[Path on Linux].wipe()
 
     val sessions = Sessions(Repl.Rendering.Exhibit(ansi = true))
-    val service  = sessions.serve(socketPath)
-    Out.println(t"Serving a REPL on $socketPath (Ctrl+C or /quit to stop)")
-    sessions.awaitQuit()
-    service.stop()
 
+    // A bind failure here means another server already holds this per-process socket path; it is
+    // reported like any other failure to serve.
     recover:
-      case _: Path.Error | _: Io.Error => ()
-    . protect:
-      socketPath.as[Path on Linux].wipe()
+      case Bind.Error(_) =>
+        Out.println(t"Could not serve on $socketPath: the socket is already in use")
+        Exit.Fail(5)
 
-    Exit.Ok
+    . protect:
+        val service = sessions.serve(socketPath)
+        Out.println(t"Serving a REPL on $socketPath (Ctrl+C or /quit to stop)")
+        sessions.awaitQuit()
+        service.stop()
+
+        recover:
+          case _: Path.Error | _: Io.Error => ()
+        . protect:
+          socketPath.as[Path on Linux].wipe()
+
+        Exit.Ok
   catch case error: Throwable =>
     Out.println(t"Could not serve on $socketPath: ${error.toString.tt}")
     Exit.Fail(6)
@@ -647,10 +646,13 @@ private def sessionArgError(message: Text)(using Stdio): Exit =
 // the server is a separate process it outlives this client, so the same session can
 // be reconnected to later by running `flame` again. Returns the live connection,
 // or `Unset` if no server became reachable in time.
-private def launchServer[result]()(using Stdio, System)(body: Duplex => result): Optional[result] =
+private def launchServer[result]()(using Stdio, System, Monitor)(body: Duplex => result): Optional[result] =
   safely(System.properties.ethereal.script[Text]()).lay(Unset): executable =>
     val before: List[Text] = socketPaths(socketDirectory)
 
+    // `ProcessBuilder` rather than guillotine's `fork`: this child must be fully DETACHED, with
+    // its streams discarded, and guillotine's job API has no redirection control — a forked child
+    // inherits pipes that nobody drains, and a server writing to stdout would eventually block.
     val builder = jl.ProcessBuilder(executable.s, "serve-socket")
     builder.redirectOutput(jl.ProcessBuilder.Redirect.DISCARD)
     builder.redirectError(jl.ProcessBuilder.Redirect.DISCARD)
@@ -663,7 +665,7 @@ private def launchServer[result]()(using Stdio, System)(body: Duplex => result):
     // Poll for a new, connectable socket (the socket file appears once it binds), then
     // run `body` over the first one that connects.
     while result.absent && waited < 10000 do
-      jl.Thread.sleep(100)
+      snooze(100*Milli(Second))
       waited += 100
 
       socketPaths(socketDirectory).each: candidate =>
@@ -678,8 +680,7 @@ private def socketPaths(directory: Text): List[Text] =
   recover:
     case _: Path.Error => Nil
   . protect:
-    val names: Chain[Text] = directory.as[Path on Linux].children.map(_.encode)
-    List.from(names.stdlib.filter(_.ends(t".sock")))
+    directory.as[Path on Linux].children.map(_.encode).filter(_.ends(t".sock")).to[List]
 
 // Connects to a per-process UNIX domain socket. With no server running, launches one
 // in the background and attaches to it (so `flame` alone is a self-contained REPL,
@@ -698,15 +699,13 @@ private def environmentPairs(environment: Environment): List[Repl.Pair] =
     field.setAccessible(true)
 
     field.get(environment) match
+      // The field holds a `List[Text]`, whose opaque types both erase to the stdlib list and
+      // `String` this matches — the one place the reflective read has to name them.
       case lines: scala.collection.immutable.List[?] =>
-        val pairs: scala.collection.immutable.List[Repl.Pair] = lines.flatMap:
-          case line: String =>
-            val parts = line.split("=", 2).nn
-            if parts.length == 2 then scala.collection.immutable.List(Repl.Pair(parts(0).nn.tt, parts(1).nn.tt))
-            else scala.collection.immutable.Nil
-          case _ => scala.collection.immutable.Nil
+        val texts: List[Text] = List.from(lines.collect { case line: String => line.tt })
 
-        List.from(pairs)
+        texts.map(_.cut(t"=", 2)).sweep:
+          case List(key, value) => Repl.Pair(key, value)
 
       case _ => Nil
   catch case _: Exception => Nil
@@ -717,7 +716,7 @@ private def connectSocket(intent: SessionIntent, initial: List[Text], history: W
   // Probe every socket file: a connectable one is live; one that refuses (a crashed or
   // killed server that never cleaned up) is a stale leftover, so delete it. Then attach
   // to the lone live server, list several, or — when none survive — start a fresh one.
-  val live: scm.ArrayBuffer[Text] = scm.ArrayBuffer()
+  var live: List[Text] = Nil
 
   socketPaths(socketDirectory).each: path =>
     if connectDomain(DomainSocket(path)) { _ => () }.absent
@@ -726,9 +725,9 @@ private def connectSocket(intent: SessionIntent, initial: List[Text], history: W
         case _: Path.Error | _: Io.Error => ()
       . protect:
         path.as[Path on Linux].wipe()
-    else live += path
+    else live = path :: live
 
-  live.to(List) match
+  live.reverse match
     case Nil =>
       Out.println(t"Starting a REPL server…")
       launchServer()(converse(intent, initial, history, context)(_)).or(failedToLaunch)
@@ -739,7 +738,7 @@ private def connectSocket(intent: SessionIntent, initial: List[Text], history: W
     case paths =>
       Out.println(t"Several REPL servers are running:")
 
-      paths.each: path =>
+      paths.each: (path: Text) =>
         Out.println(t"  $path")
 
       Out.println(t"Stop all but one, or connect to a specific one with 'flame --host localhost'")
@@ -779,10 +778,10 @@ private def converse(intent: SessionIntent, initial: List[Text], historyConfig: 
   // The persisted prompt history (see `flame.History`), most recent `limit` entries; a file
   // already over the limit is trimmed on load, so it cannot grow without bound across sessions.
   val loaded: List[Text] = historyConfig.file.lay(Nil: List[Text]): file =>
-    val all: sci.List[Text] = flame.History.load(file)
-    val kept: sci.List[Text] = all.takeRight(historyConfig.limit)
-    if all.length > historyConfig.limit then flame.History.replace(file, List.from(kept))
-    List.from(kept)
+    val all:  List[Text] = flame.History.load(file)
+    val kept: List[Text] = all.keep(historyConfig.limit, Rtl)
+    if all.size > historyConfig.limit then flame.History.replace(file, kept)
+    kept
 
   recover:
     case Terminal.Error() =>
