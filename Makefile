@@ -66,7 +66,13 @@ test-plain:
 	./mill flame.test.assembly
 	java -cp out/flame/test/assembly.dest/out.jar flame.runTests
 
+# Install the pinned pyrocosm release into the local ivy repository, as CI does, so a local build
+# resolves the released jars rather than whatever a pyrocosm checkout's `publishLocal` last
+# installed: the pinned version, or `VERSION=X.Y.Z`. Soundness itself is left alone.
+sync-releases:
+	./etc/ci/sync-releases.sh $(VERSION)
+
 dev:
 	./mill -w flame.client.compile
 
-.PHONY: assembly release publishLocal run web test test-plain dev install
+.PHONY: sync-releases assembly release publishLocal run web test test-plain dev install

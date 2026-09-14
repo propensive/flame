@@ -31,7 +31,7 @@ object settings:
   // to use its `release/lib` jars directly (fork-developer mode).
   val scalaHome = sys.env.getOrElse("SOUNDNESS_SCALA_HOME", "")
 
-  val soundnessVersion = "0.65.0"
+  val soundnessVersion = "0.66.0"
 
   // The version flame's OWN library modules (`flame-core`, `flame-web`, `flame-client`) are
   // released under, AND the version the `launcher` module resolves them at. Kept as a single value
