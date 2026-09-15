@@ -104,4 +104,11 @@ public final class ReplBridge {
   public static void updateLive(long session, String name, Object value) {
     ((Consumer<Object>) registry.get(key(session, name) + " set")).accept(value);
   }
+
+  // Forgets every value, supplier and setter filed for `session`, whose suppliers would otherwise
+  // keep its line wrappers (and their classloader) reachable after the session is closed.
+  public static void clear(long session) {
+    String prefix = session + " ";
+    registry.keySet().removeIf(key -> key.startsWith(prefix));
+  }
 }

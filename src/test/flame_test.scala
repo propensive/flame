@@ -83,6 +83,35 @@ object Wire:
   def domain(path: Text): Wire^ =
     Wire(Connectable.domainSocket.connect(DomainSocket(path), Unset))
 
+// Every `Repl` and `Sessions` a test makes, registered as it is made (`Opened(Opened(Repl()))`) so that
+// `isolated` can close it when the test's block ends. Each keeps a warm compiler alive until it is
+// closed (see `Repl#close`), so a suite that merely dropped them would exhaust any heap.
+object Opened:
+  private val opened: java.util.ArrayDeque[Repl[?] | Sessions[?]] = java.util.ArrayDeque()
+
+  def apply[value <: Repl[?] | Sessions[?]](value: value): value =
+    opened.synchronized(opened.push(value))
+    value
+
+  def depth: Int = opened.synchronized(opened.size)
+
+  // Closes, newest first, everything opened since `depth` was read.
+  def closeTo(depth: Int): Unit =
+    val next: Optional[Repl[?] | Sessions[?]] =
+      opened.synchronized(if opened.size > depth then Optional(opened.pop()) else Unset)
+
+    next.let: value =>
+      value match
+        case repl: Repl[?]         => repl.close()
+        case sessions: Sessions[?] => sessions.close()
+
+      closeTo(depth)
+
+// `supervise`, closing whatever the block opened (see `Opened`) once it has finished.
+def isolated[result](block: Monitor ?=> result)(using Threading, Codepoint): result =
+  val depth = Opened.depth
+  try supervise(block) finally Opened.closeTo(depth)
+
 // Mimics a standard-REPL session: `size` references `greeting`, a field of the
 // enclosing object, by simple name (as `var name = …` would be in the Scala REPL).
 // `session` reads `size` once, mutates `greeting`, then reads it again — the
@@ -94,6 +123,7 @@ object ReplFixture:
   :   (Repl.Outcome, Repl.Outcome) =
     val repl = Repl[3.9]:
       def size: Int = greeting.length
+    Opened(repl)
 
     val before: Repl.Outcome = repl.interpret(t"size")
     greeting = "changed"
@@ -105,8 +135,8 @@ object Tests extends Suite(m"Flame Tests"):
       given Scalac[3.9, Universe.Classfile] = Scalac(Nil)
 
       test(m"a definition is visible on a later line"):
-        supervise:
-          val repl = Repl()
+        isolated:
+          val repl = Opened(Repl())
           repl.interpret(t"val x = 40")
           repl.interpret(t"println(x + 2)")
       . assert:
@@ -114,8 +144,8 @@ object Tests extends Suite(m"Flame Tests"):
           case _                         => false
 
       test(m"an import persists to a later line"):
-        supervise:
-          val repl = Repl()
+        isolated:
+          val repl = Opened(Repl())
           repl.interpret(t"import scala.collection.mutable.ListBuffer")
           repl.interpret(t"ListBuffer(1, 2, 3)")
       . assert:
@@ -123,8 +153,8 @@ object Tests extends Suite(m"Flame Tests"):
           case _                         => false
 
       test(m"an import of a session definition persists to a later line"):
-        supervise:
-          val repl = Repl()
+        isolated:
+          val repl = Opened(Repl())
           repl.interpret(t"object Foo { object Bar { def hi = 42 } }")
           repl.interpret(t"import Foo.Bar")
           repl.interpret(t"Bar.hi")
@@ -133,8 +163,8 @@ object Tests extends Suite(m"Flame Tests"):
           case _                               => false
 
       test(m"a wildcard import of a session definition persists to a later line"):
-        supervise:
-          val repl = Repl()
+        isolated:
+          val repl = Opened(Repl())
           repl.interpret(t"object Foo { val n = 7 }")
           repl.interpret(t"import Foo.*")
           repl.interpret(t"n")
@@ -143,8 +173,8 @@ object Tests extends Suite(m"Flame Tests"):
           case _                               => false
 
       test(m"/unimport removes an import so it is no longer in scope"):
-        supervise:
-          val repl = Repl()
+        isolated:
+          val repl = Opened(Repl())
           repl.interpret(t"import scala.collection.mutable.ListBuffer")
           val before = repl.interpret(t"ListBuffer(1, 2, 3)")
           repl.interpret(t"/unimport scala.collection.mutable.ListBuffer")
@@ -154,8 +184,8 @@ object Tests extends Suite(m"Flame Tests"):
           case _                                                     => false
 
       test(m"/unimport with no argument lists the removable imports"):
-        supervise:
-          val repl = Repl()
+        isolated:
+          val repl = Opened(Repl())
           repl.interpret(t"import scala.collection.mutable.ListBuffer")
           repl.interpret(t"/unimport")
       . assert:
@@ -163,15 +193,15 @@ object Tests extends Suite(m"Flame Tests"):
           case _                              => false
 
       test(m"/unimport reports when no import matches the given tokens"):
-        supervise:
-          Repl().interpret(t"/unimport nonsense.does.not.exist")
+        isolated:
+          Opened(Repl()).interpret(t"/unimport nonsense.does.not.exist")
       . assert:
           case Repl.Outcome.Ran(_, _, output, _, _) => output.contains(t"No matching import")
           case _                              => false
 
       test(m"/classpath lists the current classpath"):
-        supervise:
-          Repl().interpret(t"/classpath")
+        isolated:
+          Opened(Repl()).interpret(t"/classpath")
       . assert:
           case Repl.Outcome.Ran(_, _, output, _, _) => output.contains(t"Classpath (")
           case _                              => false
@@ -182,44 +212,44 @@ object Tests extends Suite(m"Flame Tests"):
         bindings.map { b => t"${b.name.or(t"_")}: ${b.tpe}" }.join(t", ")
 
       test(m"an unfinished `unsafely:` block reports the contextual values it has introduced"):
-        supervise:
-          val repl = Repl()
+        isolated:
+          val repl = Opened(Repl())
           repl.react(0, t"import soundness.*")
           scopeText(repl.scopeAt(t"unsafely:\n  "))
       . assert { scope => scope.contains(t"Unsafe") && scope.contains(t"CanThrow[Exception]") }
 
       test(m"an unfinished lambda reports its parameter by name and type"):
-        supervise:
-          Repl().scopeAt(t"scala.List(1, 2).map { x =>\n  ")
+        isolated:
+          Opened(Repl()).scopeAt(t"scala.List(1, 2).map { x =>\n  ")
       . assert:
           case Repl.ScopeBinding(name, tpe, false, _) :: Nil => name == t"x" && tpe == t"Int"
           case _                                          => false
 
       test(m"nested scopes report the innermost block's contextual values first"):
-        supervise:
-          val repl = Repl()
+        isolated:
+          val repl = Opened(Repl())
           repl.react(0, t"import soundness.*")
           repl.scopeAt(t"unsafely:\n  safely:\n    ").map(_.tpe)
       . assert { types => types.prim.let(_.contains(t"Diagnostics")).or(false) && types.exists(_.contains(t"Unsafe")) }
 
       test(m"a block's own definitions are in scope for its next statement"):
-        supervise:
-          val repl = Repl()
+        isolated:
+          val repl = Opened(Repl())
           repl.react(0, t"import soundness.*")
           scopeText(repl.scopeAt(t"unsafely:\n  val n = 42\n  "))
       . assert { scope => scope.contains(t"n: Int") && scope.contains(t"Unsafe") }
 
       test(m"a complete single line opens no scope"):
-        supervise:
-          Repl().scopeAt(t"1 + 2")
+        isolated:
+          Opened(Repl()).scopeAt(t"1 + 2")
       . assert(_ == Nil)
 
       // `Out.println` needs a `Stdio`; the REPL supplies one ambiently (see `ReplStdio`), writing
       // to the run's captured stdout exactly as `println` does. Experimental mode, as any use of a
       // Soundness definition needs.
       test(m"Out.println prints without a Stdio import"):
-        supervise:
-          val repl = Repl()
+        isolated:
+          val repl = Opened(Repl())
           repl.react(0, t"/set experimental")
           repl.react(0, t"import soundness.*")
           repl.interpret(t"Out.println(t\"ambient stdio\")")
@@ -230,8 +260,8 @@ object Tests extends Suite(m"Flame Tests"):
       // The ambient one is a `Stdio.Provider`, found only when no `Stdio` is in lexical scope, so
       // a user's own import is never ambiguous with it and simply takes over.
       test(m"a user-imported Stdio takes precedence over the ambient one"):
-        supervise:
-          val repl = Repl()
+        isolated:
+          val repl = Opened(Repl())
           repl.react(0, t"/set experimental")
           repl.react(0, t"import soundness.*")
           repl.react(1, t"import stdios.muteStdio")
@@ -241,8 +271,8 @@ object Tests extends Suite(m"Flame Tests"):
           case _                                    => false
 
       test(m"a user-defined Stdio on an earlier line takes precedence over the ambient one"):
-        supervise:
-          val repl = Repl()
+        isolated:
+          val repl = Opened(Repl())
           repl.react(0, t"/set experimental")
           repl.react(0, t"import soundness.*")
           repl.react(1, t"given quiet: Stdio = stdios.muteStdio")
@@ -256,13 +286,13 @@ object Tests extends Suite(m"Flame Tests"):
         case _                      => t""
 
       test(m"a type-error diagnostic renders types via stenography, abbreviated to `Int`"):
-        supervise:
-          diagnostics(Repl().react(0, t"val n: Int = \"hello\""))
+        isolated:
+          diagnostics(Opened(Repl()).react(0, t"val n: Int = \"hello\""))
       . assert { diag => diag.contains(t"Int") && !diag.contains(t"scala.Int") }
 
       test(m"a type-error diagnostic abbreviates a session-imported type to its simple name"):
-        supervise:
-          val repl = Repl()
+        isolated:
+          val repl = Opened(Repl())
           repl.react(0, t"import scala.collection.mutable.ListBuffer")
           diagnostics(repl.react(1, t"val b: ListBuffer[Int] = \"no\""))
       . assert { diag => diag.contains(t"ListBuffer[Int]") && !diag.contains(t"mutable.ListBuffer") }
@@ -270,8 +300,8 @@ object Tests extends Suite(m"Flame Tests"):
       // `soundness.Json` is `export jacinta.Json`, so the compiler names the type `jacinta.Json`; the
       // reifier resolves the prelude's exports so it abbreviates as the user wrote it.
       test(m"a type reached through a prelude's export abbreviates to its leaf name"):
-        supervise:
-          val repl = Repl()
+        isolated:
+          val repl = Opened(Repl())
           repl.react(0, t"import soundness.*")
           diagnostics(repl.react(1, t"val j: Json = 1"))
       . assert { diag => diag.contains(t"Json") && !diag.contains(t"jacinta.Json") }
@@ -281,8 +311,8 @@ object Tests extends Suite(m"Flame Tests"):
       // the line is compiled with the fork's `-Zdiagnostic-givens`, and only when frontier is on
       // the session classpath — so this guards both.
       test(m"a missing given is explained with Soundness's advice, naming candidate givens"):
-        supervise:
-          val repl = Repl()
+        isolated:
+          val repl = Opened(Repl())
           repl.react(0, t"import soundness.*")
           diagnostics(repl.react(1, t"summon[rudiments.DecimalConverter]"))
       . assert { diag => diag.contains(t"decimalConverters.javaDecimalConverter") }
@@ -294,8 +324,8 @@ object Tests extends Suite(m"Flame Tests"):
       // `Any` and then fails on `Any is Textual` — with or without `-Zdiagnostic-givens`. This is
       // frontier's catch-all satisfying a search made before inference has run; reported upstream.
       test(m"a bare join over mapped elements still resolves with the advice in scope"):
-        supervise:
-          val repl = Repl()
+        isolated:
+          val repl = Opened(Repl())
           repl.react(0, t"/set experimental")
           repl.react(1, t"import soundness.*")
           repl.interpret(t"List(t\"a\", t\"b\").map(_.upper).join")
@@ -304,8 +334,8 @@ object Tests extends Suite(m"Flame Tests"):
           case _                                   => false
 
       test(m"flatMap still resolves with the advice in scope"):
-        supervise:
-          val repl = Repl()
+        isolated:
+          val repl = Opened(Repl())
           repl.react(0, t"/set experimental")
           repl.react(1, t"import soundness.*")
           repl.interpret(t"List(1, 2).flatMap { n => List(n, n) }")
@@ -317,8 +347,8 @@ object Tests extends Suite(m"Flame Tests"):
       // the user sees may name them — not the result line's type, a `def`'s signature, a diagnostic,
       // nor a completion signature.
       test(m"a session-defined type renders as the user wrote it, without the wrapper object"):
-        supervise:
-          val repl = Repl()
+        isolated:
+          val repl = Opened(Repl())
           repl.interpret(t"object Foo { object Bar }")
           repl.interpret(t"Foo.Bar")
       . assert:
@@ -326,8 +356,8 @@ object Tests extends Suite(m"Flame Tests"):
           case _                                 => false
 
       test(m"an object's result binds a name from the object, not from the `.type` suffix"):
-        supervise:
-          val repl = Repl()
+        isolated:
+          val repl = Opened(Repl())
           repl.interpret(t"object Foo { object Bar }")
           repl.interpret(t"Foo.Bar")
       . assert:
@@ -337,8 +367,8 @@ object Tests extends Suite(m"Flame Tests"):
       // A refinement, like a type argument or a capture set, decorates a base type without changing
       // which type it is, so the binding is still named after what it refines.
       test(m"a refined type binds a name from the type it refines"):
-        supervise:
-          Repl().interpret(t"\"\".asInstanceOf[String { type Foo = Any }]")
+        isolated:
+          Opened(Repl()).interpret(t"\"\".asInstanceOf[String { type Foo = Any }]")
       . assert:
           case Repl.Outcome.Ran(_, _, _, name, _) => name == t"string"
           case _                                  => false
@@ -346,8 +376,8 @@ object Tests extends Suite(m"Flame Tests"):
       // An infix type ALIAS does not name a type — Soundness's `X is Y` expands to
       // `Y { type Self = X }`, so the binding is named after the trait on the right, not after `is`.
       test(m"an infix `is` type binds a name from the trait, not from the alias"):
-        supervise:
-          val repl = Repl()
+        isolated:
+          val repl = Opened(Repl())
           repl.interpret(t"infix type is[S, T] = T { type Self = S }")
           repl.interpret(t"trait Barable { type Self }")
           repl.interpret(t"null.asInstanceOf[Int is Barable]")
@@ -357,8 +387,8 @@ object Tests extends Suite(m"Flame Tests"):
 
       // `by`/`in` qualify what is already to their left, so they step left and reach the same `is`.
       test(m"a qualified infix type binds a name from the trait it qualifies"):
-        supervise:
-          val repl = Repl()
+        isolated:
+          val repl = Opened(Repl())
           repl.interpret(t"infix type is[S, T] = T { type Self = S }")
           repl.interpret(t"infix type by[T, R] = T { type Operand = R }")
           repl.interpret(t"trait Barable { type Self; type Operand }")
@@ -370,15 +400,15 @@ object Tests extends Suite(m"Flame Tests"):
       // An expression line is bound as a `final val`, so a constant keeps its singleton type rather
       // than being widened by the REPL's own binding — `42` is a `42`, not an `Int`.
       test(m"an integer literal reports its singleton type"):
-        supervise:
-          Repl().interpret(t"42")
+        isolated:
+          Opened(Repl()).interpret(t"42")
       . assert:
           case Repl.Outcome.Ran(_, _, _, _, tpe) => tpe.let(_.text) == t"42"
           case _                                 => false
 
       test(m"a string literal reports its singleton type"):
-        supervise:
-          Repl().interpret(t"\"hello\"")
+        isolated:
+          Opened(Repl()).interpret(t"\"hello\"")
       . assert:
           case Repl.Outcome.Ran(_, _, _, _, tpe) => tpe.let(_.text) == t"\"hello\""
           case _                                 => false
@@ -386,15 +416,15 @@ object Tests extends Suite(m"Flame Tests"):
       // A singleton also reports the type it widens to, which the front-ends show dimmed after a
       // `<:` — the result IS a `42`, and a `42` is an `Int`.
       test(m"a singleton type carries the base type it widens to"):
-        supervise:
-          Repl().interpret(t"42")
+        isolated:
+          Opened(Repl()).interpret(t"42")
       . assert:
           case Repl.Outcome.Ran(_, _, _, _, tpe) => tpe.let(_.base) == t"Int"
           case _                                 => false
 
       test(m"a non-singleton type carries no base type"):
-        supervise:
-          Repl().interpret(t"List(1, 2)")
+        isolated:
+          Opened(Repl()).interpret(t"List(1, 2)")
       . assert:
           case Repl.Outcome.Ran(_, _, _, _, tpe) => tpe.let(_.base).absent
           case _                                 => false
@@ -402,8 +432,8 @@ object Tests extends Suite(m"Flame Tests"):
       // …but the NAME comes from the widened type, since `42` is not one an identifier can be made
       // from — so precision in the type costs nothing in the naming.
       test(m"a singleton-typed result is still named from its widened base type"):
-        supervise:
-          Repl().interpret(t"42")
+        isolated:
+          Opened(Repl()).interpret(t"42")
       . assert:
           case Repl.Outcome.Ran(_, _, _, name, _) => name == t"int"
           case _                                  => false
@@ -411,22 +441,22 @@ object Tests extends Suite(m"Flame Tests"):
       // The REPL reports only the widening the USER's code performs: an ordinary `val` widens, so
       // this stays `Int` — it is the probe's own widening that was misinformation.
       test(m"a plain `val` of a constant still reports the widened type"):
-        supervise:
-          Repl().interpret(t"val n = 40 + 2")
+        isolated:
+          Opened(Repl()).interpret(t"val n = 40 + 2")
       . assert:
           case Repl.Outcome.Ran(_, _, _, _, tpe) => tpe.let(_.text) == t"Int"
           case _                                 => false
 
       test(m"a `val` annotated with a singleton type reports that type"):
-        supervise:
-          Repl().interpret(t"val n: 42 = 42")
+        isolated:
+          Opened(Repl()).interpret(t"val n: 42 = 42")
       . assert:
           case Repl.Outcome.Ran(_, _, _, _, tpe) => tpe.let(_.text) == t"42"
           case _                                 => false
 
       test(m"a `def` returning a session-defined type shows no wrapper object in its signature"):
-        supervise:
-          val repl = Repl()
+        isolated:
+          val repl = Opened(Repl())
           repl.interpret(t"object Foo { class Baz }")
           repl.interpret(t"def make = new Foo.Baz")
       . assert:
@@ -435,30 +465,30 @@ object Tests extends Suite(m"Flame Tests"):
           case _ => false
 
       test(m"a diagnostic naming a session-defined type shows no wrapper object"):
-        supervise:
-          val repl = Repl()
+        isolated:
+          val repl = Opened(Repl())
           repl.react(0, t"object Foo { object Bar }")
           diagnostics(repl.react(1, t"val n: Int = Foo.Bar"))
       . assert { diag => diag.contains(t"Foo.Bar.type") && !diag.contains(t"rs$$line$$") }
 
       test(m"a completion signature shows no wrapper object"):
-        supervise:
-          val repl = Repl()
+        isolated:
+          val repl = Opened(Repl())
           repl.interpret(t"object Foo { object Bar { def hi = 42 }; def make = Bar }")
           repl.completionsAt(t"Foo.mak", 7)
       . assert: items =>
           items.exists(_.name == t"make") && items.all(!_.signature.contains(t"rs$$line$$"))
 
       test(m"/classload reports a nonexistent path"):
-        supervise:
-          Repl().interpret(t"/classload /no/such/directory/lib.jar")
+        isolated:
+          Opened(Repl()).interpret(t"/classload /no/such/directory/lib.jar")
       . assert:
           case Repl.Outcome.Ran(_, _, output, _, _) => output.contains(t"No such file or directory")
           case _                              => false
 
       test(m"/classload adds an entry that /classpath then shows"):
-        supervise:
-          val repl = Repl()
+        isolated:
+          val repl = Opened(Repl())
           repl.interpret(t"/classload /usr")
           repl.interpret(t"/classpath")
       . assert:
@@ -466,24 +496,24 @@ object Tests extends Suite(m"Flame Tests"):
           case _                              => false
 
       test(m"/classload tab-completion lists filesystem entries as whole-line candidates"):
-        supervise:
+        isolated:
           val partial: Text = t"/classload /"
-          Repl().completionsAt(partial, partial.length)
+          Opened(Repl()).completionsAt(partial, partial.length)
       . assert: items =>
           !items.nil
           && items.all(_.name.starts(t"/classload /"))  // whole-line `/classload <path>` candidates
           && items.exists(_.name.ends(t"/"))            // at least one directory (e.g. /usr/, /bin/)
 
       test(m"a keyword tab-completion ends with a space"):
-        supervise:
-          Repl().completionsAt(t"va", 2)
+        isolated:
+          Opened(Repl()).completionsAt(t"va", 2)
       . assert: items =>
           val keywords = items.filter(_.kind == t"keyword")
           keywords.exists(_.name == t"val ") && keywords.all(_.name.ends(t" "))
 
       test(m"a given declared on one line is in scope on a later line"):
-        supervise:
-          val repl = Repl()
+        isolated:
+          val repl = Opened(Repl())
           repl.interpret(t"given Int = 42")
           repl.interpret(t"summon[Int]")
       . assert:
@@ -491,8 +521,8 @@ object Tests extends Suite(m"Flame Tests"):
           case _                             => false
 
       test(m"a persisted given resolves a later `using` parameter"):
-        supervise:
-          val repl = Repl()
+        isolated:
+          val repl = Opened(Repl())
           repl.interpret(t"given Int = 7")
           repl.interpret(t"def double(using n: Int) = n*2")
           repl.interpret(t"double")
@@ -501,8 +531,8 @@ object Tests extends Suite(m"Flame Tests"):
           case _                             => false
 
       test(m"a `val` definition shows its name, value and type"):
-        supervise:
-          Repl().interpret(t"val x = 40 + 2")
+        isolated:
+          Opened(Repl()).interpret(t"val x = 40 + 2")
       . assert:
           case Repl.Outcome.Ran(_, value, _, name, tpe) =>
             value == t"42" && name == t"x" && tpe.let(_.text) == t"Int"
@@ -513,15 +543,15 @@ object Tests extends Suite(m"Flame Tests"):
       // collection instances onto the prelude's opaque types — so it renders through
       // `InspectRender`'s `toString` fallback, as `List(1, 2, 3)` rather than the old `[1, 2, 3]`.
       test(m"a `var` definition shows its name, value and type"):
-        supervise:
-          Repl().interpret(t"var y = List(1, 2, 3)")
+        isolated:
+          Opened(Repl()).interpret(t"var y = List(1, 2, 3)")
       . assert:
           case Repl.Outcome.Ran(_, value, _, name, _) => value == t"List(1, 2, 3)" && name == t"y"
           case _                                       => false
 
       test(m"a `val` definition still persists for later lines"):
-        supervise:
-          val repl = Repl()
+        isolated:
+          val repl = Opened(Repl())
           repl.interpret(t"val x = 40 + 2")
           repl.interpret(t"x + 1")
       . assert:
@@ -529,8 +559,8 @@ object Tests extends Suite(m"Flame Tests"):
           case _                                    => false
 
       test(m"a `lazy val` shows its type without being forced"):
-        supervise:
-          val repl = Repl()
+        isolated:
+          val repl = Opened(Repl())
           repl.interpret(t"var forced = false")
           repl.interpret(t"lazy val z = { forced = true; 99 }")
           repl.interpret(t"forced")
@@ -539,22 +569,22 @@ object Tests extends Suite(m"Flame Tests"):
           case _                                    => false
 
       test(m"a `def` shows its signature with the written return type, uninvoked"):
-        supervise:
-          Repl().interpret(t"def f(a: Int, b: String): String = b*a")
+        isolated:
+          Opened(Repl()).interpret(t"def f(a: Int, b: String): String = b*a")
       . assert:
           case Repl.Outcome.Ran(_, _, output, _, _) => output.trim == t"def f(a: Int, b: String): String"
           case _                                     => false
 
       test(m"a `def` with an omitted return type shows the inferred one"):
-        supervise:
-          Repl().interpret(t"def g(n: Int) = n + 1")
+        isolated:
+          Opened(Repl()).interpret(t"def g(n: Int) = n + 1")
       . assert:
           case Repl.Outcome.Ran(_, _, output, _, _) => output.trim == t"def g(n: Int): Int"
           case _                                     => false
 
       test(m"/set experimental enables experimental definitions"):
-        supervise:
-          val repl = Repl()
+        isolated:
+          val repl = Opened(Repl())
           repl.interpret(t"@scala.annotation.experimental def ex = 1")
           val before = repl.interpret(t"ex")
           repl.interpret(t"/set experimental")
@@ -564,59 +594,59 @@ object Tests extends Suite(m"Flame Tests"):
           case _                                                     => false
 
       test(m"completions are offered for a member prefix"):
-        supervise:
+        isolated:
           val code = t"List(1, 2, 3).ma"
-          Repl().completionsAt(code, code.length).map(_.name)
+          Opened(Repl()).completionsAt(code, code.length).map(_.name)
       . assert(_.has(t"map"))
 
       test(m"completions are offered inside a definition's right-hand side"):
-        supervise:
+        isolated:
           val code = t"def foo() = System.o"
-          Repl().completionsAt(code, code.length).map(_.name)
+          Opened(Repl()).completionsAt(code, code.length).map(_.name)
       . assert(_.has(t"out"))
 
       test(m"completions are offered inside a val's right-hand side"):
-        supervise:
+        isolated:
           val code = t"val xs = List(1, 2, 3).ma"
-          Repl().completionsAt(code, code.length).map(_.name)
+          Opened(Repl()).completionsAt(code, code.length).map(_.name)
       . assert(_.has(t"map"))
 
       test(m"completions see the session's imports for a first-token prefix"):
-        supervise:
-          val repl = Repl()
+        isolated:
+          val repl = Opened(Repl())
           repl.interpret(t"import scala.collection.mutable.ListBuffer")
           repl.completionsAt(t"ListB", 5).map(_.name)
       . assert(_.has(t"ListBuffer"))
 
       test(m"completions work in import position"):
-        supervise:
+        isolated:
           val code = t"import sca"
-          Repl().completionsAt(code, code.length).map(_.name)
+          Opened(Repl()).completionsAt(code, code.length).map(_.name)
       . assert(_.has(t"scala"))
 
       test(m"slash-command lines complete against the engine's commands"):
-        supervise:
+        isolated:
           val code = t"/set ex"
-          Repl().completionsAt(code, code.length).map(_.name)
+          Opened(Repl()).completionsAt(code, code.length).map(_.name)
       . assert(_.has(t"/set experimental"))
 
       test(m"/s offers /set once, not one entry per setting"):
-        supervise:
+        isolated:
           val code = t"/s"
-          Repl().completionsAt(code, code.length).map(_.name)
+          Opened(Repl()).completionsAt(code, code.length).map(_.name)
       . assert { names => names.has(t"/set ") && !names.has(t"/set async") }
 
       test(m"/set followed by a space offers its subcommands as settings"):
-        supervise:
+        isolated:
           val code = t"/set "
-          Repl().completionsAt(code, code.length)
+          Opened(Repl()).completionsAt(code, code.length)
       . assert: items =>
           items.map(_.name).has(t"/set async") && items.map(_.name).has(t"/set experimental")
           && items.all(_.kind == t"setting")
 
       test(m"a new definition invalidates the cached member completions"):
-        supervise:
-          val repl = Repl()
+        isolated:
+          val repl = Opened(Repl())
           repl.completionsAt(t"z9.le", 5)        // z9 undefined: caches an empty member list
           repl.interpret(t"val z9 = \"hi\"")      // defining z9 must drop the stale cache
           repl.completionsAt(t"z9.le", 5).map(_.name)
@@ -728,43 +758,43 @@ object Tests extends Suite(m"Flame Tests"):
       . assert(_ == false)
 
       test(m"an expression result carries its value and type"):
-        supervise:
-          Repl().react(0, t"1 + 1")
+        isolated:
+          Opened(Repl()).react(0, t"1 + 1")
       . assert:
           case Repl.Reply.Ran(_, value, _, tpe, _, _, _, _, _) => value == t"2" && tpe.present
           case _                                       => false
 
       test(m"a Unit result shows neither a value nor a type"):
-        supervise:
-          Repl().react(0, t"println(\"hi\")")
+        isolated:
+          Opened(Repl()).react(0, t"println(\"hi\")")
       . assert:
           case Repl.Reply.Ran(_, value, _, tpe, _, _, _, _, _) => value.absent && tpe.absent
           case _                                       => false
 
       test(m"an import produces no result value"):
-        supervise:
-          Repl().react(0, t"import scala.collection.mutable.*")
+        isolated:
+          Opened(Repl()).react(0, t"import scala.collection.mutable.*")
       . assert:
           case Repl.Reply.Ran(_, value, _, tpe, _, _, _, _, _) => value.absent && tpe.absent
           case _                                       => false
 
       test(m"a type error is reported as Rejected with notices"):
-        supervise:
-          Repl().interpret(t"val n: Int = \"forty\"")
+        isolated:
+          Opened(Repl()).interpret(t"val n: Int = \"forty\"")
       . assert:
           case Repl.Outcome.Rejected(notices) => !notices.nil
           case _                              => false
 
       test(m"a runtime exception is reported as Threw"):
-        supervise:
-          Repl().interpret(t"throw new RuntimeException(\"boom\")")
+        isolated:
+          Opened(Repl()).interpret(t"throw new RuntimeException(\"boom\")")
       . assert:
           case Repl.Outcome.Threw(_, _, _) => true
           case _                           => false
 
       test(m"a thrown exception's reply renders its stack trace"):
-        supervise:
-          Repl().react(0, t"throw new RuntimeException(\"boom\")")
+        isolated:
+          Opened(Repl()).react(0, t"throw new RuntimeException(\"boom\")")
       . assert:
           case Repl.Reply.Threw(_, _, diagnostics, _, _, _) =>
             diagnostics.contains(t"RuntimeException") && diagnostics.contains(t"boom")
@@ -775,7 +805,7 @@ object Tests extends Suite(m"Flame Tests"):
       given Scalac[3.9, Universe.Classfile] = Scalac(Nil)
 
       test(m"captured values and a lifted definition are usable in the REPL"):
-        supervise:
+        isolated:
           val greeting: String = "hello"
           var counter:  Int    = 5
 
@@ -783,6 +813,7 @@ object Tests extends Suite(m"Flame Tests"):
             val text  = greeting
             val count = counter
             def total: Int = text.length + count
+          Opened(repl)
 
           repl.interpret(t"println(total)")     // "hello".length + 5
       . assert:
@@ -790,10 +821,11 @@ object Tests extends Suite(m"Flame Tests"):
           case _                         => false
 
       test(m"a lifted import is in scope for REPL lines"):
-        supervise:
+        isolated:
           // the lifted import is consumed by the macro, so it reads as unused here
           @scala.annotation.nowarn val repl = Repl[3.9]:
             import scala.collection.mutable.ListBuffer
+          Opened(repl)
 
           repl.interpret(t"println(ListBuffer(1, 2, 3).sum)")
       . assert:
@@ -801,11 +833,12 @@ object Tests extends Suite(m"Flame Tests"):
           case _                         => false
 
       test(m"a captured value persists across several lines"):
-        supervise:
+        isolated:
           val secret: Int = 42
 
           val repl = Repl[3.9]:
             val seed = secret
+          Opened(repl)
 
           repl.interpret(t"val doubled = seed*2")
           repl.interpret(t"println(doubled + seed)")
@@ -817,22 +850,22 @@ object Tests extends Suite(m"Flame Tests"):
       given Scalac[3.9, Universe.Classfile] = Scalac(Nil)
 
       test(m"an expression's value is rendered via Inspectable"):
-        supervise:
-          Repl().interpret(t"21 * 2")
+        isolated:
+          Opened(Repl()).interpret(t"21 * 2")
       . assert:
           case Repl.Outcome.Ran(_, value, _, _, _) => value.let(_ == t"42").or(false)
           case _                             => false
 
       test(m"a type/class definition renders no value"):
-        supervise:
-          Repl().interpret(t"class C(n: Int)")
+        isolated:
+          Opened(Repl()).interpret(t"class C(n: Int)")
       . assert:
           case Repl.Outcome.Ran(_, value, _, _, _) => value.absent
           case _                             => false
 
       test(m"a result is bound to a type-derived name, usable on a later line"):
-        supervise:
-          val repl = Repl()
+        isolated:
+          val repl = Opened(Repl())
           val first = repl.interpret(t"List(1, 2, 3)")
           (first, repl.interpret(t"list.size"))
       . assert:
@@ -841,8 +874,8 @@ object Tests extends Suite(m"Flame Tests"):
           case _ => false
 
       test(m"a repeated result type gets a numbered name to avoid a collision"):
-        supervise:
-          val repl = Repl()
+        isolated:
+          val repl = Opened(Repl())
           repl.interpret(t"List(1)")
           repl.interpret(t"List(2)")
       . assert:
@@ -850,8 +883,8 @@ object Tests extends Suite(m"Flame Tests"):
           case _                                  => false
 
       test(m"stdout printed while a line runs is captured"):
-        supervise:
-          Repl().interpret(t"println(7)")
+        isolated:
+          Opened(Repl()).interpret(t"println(7)")
       . assert:
           case Repl.Outcome.Ran(_, _, output, _, _) => output.contains(t"7")
           case _                              => false
@@ -1027,10 +1060,10 @@ object Tests extends Suite(m"Flame Tests"):
         blocks.map(block).join(t"\n")
 
       def exhibiting(using Monitor, System, Probate): Repl[3.9] =
-        Repl.make[3.9](Repl.Prelude.empty, Repl.Rendering.Exhibit(false))
+        Opened(Repl.make[3.9](Repl.Prelude.empty, Repl.Rendering.Exhibit(false)))
 
       test(m"a result is exhibited as blocks, with no text rendering"):
-        supervise(exhibiting.react(0, t"val n = 1 + 1"))
+        isolated(exhibiting.react(0, t"val n = 1 + 1"))
       . assert:
           case Repl.Reply.Ran(_, value, _, _, _, diagnostics, _, _, blocks) =>
             val text = texts(Blocks.decode(blocks))
@@ -1038,14 +1071,14 @@ object Tests extends Suite(m"Flame Tests"):
           case _ => false
 
       test(m"captured output becomes output blocks by stream"):
-        supervise(exhibiting.react(0, t"java.lang.System.out.println(\"hi\"); java.lang.System.err.println(\"oh\")"))
+        isolated(exhibiting.react(0, t"java.lang.System.out.println(\"hi\"); java.lang.System.err.println(\"oh\")"))
       . assert:
           case Repl.Reply.Ran(_, _, _, _, _, _, _, _, blocks) =>
             Blocks.decode(blocks).sweep { case Block.Output(text, error) => (text.trim, error) } == List((t"hi", false), (t"oh", true))
           case _ => false
 
       test(m"a rejection's diagnostics are notices of failure"):
-        supervise(exhibiting.react(0, t"val n: Int = \"hello\""))
+        isolated(exhibiting.react(0, t"val n: Int = \"hello\""))
       . assert:
           case Repl.Reply.Rejected(_, diagnostics, tokens, blocks) =>
             val decoded = Blocks.decode(blocks)
@@ -1054,14 +1087,14 @@ object Tests extends Suite(m"Flame Tests"):
           case _ => false
 
       test(m"a thrown exception is exhibited as a stack trace"):
-        supervise(exhibiting.react(0, t"throw new java.lang.RuntimeException(\"boom\")"))
+        isolated(exhibiting.react(0, t"throw new java.lang.RuntimeException(\"boom\")"))
       . assert:
           case Repl.Reply.Threw(_, _, diagnostics, _, _, blocks) =>
             diagnostics == t"" && texts(Blocks.decode(blocks)).contains(t"boom")
           case _ => false
 
       test(m"a diagnostic with a blank line inside survives the wire"):
-        supervise:
+        isolated:
           val repl = exhibiting
           repl.react(0, t"/set experimental")
           repl.react(0, t"import soundness.*")
@@ -1073,7 +1106,7 @@ object Tests extends Suite(m"Flame Tests"):
           case _ => false
 
       test(m"a connection answers a submission and pushes an asynchronous one"):
-        supervise:
+        isolated:
           val sessions = Sessions(Repl.Rendering.Exhibit(true))
           val lock = Mutex()
           var sent: List[Repl.Reply] = Nil
@@ -1156,7 +1189,7 @@ object Tests extends Suite(m"Flame Tests"):
         (engine, scala.caps.unsafe.unsafeAssumePure(ReplInterface(engine, options)))
 
       test(m"a submission becomes a pending entry and a request"):
-        supervise:
+        isolated:
           val (engine, interface) = fresh()
           interface.handle(Event.Submitted(interface.field.input, t"1 + 1"))
           (engine.submissions, interface.transcript())
@@ -1165,14 +1198,14 @@ object Tests extends Suite(m"Flame Tests"):
           && entries.size == 1 && entries.prim.lay(false)(pendingEntry)
 
       test(m"a trailing blank line is stripped from a submission"):
-        supervise:
+        isolated:
           val (engine, interface) = fresh()
           interface.handle(Event.Submitted(interface.field.input, t"val x = 1\n  x\n"))
           engine.submissions.map(_.code)
       . assert(_ == List(t"val x = 1\n  x"))
 
       test(m"an engine answering before the request returns still settles the entry"):
-        supervise:
+        isolated:
           val engine = FakeEngine()
           val interface: ReplInterface = scala.caps.unsafe.unsafeAssumePure(ReplInterface(engine, ReplInterface.Options()))
           val immediate: Engine = new Engine:
@@ -1190,7 +1223,7 @@ object Tests extends Suite(m"Flame Tests"):
           entries.size == 1 && !entries.prim.lay(false)(pendingEntry) && texts(entries).contains(t"at once")
 
       test(m"the reply settles the entry in place"):
-        supervise:
+        isolated:
           val (engine, interface) = fresh()
           interface.handle(Event.Submitted(interface.field.input, t"1 + 1"))
           val id = engine.submissions.prim.let(_.id).or(0)
@@ -1200,7 +1233,7 @@ object Tests extends Suite(m"Flame Tests"):
           entries.size == 1 && !entries.prim.lay(false)(pendingEntry) && texts(entries).contains(t"res0: Int = 2")
 
       test(m"an asynchronous run streams its output before its reply fills the entry"):
-        supervise:
+        isolated:
           val (engine, interface) = fresh()
           interface.handle(Event.Submitted(interface.field.input, t"slow()"))
           val id = engine.submissions.prim.let(_.id).or(0)
@@ -1217,7 +1250,7 @@ object Tests extends Suite(m"Flame Tests"):
               && !settled.prim.lay(false)(pendingEntry) && texts(settled).cut(t"hi").size == 2
 
       test(m"editing decorates the prompt at once and asks the engine for the scope"):
-        supervise:
+        isolated:
           val (engine, interface) = fresh()
           interface.handle(Event.Edited(interface.field.input, t"val x = (", 9))
           (engine.requests, interface.field.decoration())
@@ -1227,7 +1260,7 @@ object Tests extends Suite(m"Flame Tests"):
           && decoration.incomplete && decoration.tokens.exists(_.text == t"val")
 
       test(m"a multi-line entry submits only after a blank line"):
-        supervise:
+        isolated:
           val (engine, interface) = fresh()
           interface.handle(Event.Edited(interface.field.input, t"val x = 1\nx", 11))
           val open = interface.field.decoration().incomplete
@@ -1236,7 +1269,7 @@ object Tests extends Suite(m"Flame Tests"):
       . assert(_ == (true, false))
 
       test(m"a command is never incomplete"):
-        supervise:
+        isolated:
           val (engine, interface) = fresh()
           interface.handle(Event.Edited(interface.field.input, t"/set async", 10))
           interface.field.decoration()
@@ -1244,7 +1277,7 @@ object Tests extends Suite(m"Flame Tests"):
           !decoration.incomplete && decoration.tokens.prim.lay(false)(_.accent == Token.Accent.Command)
 
       test(m"/clear empties the transcript"):
-        supervise:
+        isolated:
           val (engine, interface) = fresh()
           interface.handle(Event.Submitted(interface.field.input, t"1 + 1"))
           interface.handle(Event.Submitted(interface.field.input, t"/clear"))
@@ -1252,7 +1285,7 @@ object Tests extends Suite(m"Flame Tests"):
       . assert(_ == (Nil, 1))
 
       test(m"/session asks the engine and notes the answer"):
-        supervise:
+        isolated:
           val (engine, interface) = fresh()
           interface.handle(Event.Submitted(interface.field.input, t"/session other"))
           val id = engine.requests.sweep { case Repl.Request.Session(id, t"other") => id }.prim.or(0)
@@ -1261,7 +1294,7 @@ object Tests extends Suite(m"Flame Tests"):
       . assert(_.contains(Repl.messages.switched(t"other")))
 
       test(m"submissions join the history and are persisted"):
-        supervise:
+        isolated:
           // Recorded newest-first, as elsewhere in this harness, and reversed when read.
           var persisted: List[Text] = Nil
           val (engine, interface) = fresh(ReplInterface.Options(history = List(t"earlier"), persist = line => persisted = line :: persisted))
@@ -1271,7 +1304,7 @@ object Tests extends Suite(m"Flame Tests"):
       . assert(_ == (List(t"earlier", t"1 + 1"), List(t"1 + 1")))
 
       test(m"an unknown command is refused without troubling the engine"):
-        supervise:
+        isolated:
           val (engine, interface) = fresh()
           interface.handle(Event.Submitted(interface.field.input, t"/nonsense"))
           (engine.submissions.size, texts(interface.transcript()))
@@ -1280,7 +1313,7 @@ object Tests extends Suite(m"Flame Tests"):
           case _ => false
 
       test(m"closing the interface closes the engine"):
-        supervise:
+        isolated:
           val (engine, interface) = fresh()
           interface.handle(Event.Closed)
           engine.closed
@@ -1290,9 +1323,9 @@ object Tests extends Suite(m"Flame Tests"):
       given Scalac[3.9, Universe.Classfile] = Scalac(Nil)
 
       test(m"a reply carries the value, type and highlighting"):
-        supervise:
+        isolated:
           val tcpPort = Port[Tcp]()
-          val service = Sessions().serve(tcpPort)
+          val service = Opened(Sessions()).serve(tcpPort)
           val socket  = Wire.tcp(tcpPort)
 
           try socket.exchange(Repl.Request.Submit(1, t"1 + 1"))
@@ -1309,9 +1342,9 @@ object Tests extends Suite(m"Flame Tests"):
             false
 
       test(m"a quit request fulfils the server's quit signal"):
-        supervise:
+        isolated:
           val tcpPort  = Port[Tcp]()
-          val sessions = Sessions()
+          val sessions = Opened(Sessions())
           val service  = sessions.serve(tcpPort)
           val socket   = Wire.tcp(tcpPort)
 
@@ -1328,11 +1361,11 @@ object Tests extends Suite(m"Flame Tests"):
       . assert(_ == true)
 
       test(m"a message sent over a UNIX domain socket is answered"):
-        supervise:
+        isolated:
           val directory: Path on Linux = temporaryDirectory/Uuid()
           directory.create[Directory]()
           val socketPath: Text = (directory/t"repl.sock").encode
-          val service = Sessions().serve(socketPath)
+          val service = Opened(Sessions()).serve(socketPath)
           val socket  = Wire.domain(socketPath)
 
           try socket.exchange(Repl.Request.Submit(3, t"6 * 7"))
@@ -1344,8 +1377,8 @@ object Tests extends Suite(m"Flame Tests"):
           case _                                    => false
 
       test(m"sessions are independent and each has a distinct name"):
-        supervise:
-          val sessions = Sessions()
+        isolated:
+          val sessions = Opened(Sessions())
           val a = sessions.create()
           val b = sessions.create()
           def session(name: Text) =
@@ -1360,11 +1393,11 @@ object Tests extends Suite(m"Flame Tests"):
           case _                                                                  => false
 
       test(m"a Session request switches the connection and lists sessions"):
-        supervise:
+        isolated:
           val directory: Path on Linux = temporaryDirectory/Uuid()
           directory.create[Directory]()
           val socketPath: Text = (directory/t"repl2.sock").encode
-          val sessions = Sessions()
+          val sessions = Opened(Sessions())
           val service = sessions.serve(socketPath)
           val socket  = Wire.domain(socketPath)
 
@@ -1384,9 +1417,9 @@ object Tests extends Suite(m"Flame Tests"):
       // Naming a session that does not exist STARTS it under that name (`/session work`), reported
       // as `Created`; naming it again merely switches (`Joined`).
       test(m"a Session request naming an unknown session starts it under that name"):
-        supervise:
+        isolated:
           val tcpPort = Port[Tcp]()
-          val service = Sessions().serve(tcpPort)
+          val service = Opened(Sessions()).serve(tcpPort)
           val socket  = Wire.tcp(tcpPort)
 
           try
@@ -1407,9 +1440,9 @@ object Tests extends Suite(m"Flame Tests"):
       // `--create work` starts a new session; a second `--create work` must FAIL (name taken),
       // reported as `Exists` without switching.
       test(m"a Create request starts a new session, and fails if the name is taken"):
-        supervise:
+        isolated:
           val tcpPort = Port[Tcp]()
-          val service = Sessions().serve(tcpPort)
+          val service = Opened(Sessions()).serve(tcpPort)
           val socket  = Wire.tcp(tcpPort)
 
           try
@@ -1430,9 +1463,9 @@ object Tests extends Suite(m"Flame Tests"):
       // `--join work` joins an existing session; joining one that does not exist must FAIL
       // (`Missing`) and create nothing.
       test(m"a Join request joins an existing session, and fails if there is none"):
-        supervise:
+        isolated:
           val tcpPort = Port[Tcp]()
-          val service = Sessions().serve(tcpPort)
+          val service = Opened(Sessions()).serve(tcpPort)
           val socket  = Wire.tcp(tcpPort)
 
           try
@@ -1458,8 +1491,8 @@ object Tests extends Suite(m"Flame Tests"):
       // two first-time `semanticImports` builds corrupted a package scope and one thread looped
       // forever: this drives both at once, repeatedly, and must return.
       test(m"a concurrent completion and diagnostic on one session both return"):
-        supervise:
-          val repl = Repl()
+        isolated:
+          val repl = Opened(Repl())
           repl.react(0, t"import soundness.*")
           var stuck: Boolean = false
 
@@ -1479,8 +1512,8 @@ object Tests extends Suite(m"Flame Tests"):
       // A session's ambient `WorkingDirectory`/`Environment`/`System` (see `ReplContext`) reflect the
       // values filed for it — the client's — and `System`'s `user.dir` follows the working directory.
       test(m"the ambient WorkingDirectory, Environment and System are the client's"):
-        supervise:
-          val repl = Repl()
+        isolated:
+          val repl = Opened(Repl())
           ReplContext.set(repl.session, ReplContext.Values(t"/tmp/flame-client",
             Map(t"FLAME_TEST_VARIABLE" -> t"present")))
           repl.react(0, t"/set experimental")
@@ -1496,8 +1529,8 @@ object Tests extends Suite(m"Flame Tests"):
       // The ambient givens are conditional, so a user's own `given` on an earlier line (in scope
       // through the history import, an inner level) — or an import of Soundness's — wins outright.
       test(m"a user-defined WorkingDirectory overrides the ambient one"):
-        supervise:
-          val repl = Repl()
+        isolated:
+          val repl = Opened(Repl())
           ReplContext.set(repl.session, ReplContext.Values(t"/tmp/flame-client", Map()))
           repl.react(0, t"/set experimental")
           repl.react(0, t"import soundness.*")
@@ -1508,8 +1541,8 @@ object Tests extends Suite(m"Flame Tests"):
           case _                                   => false
 
       test(m"an imported Soundness Environment given overrides the ambient one without ambiguity"):
-        supervise:
-          val repl = Repl()
+        isolated:
+          val repl = Opened(Repl())
           repl.react(0, t"/set experimental")
           repl.react(0, t"import soundness.*")
           repl.react(1, t"import environments.emptyEnvironment")
@@ -1522,9 +1555,9 @@ object Tests extends Suite(m"Flame Tests"):
 
       // Over the wire: a `Context` request files the connecting client's values on its session.
       test(m"a Context request makes the client's working directory ambient in its session"):
-        supervise:
+        isolated:
           val tcpPort = Port[Tcp]()
-          val service = Sessions().serve(tcpPort)
+          val service = Opened(Sessions()).serve(tcpPort)
           val socket  = Wire.tcp(tcpPort)
 
           try
@@ -1543,8 +1576,8 @@ object Tests extends Suite(m"Flame Tests"):
       // stdout and stderr are both captured, in the order they interleaved, and a reply locates each
       // run by stream (`spans`) within the plain `output`, so the front-ends can shade them apart.
       test(m"stdout and stderr are captured in order, as separate spans"):
-        supervise:
-          Repl().react(0, t"println(\"a\"); System.err.println(\"b\"); println(\"c\")")
+        isolated:
+          Opened(Repl()).react(0, t"println(\"a\"); System.err.println(\"b\"); println(\"c\")")
       . assert:
           case Repl.Reply.Ran(_, _, output, _, _, _, _, spans, _) =>
             output == t"a\nb\nc\n"
@@ -1555,8 +1588,8 @@ object Tests extends Suite(m"Flame Tests"):
 
       // The ambient `Stdio` (see `ReplStdio`) routes `Err` to the captured stderr as well.
       test(m"Err.println is captured as stderr"):
-        supervise:
-          val repl = Repl()
+        isolated:
+          val repl = Opened(Repl())
           repl.react(0, t"/set experimental")
           repl.react(0, t"import soundness.*")
           repl.react(1, t"Err.println(t\"oops\")")
@@ -1571,8 +1604,8 @@ object Tests extends Suite(m"Flame Tests"):
       // into the line's own coordinates (`Repl.userSpan`) and split into marked tokens
       // (`Repl.mark`): here exactly the offending `"hello"`.
       test(m"a type error's span is marked on the rejected line's tokens"):
-        supervise:
-          Repl().react(0, t"val n: Int = \"hello\"")
+        isolated:
+          Opened(Repl()).react(0, t"val n: Int = \"hello\"")
       . assert:
           case Repl.Reply.Rejected(_, _, tokens, _) =>
             val marked = tokens.filter(_.mark.present)
@@ -1583,8 +1616,8 @@ object Tests extends Suite(m"Flame Tests"):
 
       // A span on the SECOND line of a multi-line submission lands on that line's tokens.
       test(m"a span on a later line of a multi-line submission is marked there"):
-        supervise:
-          Repl().react(0, t"def f: Int =\n  1 + \"x\"")
+        isolated:
+          Opened(Repl()).react(0, t"def f: Int =\n  1 + \"x\"")
       . assert:
           case Repl.Reply.Rejected(_, _, tokens, _) =>
             val marked = tokens.filter(_.mark.present).map(_.text).join
@@ -1610,7 +1643,7 @@ object Tests extends Suite(m"Flame Tests"):
       // submitted prompt — round-trips through BinTEL (a bare `Text` will not encode at the top
       // level, so the line is wrapped in this struct).
       test(m"a HistoryEntry round-trips through BinTEL"):
-        supervise:
+        isolated:
           val data: Data = Repl.HistoryEntry(t"import soundness.*").bintel
           Bintel.read[Repl.HistoryEntry](data)
       . assert:
@@ -1621,9 +1654,9 @@ object Tests extends Suite(m"Flame Tests"):
       // request would through the connection's lazy current session), so a `--session` completion
       // can enumerate the joinable sessions without leaving throwaways behind.
       test(m"a SessionList request lists sessions without creating one"):
-        supervise:
+        isolated:
           val tcpPort = Port[Tcp]()
-          val service = Sessions().serve(tcpPort)
+          val service = Opened(Sessions()).serve(tcpPort)
           val socket  = Wire.tcp(tcpPort)
 
           try
@@ -1645,9 +1678,9 @@ object Tests extends Suite(m"Flame Tests"):
             false
 
       test(m"a completion request returns matching completions"):
-        supervise:
+        isolated:
           val tcpPort = Port[Tcp]()
-          val service = Sessions().serve(tcpPort)
+          val service = Opened(Sessions()).serve(tcpPort)
           val socket  = Wire.tcp(tcpPort)
 
           try socket.exchange(Repl.Request.Complete(1, t"List(1, 2, 3).m", 15))
@@ -1661,9 +1694,9 @@ object Tests extends Suite(m"Flame Tests"):
       // A tokenize reply carries the scope the unfinished line has opened — computed on the
       // connection's session (created by the first submission), so it sees that session's history.
       test(m"a tokenize request reports the scope an unfinished line has opened"):
-        supervise:
+        isolated:
           val tcpPort = Port[Tcp]()
-          val service = Sessions().serve(tcpPort)
+          val service = Opened(Sessions()).serve(tcpPort)
           val socket  = Wire.tcp(tcpPort)
 
           try
@@ -1683,11 +1716,12 @@ object Tests extends Suite(m"Flame Tests"):
       given Scalac[3.9, Universe.Classfile] = Scalac(Nil)
 
       test(m"a lifted def can reference a value from the enclosing scope"):
-        supervise:
+        isolated:
           val base = 100
 
           val repl = Repl[3.9]:
             def shifted(n: Int): Int = n + base
+          Opened(repl)
 
           repl.interpret(t"shifted(5)")
       . assert:
@@ -1695,9 +1729,10 @@ object Tests extends Suite(m"Flame Tests"):
           case _                             => false
 
       test(m"a lifted def captures an enclosing method parameter"):
-        def session(base: Int): Repl.Outcome = supervise:
+        def session(base: Int): Repl.Outcome = isolated:
           val repl = Repl[3.9]:
             def plus(n: Int): Int = n + base
+          Opened(repl)
 
           repl.interpret(t"plus(2)")
 
@@ -1707,12 +1742,13 @@ object Tests extends Suite(m"Flame Tests"):
           case _                             => false
 
       test(m"a lifted def can reference both a block binding and an outside value"):
-        supervise:
+        isolated:
           val base = 100
 
           val repl = Repl[3.9]:
             val offset = 5
             def total: Int = offset + base
+          Opened(repl)
 
           repl.interpret(t"total")
       . assert:
@@ -1720,7 +1756,7 @@ object Tests extends Suite(m"Flame Tests"):
           case _                             => false
 
       test(m"a lifted def references a field of an enclosing object, tracking changes"):
-        supervise:
+        isolated:
           ReplFixture.greeting = "hi"     // length 2; then mutated to "changed" (7)
           ReplFixture.session
       . assert:
@@ -1730,11 +1766,12 @@ object Tests extends Suite(m"Flame Tests"):
             false
 
       test(m"a lifted def can write back to a host var"):
-        supervise:
+        isolated:
           var tally = 1
 
           val repl = Repl[3.9]:
             def bump(): Unit = tally = tally + 10
+          Opened(repl)
 
           repl.interpret(t"bump()")
           repl.interpret(t"bump()")
@@ -1742,10 +1779,11 @@ object Tests extends Suite(m"Flame Tests"):
       . assert(_ == 21)
 
       test(m"a lifted import is in scope for a lifted def and for later lines"):
-        supervise:
+        isolated:
           val repl = Repl[3.9]:
             import scala.collection.mutable.ListBuffer
             def make: ListBuffer[Int] = ListBuffer(1, 2, 3)
+          Opened(repl)
 
           repl.interpret(t"make.sum")               // lifted def uses the import
           repl.interpret(t"ListBuffer(9, 9).sum")   // a later line uses it directly
@@ -1754,9 +1792,10 @@ object Tests extends Suite(m"Flame Tests"):
           case _                             => false
 
       test(m"a block-local var can be reassigned from a REPL line"):
-        supervise:
+        isolated:
           val repl = Repl[3.9]:
             var counter = 10
+          Opened(repl)
 
           repl.interpret(t"counter = counter + 5")
           repl.interpret(t"counter")
