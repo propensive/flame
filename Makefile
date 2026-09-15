@@ -10,10 +10,10 @@ assembly: publishLocal
 	./mill flame.launcher.assembly
 
 # Publish flame to GitHub Releases: the three library jars first, then — once their digests are
-# indexed — the repackaged `flame` executables, added to the same release. See etc/ci/release.sh
-# for the two-step ordering and its verification.
+# indexed — the repackaged `flame` executables, added to the same release. See release-launcher.sh
+# in propensive/.github (run through etc/shared) for the two-step ordering and its verification.
 release:
-	./etc/ci/release.sh $(VERSION)
+	./etc/shared release-launcher.sh flame "flame-core flame-web flame-client" $(VERSION)
 
 # Publish the libraries to the local ~/.ivy2 (the launcher resolves them from there; burdock will
 # NOT externalize a locally-published copy unless its bytes match a release asset).
@@ -44,7 +44,7 @@ flame: flame.jar xeq-fetch
 
 # Fetch the pinned `xeq` builder script into dist/xeq.
 xeq-fetch:
-	./etc/ci/xeq-fetch.sh
+	./etc/shared xeq-fetch.sh
 
 install: flame
 	cp flame ${HOME}/.local/bin/
@@ -76,7 +76,7 @@ test-plain:
 # resolves the released jars rather than whatever a pyrocosm checkout's `publishLocal` last
 # installed: the pinned version, or `VERSION=X.Y.Z`. Soundness itself is left alone.
 sync-releases:
-	./etc/ci/sync-releases.sh $(VERSION)
+	./etc/shared sync-releases.sh propensive/pyrocosm pyrocosmVersion $(VERSION)
 
 dev:
 	./mill -w flame.client.compile

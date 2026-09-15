@@ -38,7 +38,8 @@ object settings:
   // so the released coordinates and the launcher's dependency coordinates cannot drift apart:
   // burdock externalizes a module only when the exact released jar bytes are on the launcher's
   // classpath, so a mismatch would silently fall back to inlining. Bump (and commit) per release;
-  // etc/ci/release.sh refuses to release when this pin disagrees with its VERSION argument.
+  // release-launcher.sh (in propensive/.github) refuses to release when this pin disagrees with
+  // its VERSION argument.
   val flameVersion = sys.env.getOrElse("FLAME_VERSION", "0.1.3")
 
   // The Pyrocosm release the user interface is built on: the model (and its compiler-facing
@@ -384,11 +385,12 @@ trait Component(dependencies: PublishModule*) extends Toolchain:
 
 // Mixed into the library modules that are released (`core`, `web`, `client`) — the modules the
 // `launcher` then pulls back in as published coordinates. Releases go to GitHub Releases (see
-// etc/ci/release.sh), with `publishLocal` producing the jars and their POMs; the Sonatype module is
-// retained only for its POM machinery. Every setting mirrors the Soundness build: the same
-// `dev.propensive` organization, URL, Apache-2.0 licence, GitHub SCM and developer, plus the empty
-// `-javadoc.jar`. A module's `moduleDeps` that are themselves `Publishing` become POM
-// `<dependency>` entries, so the published `flame-client` correctly declares `flame-core`/`flame-web`.
+// release-launcher.sh in propensive/.github), with `publishLocal` producing the jars and their
+// POMs; the Sonatype module is retained only for its POM machinery. Every setting mirrors the
+// Soundness build: the same `dev.propensive` organization, URL, Apache-2.0 licence, GitHub SCM and
+// developer, plus the empty `-javadoc.jar`. A module's `moduleDeps` that are themselves
+// `Publishing` become POM `<dependency>` entries, so the published `flame-client` correctly
+// declares `flame-core`/`flame-web`.
 trait Publishing extends Toolchain, SonatypeCentralPublishModule:
   def publishVersion = settings.flameVersion
   def artifactSuffix = Task("")
