@@ -451,8 +451,12 @@ object flame extends Project:
   // module's assembly (`make run` does so). Externalization happens only in `make release`, once
   // the same bytes are a GitHub release asset (a local copy alone would be inlined).
   object launcher extends Component():
+    // `frontier-core` is only a RUNTIME dependency of `core`, so it would be missing from this
+    // module's compile classpath, which is what `externalize` hashes; the repackager would then
+    // inline it rather than externalize it. Naming it here lets it be externalized like the rest.
     def mvnDeps =
       mvn"dev.propensive:flame-client:${settings.flameVersion}" +: settings.clientDeps
+      :+ settings.component("frontier-core")
     def finalMainClass = "flame.repl"
     // A clean zip (no executable shell preamble) so the Burdock repackager can read and rewrite the
     // assembled JAR.
