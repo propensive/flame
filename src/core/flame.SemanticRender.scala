@@ -45,11 +45,13 @@ import kaleidoscope.*
 import prepositional.*
 import rudiments.*
 import stenography.*
+import tessellate.Flow
 import vacuous.*
 
 import delicious.*  // Markup, SemanticMessage, Reifier, `semantic` on Notice, `teletype` on SemanticMessage
 import pyrocosm.{Block, Tone}
 import pyrocosm.{exhibit, sourceCodePresentable, flattened}
+import FlameColours.srgb
 
 // Renders compiler notices for a REPL reply, re-rendering the TYPES embedded in each error message
 // through stenography and syntax-highlighting both them and any embedded CODE SAMPLES with harlequin.
@@ -61,9 +63,6 @@ import pyrocosm.{exhibit, sourceCodePresentable, flattened}
 // blocks (`blocks`). Both fall back to the compiler's own printed text for anything that cannot
 // be reified, and to the plain message when there is no semantic markup at all.
 object SemanticRender:
-  private def hex(rgb: Int): Color in Srgb =
-    Srgb(((rgb >> 16) & 0xff)/255.0, ((rgb >> 8) & 0xff)/255.0, (rgb & 0xff)/255.0)
-
   // The syntax palette, matched to the user's Zed theme "Propensive" — the single source of truth,
   // shared with the CLI front-end (whose editor `given` delegates here), so a type or code sample in
   // an error message is coloured exactly as it would be in the editor. (See the palette notes in
@@ -71,21 +70,21 @@ object SemanticRender:
   // Zed's punctuation.bracket/operator respectively.)
   val palette: ScalaSyntaxPalette = new Palette:
     type Form = Srgb
-    def background:       Color in Srgb = hex(FlameColours.background)
-    def foreground:       Color in Srgb = hex(FlameColours.foreground)
-    def scalaError:       Color in Srgb = hex(FlameColours.error)
-    def scalaNumber:      Color in Srgb = hex(FlameColours.number)
-    def scalaString:      Color in Srgb = hex(FlameColours.string)
-    def scalaTerm:        Color in Srgb = hex(FlameColours.term)
-    def scalaType:        Color in Srgb = hex(FlameColours.tpe)
-    def scalaKeyword:     Color in Srgb = hex(FlameColours.keyword)
-    def scalaSymbol:      Color in Srgb = hex(FlameColours.symbol)
-    def scalaParenthesis: Color in Srgb = hex(FlameColours.operator)
-    def scalaModifier:    Color in Srgb = hex(FlameColours.keyword)
-    def scalaComment:     Color in Srgb = hex(FlameColours.comment)
-    def subdued:          Color in Srgb = hex(FlameColours.subdued)
-    def accented:         Color in Srgb = hex(FlameColours.foreground)
-    def margin:           Color in Srgb = hex(FlameColours.margin)
+    def background:       Color in Srgb = srgb(FlameColours.background)
+    def foreground:       Color in Srgb = srgb(FlameColours.foreground)
+    def scalaError:       Color in Srgb = srgb(FlameColours.error)
+    def scalaNumber:      Color in Srgb = srgb(FlameColours.number)
+    def scalaString:      Color in Srgb = srgb(FlameColours.string)
+    def scalaTerm:        Color in Srgb = srgb(FlameColours.term)
+    def scalaType:        Color in Srgb = srgb(FlameColours.tpe)
+    def scalaKeyword:     Color in Srgb = srgb(FlameColours.keyword)
+    def scalaSymbol:      Color in Srgb = srgb(FlameColours.symbol)
+    def scalaParenthesis: Color in Srgb = srgb(FlameColours.operator)
+    def scalaModifier:    Color in Srgb = srgb(FlameColours.keyword)
+    def scalaComment:     Color in Srgb = srgb(FlameColours.comment)
+    def subdued:          Color in Srgb = srgb(FlameColours.subdued)
+    def accented:         Color in Srgb = srgb(FlameColours.foreground)
+    def margin:           Color in Srgb = srgb(FlameColours.margin)
 
 
   // Renders `notices` to the diagnostics string. `reifier` reifies the TASTy of each type marker
@@ -198,9 +197,12 @@ object SemanticRender:
 
     recur(plain, Nil)
 
-  // Word-wraps a PLAIN (no semantic markup) message for the terminal, through the same flow — no
-  // styling, so the wrapped Teletype's plain text is returned directly.
-  private def wrapPlain(text: Text): Text = flow(prose(text)).plain
+  // Word-wraps a PLAIN (no semantic markup) message for the terminal. With no code samples to hold
+  // together there is nothing `flow` protects, so this is tessellate's own wrap; `flow` survives
+  // only for the styled path, until `Flow` learns about unbreakable spans (Soundness #1992).
+  private def wrapPlain(text: Text): Text =
+    import hieroglyph.textMetrics.uniformMetric
+    Flow.wrap(text, wrapWidth).join(t"\n")
 
   // The stenography rendering of a type marker (Unset reifier, or a failed reification, falls back to
   // the compiler-printed text the marker also carries in `plain`).
@@ -232,7 +234,7 @@ object SemanticRender:
     // The first line's phrasing stands alone; every later line is preceded by the break it
     // follows, so the message's own line structure survives into the paragraph.
     val content: List[pyrocosm.Inline] =
-      text.cut(t"\n").map(lineInlines).fuse(Nil: List[pyrocosm.Inline]):
+      text.lines.map(lineInlines).fuse(Nil: List[pyrocosm.Inline]):
         if state.nil then next else state + List(pyrocosm.Inline.Break()) + next
 
     List(Block.Paragraph(content))
@@ -276,7 +278,7 @@ object SemanticRender:
     // A paragraph is trimmed of the breaks and blank text at either end.
     def blank(node: pyrocosm.Inline): Boolean = node match
       case pyrocosm.Inline.Break()       => true
-      case pyrocosm.Inline.Textual(text) => text.trim == t""
+      case pyrocosm.Inline.Textual(text) => text.blank
       case _                             => false
 
     def flush(): Unit =
@@ -286,7 +288,7 @@ object SemanticRender:
 
     def phrase(markup: Markup): Unit = markup match
       case Markup.Textual(text) =>
-        stripAnsi(text).cut(t"\n").each: ordinal ?=>
+        stripAnsi(text).lines.each: ordinal ?=>
           line =>
             if ordinal != Prim then run = pyrocosm.Inline.Break() :: run
             if line != t"" then run = lineInlines(line).reverse + run

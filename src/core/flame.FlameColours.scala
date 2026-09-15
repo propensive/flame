@@ -32,9 +32,19 @@
                                                                                                   */
 package flame
 
+import anticipation.Chroma
+import iridescence.*
+import prepositional.*
+
 // Flame's colours, from the Zed theme the REPL has always been coloured with: one table, so the
 // terminal theme, the web theme and the diagnostics palette agree. Each is an `0xRRGGBB` value.
 object FlameColours:
+  // An `0xRRGGBB` value as the `Color in Srgb` an iridescence `Palette` is written in. `Chroma` is
+  // already the packed form the terminal and web themes use (see `FlameTheme`), and `packed.srgb`
+  // is iridescence's own unpacking of it — so the two front-ends share one conversion rather than
+  // each deriving its own. It collapses to `Chroma(rgb).srgb` under Soundness #1991.
+  def srgb(rgb: Int): Color in Srgb = Chroma(rgb).packed.srgb
+
   val background: Int = 0x000000  // editor.background
   val foreground: Int = 0xd4be98  // editor.foreground
   val error:      Int = 0xea6962  // deleted (a clear red)

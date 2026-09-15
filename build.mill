@@ -161,6 +161,7 @@ object settings:
     "aperture-core",
     "denominative-core",
     "hieroglyph-core",       // character encodings
+    "tessellate-core",       // Flow.wrap: word-wrapping a diagnostic's prose
     // Everyday libraries a REPL user expects from `import soundness.*`:
     "gossamer-core", "rudiments-core", "contingency-core", "vacuous-core", "aviation-core",
     "quantitative-core", "quantitative-units", "hypotenuse-core", "kaleidoscope-core",

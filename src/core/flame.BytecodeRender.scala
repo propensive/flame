@@ -41,24 +41,22 @@ import mandible.*
 import prepositional.*
 import rudiments.*
 import vacuous.*
+import FlameColours.srgb
 
 // Renders the JVM bytecode of a compiled class to a coloured, truecolor-ANSI listing, for the REPL's
 // `/bytecode` command. Uses Soundness `mandible`: `Classfile(resource)` reads the class BYTES through
 // a `Classloader` (it does not load or initialise the class), and each `Method`'s disassembled
 // `Bytecode` renders as an escritoire table (Source | Offset | Opcode | Stack) via its `Teletypeable`.
 object BytecodeRender:
-  private def hex(rgb: Int): Color in Srgb =
-    Srgb(((rgb >> 16) & 0xff)/255.0, ((rgb >> 8) & 0xff)/255.0, (rgb & 0xff)/255.0)
-
   // Zed-palette colours (see `flame_client.scala`): opcodes peach like a term, the source column
   // subdued like a comment, and the stack-frame outline in the faint gutter grey.
   private given palette: BytecodePalette = new Palette:
     type Form = Srgb
-    def background: Color in Srgb = hex(0x000000)
-    def foreground: Color in Srgb = hex(0xd4be98)
-    def bytecode:   Color in Srgb = hex(0xffcc99)
-    def sourceCode: Color in Srgb = hex(0x928374)
-    def outline:    Color in Srgb = hex(0x5a524c)
+    def background: Color in Srgb = srgb(0x000000)
+    def foreground: Color in Srgb = srgb(0xd4be98)
+    def bytecode:   Color in Srgb = srgb(0xffcc99)
+    def sourceCode: Color in Srgb = srgb(0x928374)
+    def outline:    Color in Srgb = srgb(0x5a524c)
 
   // Method names that are compiler scaffolding, never the user's code: the constructors and the
   // `writeReplace` the wrapper object gets for serialization. Filtered out so the listing shows only

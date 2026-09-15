@@ -671,15 +671,15 @@ object Tests extends Suite(m"Flame Tests"):
       . assert(_ == List(t"match"))
 
       test(m"a value followed by a space is an infix receiver"):
-        Repl.infixBase(t"List(1) ma", 10)._1
+        harlequin.Fragment.infixBase(t"List(1) ma", 10)._1
       . assert(_ == t"List(1).")
 
       test(m"a value with no trailing space is not an infix receiver"):
-        Repl.infixBase(t"List(1)ma", 9)._1
+        harlequin.Fragment.infixBase(t"List(1)ma", 9)._1
       . assert(_ == Unset)
 
       test(m"a name after `val` is not an infix receiver"):
-        Repl.infixBase(t"val x ", 6)._1
+        harlequin.Fragment.infixBase(t"val x ", 6)._1
       . assert(_ == Unset)
 
       test(m"a soft modifier offers a follow-set, not the whole definition list"):

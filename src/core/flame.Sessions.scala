@@ -84,7 +84,7 @@ object Sessions:
 
   lazy val animals: List[Text] =
     val loaded: Optional[List[Text]] =
-      safely(cp"/nomenclature/animals.txt".read[Text].cut(t"\n").map(_.trim).filter(_ != t""))
+      safely(cp"/nomenclature/animals.txt".read[Text].lines.map(_.trim).filter(_ != t""))
 
     loaded.let { list => if list.nil then Unset else list }.or(fallback)
 
