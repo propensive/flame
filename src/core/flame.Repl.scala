@@ -2006,7 +2006,8 @@ class Repl[version <: Scalac.Versions]
         // One last look: the thread may have replied and exited between the two checks.
         result.or(Optional(reply.poll(0, juc.TimeUnit.MILLISECONDS)).or(crashed))
 
-    def retire(): Unit = requests.offer(Warm.Request.Retire, Warm.pollInterval, juc.TimeUnit.MILLISECONDS)
+    // `true` when the session thread took the request within `pollInterval`.
+    def retire(): Boolean = requests.offer(Warm.Request.Retire, Warm.pollInterval, juc.TimeUnit.MILLISECONDS)
 
     def alive: Boolean = thread.isAlive
 
@@ -2149,6 +2150,30 @@ class Repl[version <: Scalac.Versions]
         warmKey = Unset
 
       result
+
+  // Releases everything this `Repl` holds beyond its own fields: the warm session's thread and the
+  // scope inspector's, each of which keeps a whole compiler reachable for as long as it runs (so a
+  // `Repl` that is merely dropped is never collected), and the values its lines filed in
+  // `ReplBridge` and `ReplContext`. Taken under `mutex`, so no compile is in flight on the session
+  // thread, which is therefore waiting for its next request and takes the `Retire` promptly. The
+  // `Repl` stays usable: a later line opens a fresh session, as after a `/set`.
+  def close(): Unit =
+    mutex:
+      warm.let: session =>
+        while session.alive && !session.retire() do ()
+
+      warm = Unset
+      warmKey = Unset
+
+    scopeLock:
+      inspector.let(_.retire())
+      inspector = Unset
+      inspectorKey = Unset
+
+    scopeCache = Unset
+    reifierCache = Unset
+    ReplContext.clear(session)
+    ReplBridge.clear(session)
 
   // commit the (mutable, mutex-guarded) session state during compilation and then run the object
   // load OUTSIDE the mutex: `Complete` is a line that produced its final `Outcome` already (a

@@ -131,6 +131,16 @@ class Sessions[version <: Scalac.Versions]
         registry = registry.define(name, Repl.make[version](Repl.Prelude.empty, render))
         true
 
+  // Closes every session (see `Repl#close`) and forgets them all: without this, each session's
+  // warm compiler stays alive for as long as the process does.
+  def close(): Unit =
+    val closing: List[Repl[version]] = lock:
+      val all = registry.values.to[List]
+      registry = Map()
+      all
+
+    closing.each(_.close())
+
   // Serializes a `Reply` to BinTEL body bytes; a valid reply always type-assigns, so this is total.
   private def encode(reply: Repl.Reply): Data = unsafely(reply.bintel)
 
