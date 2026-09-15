@@ -39,7 +39,7 @@ object settings:
   // burdock externalizes a module only when the exact released jar bytes are on the launcher's
   // classpath, so a mismatch would silently fall back to inlining. Bump (and commit) per release;
   // etc/ci/release.sh refuses to release when this pin disagrees with its VERSION argument.
-  val flameVersion = sys.env.getOrElse("FLAME_VERSION", "0.1.2")
+  val flameVersion = sys.env.getOrElse("FLAME_VERSION", "0.1.3")
 
   // The Pyrocosm release the user interface is built on: the model (and its compiler-facing
   // exhibitions) in core, the terminal frontend in the client, the web frontend in web.
@@ -189,8 +189,7 @@ object settings:
     "harlequin-ansi",
     "coaxial-jvm",
     "burdock-core",              // externalize + the repackager
-    "burdock-boot",              // the Bootstrap class the repackager force-includes
-    "ziggurat-core")             // Xeq.dispatcher, for releases
+    "burdock-boot")              // the Bootstrap class the repackager force-includes
   . map(component)
 
   // The web front-end: an HTTP server (scintillate), WebSockets (perihelion), HTML (honeycomb)

@@ -37,8 +37,14 @@ flame.jar: assembly
 	cp out/flame/launcher/assembly.dest/out.jar flame.jar
 	java -cp flame.jar soundness.repackage --github propensive/flame,propensive/pyrocosm,propensive/soundness,propensive/proscala
 
-flame: flame.jar
-	java -Dbuild.executable=flame -jar flame.jar
+# Package the repackaged JAR as a native executable for this machine with the pinned `xeq` builder
+# script (fetched into dist/xeq and verified against etc/xeq.tsv).
+flame: flame.jar xeq-fetch
+	dist/xeq build --jar flame.jar --out flame
+
+# Fetch the pinned `xeq` builder script into dist/xeq.
+xeq-fetch:
+	./etc/ci/xeq-fetch.sh
 
 install: flame
 	cp flame ${HOME}/.local/bin/
@@ -75,4 +81,4 @@ sync-releases:
 dev:
 	./mill -w flame.client.compile
 
-.PHONY: sync-releases assembly release publishLocal run web test test-plain dev install
+.PHONY: xeq-fetch sync-releases assembly release publishLocal run web test test-plain dev install
