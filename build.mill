@@ -43,7 +43,7 @@ object settings:
   // inlining. Bump (and commit) per release; release-launcher.sh (in propensive/.github) refuses to
   // release when this pin disagrees with its VERSION argument. Snapshots override it through
   // `publishVersion` (below), never here.
-  val flameVersion = "0.1.3"
+  val flameVersion = "0.2.0"
 
   val scalaOptions = Seq(
     // The fork's opt-in behaviours, enabled by name, exactly as the Soundness build enables
