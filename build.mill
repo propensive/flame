@@ -31,23 +31,19 @@ object settings:
   // to use its `release/lib` jars directly (fork-developer mode).
   val scalaHome = sys.env.getOrElse("SOUNDNESS_SCALA_HOME", "")
 
-  val soundnessVersion = "0.66.0"
+  // The Soundness and Pyrocosm versions flame builds against (from `~/.ivy2/local`) are pinned
+  // in etc/refs and read by `deps`, below; every list here takes its version as a parameter.
+  // Pyrocosm supplies the model (and its compiler-facing exhibitions) to core, the terminal
+  // frontend to the client and the web frontend to web.
 
-  // The version flame's OWN library modules (`flame-core`, `flame-web`, `flame-client`) are
-  // released under, AND the version the `launcher` module resolves them at. Kept as a single value
-  // so the released coordinates and the launcher's dependency coordinates cannot drift apart:
-  // burdock externalizes a module only when the exact released jar bytes are on the launcher's
-  // classpath, so a mismatch would silently fall back to inlining. Bump (and commit) per release;
-  // release-launcher.sh (in propensive/.github) refuses to release when this pin disagrees with
-  // its VERSION argument.
-  val flameVersion = sys.env.getOrElse("FLAME_VERSION", "0.1.3")
-
-  // The Pyrocosm release the user interface is built on: the model (and its compiler-facing
-  // exhibitions) in core, the terminal frontend in the client, the web frontend in web.
-  // Resolved from `~/.ivy2/local` like the Soundness components: installed from Pyrocosm's
-  // GitHub Releases by the shared CI workflow's `extra_releases` input, or locally by
-  // Soundness's sync script pointed at Pyrocosm, or by `make publishLocal` there.
-  val pyrocosmVersion = "0.1.0"
+  // The version flame's OWN library modules are released under, AND the version the `launcher`
+  // module resolves them at. Kept as a single value so the released coordinates and the launcher's
+  // dependency coordinates cannot drift apart: burdock externalizes a module only when the exact
+  // released jar bytes are on the launcher's classpath, so a mismatch would silently fall back to
+  // inlining. Bump (and commit) per release; release-launcher.sh (in propensive/.github) refuses to
+  // release when this pin disagrees with its VERSION argument. Snapshots override it through
+  // `publishVersion` (below), never here.
+  val flameVersion = "0.1.3"
 
   val scalaOptions = Seq(
     // The fork's opt-in behaviours, enabled by name, exactly as the Soundness build enables
@@ -122,14 +118,14 @@ object settings:
   //
   // Each list names TOP-LEVEL components only: each jar's embedded POM names its own
   // dependencies, so the rest of the surface `import soundness.*` touches arrives transitively.
-  def component(name: String): Dep = mvn"dev.propensive:$name:$soundnessVersion"
+  def component(soundness: String)(name: String): Dep = mvn"dev.propensive:$name:$soundness"
 
   // The REPL session classpath. Everything `core` itself compiles against, and — because a
   // Flame user's `import soundness.*` can only reach what is on the session's compile+run
   // classpath — a curated set of the everyday Soundness libraries on top. There is no longer a
   // universal artifact to take instead, and the full set of ~280 components would be a very
   // large first-run download, so this list is deliberately a selection; extend it as needed.
-  val coreDeps = Seq(
+  def coreDeps(soundness: String) = Seq(
     // What flame's own `core` sources use:
     "anthology-scala",       // Scalac[3.9, …]: driving the compiler
     "hyperbole-core",        // /tasty: TASTy tree rendering
@@ -171,13 +167,13 @@ object settings:
     "wisteria-core", "jacinta-core", "xylophone-core", "caesura-core", "gastronomy-core",
     "guillotine-core", "telekinesis-jvm", "urticose-url", "honeycomb-core", "cataclysm-core",
     "probably-core", "escapade-io", "imperial-core", "serpentine-core")
-  . map(component)
+  . map(component(soundness))
 
-  val pyrocosmCoreDeps = Seq(
-    mvn"dev.propensive:pyrocosm-model:$pyrocosmVersion",
-    mvn"dev.propensive:pyrocosm-compiler:$pyrocosmVersion")
+  def pyrocosmCoreDeps(pyrocosm: String) = Seq(
+    mvn"dev.propensive:pyrocosm-model:$pyrocosm",
+    mvn"dev.propensive:pyrocosm-compiler:$pyrocosm")
 
-  val clientDeps = Seq(
+  def clientDeps(soundness: String) = Seq(
     "ethereal-core",             // the daemon
     "exoskeleton-completions",   // execute + tab-completion
     "profanity-core",            // the terminal and line editor
@@ -191,18 +187,18 @@ object settings:
     "coaxial-jvm",
     "burdock-core",              // externalize + the repackager
     "burdock-boot")              // the Bootstrap class the repackager force-includes
-  . map(component)
+  . map(component(soundness))
 
   // The web front-end: an HTTP server (scintillate), WebSockets (perihelion), HTML (honeycomb)
   // and the page `Archetype` (graffiti).
-  val webDeps = Seq(
+  def webDeps(soundness: String) = Seq(
     "scintillate-server", "perihelion-core", "honeycomb-core", "graffiti-core", "archimedes-core",
     "jacinta-core")
-  . map(component)
+  . map(component(soundness))
 
   // probably-events carries `probably.Streamer`, the BinTEL event stream fume drives a suite
   // through; without it fume falls back to a legacy run that no longer exists in 0.65.0.
-  val testDeps = Seq("probably-cli", "probably-events", "fulminate-core").map(component)
+  def testDeps(soundness: String) = Seq("probably-cli", "probably-events", "fulminate-core").map(component(soundness))
 
 // Exposes the fork compiler's `release/lib` jars (from a local build via `settings.scalaHome`, or
 // downloaded from the `settings.scalaRelease` GitHub release) as a Maven-layout repository,
@@ -358,6 +354,28 @@ trait Toolchain extends ScalaModule:
   override def scalaCompilerBridge: T[Option[PathRef]] = Task:
     Some(PathRef(toolchain.distribution().path / "scala3-sbt-bridge.jar"))
 
+
+// The propensive libraries this build depends on, pinned in etc/refs (the format, the
+// snapshot flow and the shared scripts are documented in propensive/.github): each is a release
+// `X.Y.Z`, or a snapshot `X.Y.Z-<12 hex>` of an unreleased upstream build, published there by
+// `make snapshot` and installed here — transitively — by `make sync-deps`, which the shared CI
+// workflow runs too. Read through a `Task.Source`, not a `val`: the Mill daemon evaluates the
+// build script once and keeps the module tree until build.mill itself changes, so a value read
+// at evaluation time would not see the file edited.
+object deps extends Module:
+  def file = Task.Source(mill.api.BuildCtx.workspaceRoot / "etc" / "refs")
+
+  def pins: T[Map[String, String]] = Task:
+    os.read.lines(file().path).map(_.trim).filter(line => line.nonEmpty && !line.startsWith("#"))
+      .map(_.split("\t").map(_.trim).filter(_.nonEmpty))
+      .map(columns => columns(0).stripPrefix("propensive/") -> columns(1)).toMap
+
+  def version(name: String): Task[String] = Task.Anon:
+    pins().getOrElse(name, sys.error(s"etc/refs has no pin for $name"))
+
+  def soundness: T[String] = Task(version("soundness")())
+  def pyrocosm: T[String] = Task(version("pyrocosm")())
+
 trait Project extends Module:
   def moduleDir = super.moduleDir / os.up / "src"
 
@@ -392,7 +410,13 @@ trait Component(dependencies: PublishModule*) extends Toolchain:
 // `Publishing` become POM `<dependency>` entries, so the published `flame-client` correctly
 // declares `flame-core`/`flame-web`.
 trait Publishing extends Toolchain, SonatypeCentralPublishModule:
-  def publishVersion = settings.flameVersion
+  // A `Task.Input` reading `Task.env`, not a plain value: `FLAME_RELEASE_VERSION` is how
+  // `make snapshot` (snapshot.sh in propensive/.github) drives the snapshot version through a
+  // Mill daemon that is already running — the daemon freezes `sys.env` at its own start, while
+  // `Task.env` is the environment of each `./mill` invocation. A release never sets it: the
+  // released version is `settings.flameVersion`, and the release script insists on it.
+  def publishVersion = Task.Input:
+    Task.env.get("FLAME_RELEASE_VERSION").filter(_.nonEmpty).getOrElse(settings.flameVersion)
   def artifactSuffix = Task("")
 
   def pomSettings = Task(PomSettings(
@@ -413,8 +437,9 @@ object flame extends Project:
   // The REPL engine. Depends on the Scala 3 compiler (it compiles user input) in addition to its
   // Soundness components. Released as `dev.propensive:flame-core`.
   object core extends Component(), Publishing:
-    def mvnDeps =
-      settings.coreDeps ++ settings.pyrocosmCoreDeps :+ mvn"org.scala-lang:scala3-compiler_3:${settings.scalaVersion}"
+    def mvnDeps = Task:
+      settings.coreDeps(deps.soundness()) ++ settings.pyrocosmCoreDeps(deps.pyrocosm())
+        :+ mvn"org.scala-lang:scala3-compiler_3:${settings.scalaVersion}"
 
     // frontier — `soundness.explainMissingContext`, the `@internal.diagnostic` catch-all given
     // that renders Soundness's missing-given advice — is a RUNTIME dependency only: it must be on
@@ -423,7 +448,7 @@ object flame extends Project:
     // OFF the compile classpath, where the catch-all satisfied tentative implicit searches —
     // `join`'s element type, `flatMap`'s reshaping — with `Any`; Soundness #1944 made the candidate
     // always fail, so that hazard is gone, but there is still no reason to compile against it.)
-    def runMvnDeps = Seq(settings.component("frontier-core"))
+    def runMvnDeps = Task(Seq(settings.component(deps.soundness())("frontier-core")))
 
   // The interactive client library (`flame.runClient` and its helpers). NO LONGER an assembled app:
   // the `@main`/`externalize` entry point moved to the `launcher` module, so this is a plain library
@@ -431,13 +456,15 @@ object flame extends Project:
   // `flame serve` can launch the web front-end in-process); those become `flame-core`/`flame-web`
   // POM dependencies, and the web front-end's Soundness deps come transitively.
   object client extends Component(core, web), Publishing:
-    def mvnDeps = settings.clientDeps :+ mvn"dev.propensive:pyrocosm-terminal:${settings.pyrocosmVersion}"
+    def mvnDeps = Task:
+      settings.clientDeps(deps.soundness()) :+ mvn"dev.propensive:pyrocosm-terminal:${deps.pyrocosm()}"
 
   // An alternative, web-based front-end (`flame.web`): serves a page and forwards REPL input/output
   // over a WebSocket, driving the same `core` engine as the CLI client. Published as
   // `dev.propensive:flame-web`; still assembled directly by `make web`, hence `finalMainClass`.
   object web extends Component(core), Publishing:
-    def mvnDeps = settings.webDeps :+ mvn"dev.propensive:pyrocosm-web:${settings.pyrocosmVersion}"
+    def mvnDeps = Task:
+      settings.webDeps(deps.soundness()) :+ mvn"dev.propensive:pyrocosm-web:${deps.pyrocosm()}"
     def finalMainClass = "flame.web"
     def prependShellScript = ""
 
@@ -456,9 +483,9 @@ object flame extends Project:
     // `frontier-core` is only a RUNTIME dependency of `core`, so it would be missing from this
     // module's compile classpath, which is what `externalize` hashes; the repackager would then
     // inline it rather than externalize it. Naming it here lets it be externalized like the rest.
-    def mvnDeps =
-      mvn"dev.propensive:flame-client:${settings.flameVersion}" +: settings.clientDeps
-      :+ settings.component("frontier-core")
+    def mvnDeps = Task:
+      mvn"dev.propensive:flame-client:${settings.flameVersion}" +: settings.clientDeps(deps.soundness())
+      :+ settings.component(deps.soundness())("frontier-core")
     def finalMainClass = "flame.repl"
     // A clean zip (no executable shell preamble) so the Burdock repackager can read and rewrite the
     // assembled JAR.
@@ -469,6 +496,47 @@ object flame extends Project:
   // .fume/config.tel) discovers it. `flame.runTests` is the plain-`java` fallback the shared CI
   // workflow uses, driving `Tests.invoke` in-process.
   object test extends Component(core):
-    def mvnDeps = settings.testDeps
-    def scalacPluginMvnDeps = Seq(mvn"dev.propensive:beneficence-plugin:${settings.soundnessVersion}")
+    def mvnDeps = Task(settings.testDeps(deps.soundness()))
+    def scalacPluginMvnDeps = Task(Seq(mvn"dev.propensive:beneficence-plugin:${deps.soundness()}"))
     def finalMainClass = "flame.runTests"
+
+// The release: the library modules' jars, each with its POM and ivy.xml embedded under
+// `META-INF/maven/<group>/<artifactId>/`, named `<artifactId>-<version>.jar`, exactly as the
+// Soundness and Pyrocosm builds stage theirs. A jar so staged is all a consumer needs: the shared
+// sync script (propensive/.github) reconstructs the ivy2 layout coursier resolves from, which is
+// how `make snapshot` publishes an unreleased build for a dependent repository to pin.
+object release extends Module:
+  def modules: Seq[PublishModule] = Seq(flame.core, flame.web, flame.client)
+
+  private def withDescriptors(source: os.Path, target: os.Path, entries: Seq[(String, os.Path)])
+  :   Unit =
+    val input = new java.util.zip.ZipFile(source.toIO)
+    val output = new java.util.zip.ZipOutputStream(new java.io.FileOutputStream(target.toIO))
+    try
+      val existing = input.entries()
+      while existing.hasMoreElements do
+        val entry = existing.nextElement()
+        output.putNextEntry(new java.util.zip.ZipEntry(entry.getName))
+        if !entry.isDirectory then input.getInputStream(entry).transferTo(output)
+        output.closeEntry()
+
+      for (name, file) <- entries do
+        output.putNextEntry(new java.util.zip.ZipEntry(name))
+        output.write(os.read.bytes(file))
+        output.closeEntry()
+    finally
+      output.close()
+      input.close()
+
+  def stage: T[Seq[PathRef]] = Task:
+    val jars: Seq[(PathRef, String, String, String, PathRef, PathRef)] =
+      Task.traverse(modules)(module =>
+        Task.Anon((module.jar(), module.pomSettings().organization, module.artifactId(),
+                   module.publishVersion(), module.pom(), module.ivy())))()
+
+    jars.map: (jar, group, artifactId, version, pom, ivy) =>
+      val target = Task.dest / s"$artifactId-$version.jar"
+      val prefix = s"META-INF/maven/$group/$artifactId"
+      val descriptors = Seq(s"$prefix/pom.xml" -> pom.path, s"$prefix/ivy.xml" -> ivy.path)
+      withDescriptors(jar.path, target, descriptors)
+      PathRef(target)

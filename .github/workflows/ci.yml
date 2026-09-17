@@ -2,7 +2,7 @@ name: CI
 
 # Build and test every pull request and every merge into main, via the shared Soundness-application
 # workflow — see propensive/.github for what it does and what it expects of this repository (the
-# ./mill wrapper, and the version pins in build.mill). The launcher resolves flame-core, flame-web and
+# ./mill wrapper, etc/shared, and the pins in etc/refs). The launcher resolves flame-core, flame-web and
 # flame-client as published coordinates, so all three are published locally first: `flame.__`
 # is Mill's wildcard, which resolves `publishLocal` to exactly the publishable modules (the
 # shell, not Mill, would expand a brace pattern, and Mill takes one target here).
@@ -22,6 +22,3 @@ jobs:
       assembly:      flame.launcher.assembly
       test_assembly: flame.test.assembly
       test_main:     flame.runTests
-      # The Pyrocosm release the interface is built on (`pyrocosmVersion` in build.mill), synced
-      # from its own GitHub Releases like the Soundness release.
-      extra_releases: propensive/pyrocosm=0.1.0
