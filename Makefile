@@ -61,12 +61,12 @@ web:
 
 # Compile and run the test suite with fume, which discovers the suite from the assembly named in
 # .fume/config.tel (relative to this directory). Extra selection terms go in TESTS, e.g.
-# `make test TESTS='tag:repl'`. `make test-plain` is the fume-less fallback the shared CI workflow
-# uses: `flame.runTests` (src/test/flame_test_main.scala) drives `Tests.invoke` in-process, since
+# `make test TESTS='tag:repl'`. CI runs the same command (the shared workflow installs the fume
+# pinned in etc/tools). `make test-plain` is a fume-less fallback: `flame.runTests` (src/test/flame_test_main.scala) drives `Tests.invoke` in-process, since
 # a probably `Suite` has had no `main` of its own since Soundness 0.65.0.
 test:
 	./mill flame.test.assembly
-	fume run $(TESTS)
+	fume run -c out/flame/test/assembly.dest/out.jar $(TESTS)
 
 test-plain:
 	./mill flame.test.assembly
