@@ -87,12 +87,12 @@ object Workspace:
   // not end the search.
   def locate(directory: Text): Optional[Path on Linux] =
     safely:
-      def recur(dir: Path on Linux): Optional[Path on Linux] =
-        val candidate =
-          dir / Name[Linux](t".pyrocosm") / Name[Linux](t"flame") / Name[Linux](t"config.tel")
-        if candidate.existent() then candidate else dir.parent.let(recur(_))
+      val start: Path on Linux = directory.as[Path on Linux]
 
-      recur(directory.as[Path on Linux])
+      (start :: start.ancestors)
+      . map { dir => dir / Name[Linux](t".pyrocosm") / Name[Linux](t"flame") / Name[Linux](t"config.tel") }
+      . filter(_.existent())
+      . prim
 
   // The prompt-history configuration governing `directory`: the `history` FILE (only when a
   // `.pyrocosm/flame` directory already exists at or above `directory` — flame never creates it),
@@ -105,11 +105,13 @@ object Workspace:
   // exist yet; the DIRECTORY must (its presence is how a project opts into history persistence).
   def historyPath(directory: Text): Optional[Text] =
     safely:
-      def recur(dir: Path on Linux): Optional[Path on Linux] =
-        val candidate = dir / Name[Linux](t".pyrocosm") / Name[Linux](t"flame")
-        if candidate.existent() then candidate else dir.parent.let(recur(_))
+      val start: Path on Linux = directory.as[Path on Linux]
 
-      recur(directory.as[Path on Linux]).let { dir => (dir / Name[Linux](t"history")).encode }
+      (start :: start.ancestors)
+      . map { dir => dir / Name[Linux](t".pyrocosm") / Name[Linux](t"flame") }
+      . filter(_.existent())
+      . prim
+      . let { dir => (dir / Name[Linux](t"history")).encode }
 
   // The history configuration for `directory`, combining the resolved file path with the config's
   // entry limit (default 100).

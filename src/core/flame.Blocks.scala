@@ -96,7 +96,7 @@ object Blocks:
       current = Nil
 
     tokens.each: (token: Repl.Token) =>
-      token.text.cut(t"\n").each: ordinal ?=>
+      token.text.lines.each: ordinal ?=>
         part =>
           if ordinal != Prim then
             flush()
@@ -129,7 +129,7 @@ object Blocks:
     def gap(text: Text): Unit =
       val shown: Text = if ansi then text else SemanticRender.stripAnsi(text)
       if shown.trim != t"" then
-        val lines: List[Text] = shown.cut(t"\n").skip(_ == t"", Rtl)
+        val lines: List[Text] = shown.lines.skip(_ == t"", Rtl)
 
         blocks =
           Block.Code
@@ -138,8 +138,8 @@ object Blocks:
           :: blocks
 
     spans.each: (span: Repl.OutputSpan) =>
-      if span.start > at then gap(plain.skip(at).keep(span.start - at))
-      blocks = Block.Output(plain.skip(span.start).keep(span.length), error = span.stream == Repl.stderrStream) :: blocks
+      if span.start > at then gap(plain.segment(at.z till span.start.z))
+      blocks = Block.Output(plain.segment(span.start.z till (span.start + span.length).z), error = span.stream == Repl.stderrStream) :: blocks
       at = span.start + span.length
 
     if at < plain.length then gap(plain.skip(at))

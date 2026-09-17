@@ -72,7 +72,7 @@ object ReplInterface:
   private def lastBreak(text: Text): Optional[Ordinal] = text.pinpoint(_ == '\n', bidi = Rtl)
 
   private def blankLastLine(text: Text): Boolean =
-    lastBreak(text).lay(false) { newline => text.skip(newline.n0 + 1).trim == t"" }
+    lastBreak(text).lay(false) { newline => text.skip(newline.n0 + 1).blank }
 
   private def stripTrailingBlank(text: Text): Text =
     if blankLastLine(text) then lastBreak(text).lay(text)(newline => text.keep(newline.n0)) else text
@@ -483,7 +483,7 @@ class ReplInterface(engine: Engine, options: ReplInterface.Options)(using Monito
               engine.send(Repl.Request.Quit(_))
               options.leave()
             else note(t"A page cannot stop the server; close the tab to leave the session")
-          else if text == t"/session" || text.starts(t"/session ") then switchTo(text.skip(t"/session".length).trim)
+          else if text == t"/session" || text.starts(t"/session ") then switchTo(text.chomp(t"/session").trim)
           else if text.starts(t"/") && !Repl.isCommand(text) then
             append(Block.Group(List(Blocks.code(Blocks.command(text)), Block.Notice(Tone.Warning, Unset, List(Block.paragraph(Repl.messages.unknownCommand(text)))))))
           else if naturalLanguage(text) then

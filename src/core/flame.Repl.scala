@@ -105,7 +105,7 @@ object Repl:
         val historyImports = history.map: (statement: Text) =>
           t"  $statement"
 
-        val body = code.cut(t"\n").map: (line: Text) =>
+        val body = code.lines.map: (line: Text) =>
           t"  $line"
 
         // The re-injected imports go at file scope — outside the wrapper object — so the
@@ -215,7 +215,7 @@ object Repl:
   // The captured runs of a tagged `output` as (stream, text) pairs — for streaming a chunk.
   def streamChunks(tagged: Text): List[(Text, Text)] =
     val (plain, spans) = segments(tagged)
-    spans.map { span => (span.stream, plain.skip(span.start).keep(span.length)) }
+    spans.map { span => (span.stream, plain.segment(span.start.z till (span.start + span.length).z)) }
 
   given outputSpanDecodable: OutputSpan is Tel.Decodable =
     import strategies.throwUnsafely
@@ -318,7 +318,7 @@ object Repl:
           while start < length do
             var end: Int = start
             while end < length && level(end) == level(start) do end += 1
-            val piece: Text = text.skip(start).keep(end - start)
+            val piece: Text = text.segment(start.z till end.z)
 
             val mark: Optional[Text] = level(start) match
               case 2 => errorMark
@@ -565,7 +565,7 @@ object Repl:
   // last line opens: after `unsafely:` alone, a same-indent line is a syntax error). Parser only,
   // so it is cheap enough to run on every keystroke; `Repl#scopeAt` typechecks the result.
   def scopeProbe(code: Text): Optional[Text] =
-    val lines: List[Text] = code.cut(t"\n")
+    val lines: List[Text] = code.lines
 
     // A brace-, parenthesis- or bracket-delimited scope (`xs.map { x =>`) is still open at the end
     // of the line, so the marker is followed by the closers, innermost first, that would complete
@@ -704,7 +704,7 @@ object Repl:
           while i < code.length && (char(i).letter || char(i) == '\'' || char(i) == '’')
           do i += 1
 
-          words = (code.skip(start).keep(i - start), sepClean) :: words
+          words = (code.segment(start.z till i.z), sepClean) :: words
           sepClean = true
         else
           if ch == '"' then     // skip a string literal: its content is not the user's own prose
@@ -801,7 +801,7 @@ object Repl:
   // everything of one or two words — is `Code`, preserving the REPL's existing behaviour; a
   // `/`-command or a leading space (the escape hatch for a misclassified line) is always `Code`.
   def classify(code: Text): Verdict =
-    if code.trim == t"" || code.starts(t"/") then Verdict.Code else
+    if code.blank || code.starts(t"/") then Verdict.Code else
       val (prose, codeish, strong) = lexicalScores(code)
       val outcome                  = probe(code)
 
@@ -875,36 +875,14 @@ object Repl:
       completions.items.filter(_.kind != prophesy.Completion.Kind.Keyword).map: item =>
         CompletionItem(item.name, item.kind.toString.tt, item.signature.text(using imports))
 
+  // Completion's cursor analysis — `memberBase`, `infixBase` and the identifier and
+  // expression scans beneath them — lives in `harlequin.Fragment`, which is called directly.
+  // These two remain only because `Fragment`'s equivalents are private to it (Soundness #1990);
+  // they are the last of flame's copies, and go when harlequin exposes its own.
   private def identifierChar(char: Char): Boolean = char.isLetterOrDigit || char == '_'
 
-  // The offset at which the partial identifier ending at `offset` begins.
-  private def identifierStart(code: Text, offset: Int): Int =
-    var start: Int = offset
-    while start > 0 && code.at(Ordinal.zerary(start - 1)).lay(false)(identifierChar) do start -= 1
-    start
-
-  // Splits `code` at the cursor into the member-selection base — everything up to and
-  // including the `.` immediately before the partial member name — and that partial. A
-  // `Unset` base means the cursor is not selecting a member (a first-token identifier, the
-  // first segment of an import, …), so there is no fixed type to enumerate and cache against.
-  def memberBase(code: Text, offset: Int): (Optional[Text], Text) =
-    val start:  Int  = identifierStart(code, offset)
-    val prefix: Text = code.keep(offset).skip(start)
-
-    if start > 0 && code.at(Ordinal.zerary(start - 1)).lay(false)(_ == '.') then (code.keep(start), prefix)
-    else (Unset, prefix)
-
-  // Keywords that make a following identifier a NAME/TYPE/PATH rather than a value, so it is not
-  // an infix receiver (`val x`, `def f`, `import p`, `case P`, `new T`, …).
-  private val infixExcluded: Set[Text] =
-    Set(t"val", t"var", t"def", t"type", t"class", t"object", t"trait", t"enum", t"given",
-        t"package", t"import", t"export", t"case", t"extension", t"new")
-
-  private val valueAccents: Set[Text] = Set(t"term", t"number", t"string", t"typal")
-
-  // Every Scala 3 keyword, hard and soft. Harlequin's lexer tags SOFT keywords (`inline`,
-  // `transparent`, `opaque`, `open`, `using`, `extension`, …) as identifiers — as Scala does —
-  // so they'd otherwise pass as infix receivers; this set excludes them (and the hard keywords).
+  // Every Scala 3 keyword, hard and soft — needed to reject a keyword as a fresh binding name
+  // (`freeName`, `freeBindingName`) and to recognise one in a definition header.
   private val allKeywords: Set[Text] =
     Set(t"abstract", t"case", t"catch", t"class", t"def", t"do", t"else", t"enum", t"export",
         t"extends", t"false", t"final", t"finally", t"for", t"given", t"if", t"implicit",
@@ -913,13 +891,6 @@ object Repl:
         t"trait", t"true", t"try", t"type", t"val", t"var", t"while", t"with", t"yield",
         t"as", t"derives", t"end", t"extension", t"infix", t"inline", t"opaque", t"open",
         t"transparent", t"using")
-
-  // Harlequin's lexer tags a symbolic operator (`+`, `::`, `<=`, …) as an identifier, just as
-  // Scala treats it, and a closing bracket as a symbol — so accent alone can't tell an operator
-  // (after which an expression is expected) from a value. `symbolic` (all non-word, non-space
-  // characters) distinguishes them by text.
-  private def symbolic(text: Text): Boolean =
-    text.length > 0 && text.all { char => !identifierChar(char) && !char.whitespace }
 
   // Keyword completion (the Scala compiler offers none), via Soundness's prophesy engine:
   // `harlequin.Lexis.context` extracts the partial identifier at the cursor and the reversed
@@ -940,68 +911,6 @@ object Repl:
       || found.expectation == prophesy.KeywordPattern.Expectation.TypeBinding
 
     (items, binding)
-
-  // The infix-completion receiver: when the cursor is at `<value-expr> <space> <partial>` — a
-  // value followed by whitespace, not a member selection — returns that value expression with a
-  // synthetic trailing `.` (so it reuses the member-completion path) and the partial method
-  // name. `Unset` when there is no value receiver (the token before the space is a keyword,
-  // operator, comma, or open bracket, or a name/type/path in a definition/import position).
-  def infixBase(code: Text, offset: Int): (Optional[Text], Text) =
-    val s = code.s
-    val start: Int = identifierStart(code, offset)
-    val prefix: Text = code.keep(offset).skip(start)
-
-    // Require whitespace immediately before the partial (the space between receiver and method).
-    if start == 0 || !s.charAt(start - 1).isWhitespace then (Unset, prefix) else
-      val before: Text = code.keep(start)
-      val sig: List[Token] =
-        tokenize(before).filter { tok => tok.accent != t"unparsed" && tok.text.trim != t"" }
-
-      sig.last.lay((Unset: Optional[Text], prefix)): last =>
-        val text = last.text
-        val closeBracket = text == t")" || text == t"]" || text == t"}"
-
-        // A value receiver: an identifier/literal (not a symbolic operator) or a closing bracket,
-        // and NOT a keyword — including a soft keyword (`inline`, `transparent`, …) the lexer tags
-        // as an identifier, which introduces a definition rather than being an infix receiver.
-        val valueEnding =
-          !allKeywords.has(text)
-          && (closeBracket || text == t"_" || (valueAccents.has(last.accent) && !symbolic(text)))
-
-        if !valueEnding then (Unset, prefix) else
-          // Strip the trailing whitespace, find where the value expression begins, and reject it
-          // if it is a bare name/path introduced by a definition/import/`new` keyword.
-          var end = start
-          while end > 0 && code.at(Ordinal.zerary(end - 1)).lay(false)(_.whitespace) do end -= 1
-          val baseStart = expressionStart(code.keep(end))
-          val base: Text = code.keep(end).skip(baseStart)
-
-          val preceding: Text =
-            tokenize(code.keep(baseStart))
-            . filter { tok => tok.accent != t"unparsed" && tok.text.trim != t"" }
-            . last.let(_.text).or(t"")
-
-          if infixExcluded.has(preceding) then (Unset, prefix) else (t"$base.", prefix)
-
-  // The character index where the value expression ending at the last character of `s` begins:
-  // scans back over identifiers, `.`, and balanced bracket groups, stopping at an operator, a
-  // space, or a boundary at depth 0.
-  private def expressionStart(s: Text): Int =
-    val str = s.s
-    var i = str.length - 1
-    var depth = 0
-    var scanning = true
-
-    while i >= 0 && scanning do
-      val c = str.charAt(i)
-      if c == ')' || c == ']' || c == '}' then { depth += 1; i -= 1 }
-      else if c == '(' || c == '[' || c == '{' then
-        if depth == 0 then { i += 1; scanning = false } else { depth -= 1; i -= 1 }
-      else if depth > 0 then i -= 1
-      else if identifierChar(c) || c == '.' then i -= 1
-      else { i += 1; scanning = false }
-
-    if i < 0 then 0 else i
 
   // Which command a setting is toggled through: `/set` for compiler options (diagnostics, the syntax
   // mode, the `experimental` master switch), `/language` for `import language.*` features.
@@ -1424,7 +1333,7 @@ object Repl:
 
     // The number of top-level (comma-separated) parameters in one clause's contents.
     def params(clause: Text): Int =
-      if clause.trim == t"" then 0 else
+      if clause.blank then 0 else
         val (commas, _) = clause.fuse((0, 0)):
           val (commas, depth) = state
 
@@ -2217,9 +2126,9 @@ class Repl[version <: Scalac.Versions]
     // whatever the first line of `code` has in front of the first line of `origin`. A `code` that
     // does not embed `origin` that way (a probe) yields no positions.
     val typed: Text = origin.or(code)
-    val userLines: Int = typed.cut(t"\n").size
-    val firstCode: Text = code.cut(t"\n").prim.or(t"")
-    val firstUser: Text = typed.cut(t"\n").prim.or(t"")
+    val userLines: Int = typed.lines.size
+    val firstCode: Text = code.lines.prim.or(t"")
+    val firstUser: Text = typed.lines.prim.or(t"")
 
     val prefix: Optional[Int] =
       if firstCode.ends(firstUser) then firstCode.length - firstUser.length else Unset
@@ -2330,8 +2239,8 @@ class Repl[version <: Scalac.Versions]
   // is a SEQUENCE of imports: its comma-separated clauses are split into one `import` each, so
   // the session tracks (and confirms, lists, and un-imports) them individually.
   private def importsIn(line: Text): List[Text] =
-    line.cut(t"\n").flatMap(_.cut(t";")).map(_.trim).filter(_.starts(t"import ")).flatMap: statement =>
-      importClauses(statement.skip(t"import ".length)).map { clause => t"import $clause" }
+    line.lines.flatMap(_.cut(t";")).map(_.trim).filter(_.starts(t"import ")).flatMap: statement =>
+      importClauses(statement.chomp(t"import ")).map { clause => t"import $clause" }
 
   // Splits an import clause-list on its top-level commas — those outside any `{…}` selector group
   // (or `[…]`/`(…)`), which are separators between clauses, not within one — trimming each clause
@@ -2668,9 +2577,7 @@ class Repl[version <: Scalac.Versions]
 
   // The tokens of an import statement after the `import` keyword — the form the user sees and
   // names when removing it. `importKey` canonicalises for matching (whitespace ignored).
-  private def importClause(statement: Text): Text =
-    val trimmed = statement.trim
-    if trimmed.starts(t"import ") then trimmed.skip(t"import ".length).trim else trimmed
+  private def importClause(statement: Text): Text = statement.trim.chomp(t"import ").trim
 
   private def importKey(text: Text): Text = importClause(text).filter(!_.whitespace)
 
@@ -2929,12 +2836,12 @@ class Repl[version <: Scalac.Versions]
         completionCache = completionCache.define(base, items)
         items
 
-    Repl.memberBase(code, offset) match
+    harlequin.Fragment.memberBase(code, offset) match
       case (base: Text, prefix) =>
         mutex(members(base)).filter(_.name.starts(prefix))
 
       case _ =>
-        Repl.infixBase(code, offset) match
+        harlequin.Fragment.infixBase(code, offset) match
           // A value followed by a space: offer the receiver's methods (usable infix) plus the
           // `match` keyword (only ever offered here, i.e. after a trailing space).
           case (base: Text, prefix) =>
