@@ -21,4 +21,3 @@ jobs:
       publish_local: flame.__
       assembly:      flame.launcher.assembly
       test_assembly: flame.test.assembly
-      test_main:     flame.runTests
