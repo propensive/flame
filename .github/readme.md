@@ -50,8 +50,8 @@ release and cached under `~/.cache/soundness/proscala`.
 
 ## Dependencies
 
-Soundness is released as per-component jars on GitHub Releases, each embedding its own POM. Run
-`make sync-releases VERSION=0.64.0` in a Soundness checkout to install a release into
+Soundness and Pyrocosm are released as per-component jars on GitHub Releases, each embedding its
+own POM. The versions are pinned in `etc/refs`; `make sync-deps` installs them into
 `~/.ivy2/local`, from which the build resolves the `dev.propensive:<library>-<component>`
 coordinates named in `build.mill`. Flame's `core` module (and so the REPL session classpath) takes
 a curated set of components: everything flame's own sources use, plus the everyday Soundness

@@ -72,13 +72,29 @@ test-plain:
 	./mill flame.test.assembly
 	java -cp out/flame/test/assembly.dest/out.jar flame.runTests
 
-# Install the pinned pyrocosm release into the local ivy repository, as CI does, so a local build
-# resolves the released jars rather than whatever a pyrocosm checkout's `publishLocal` last
-# installed: the pinned version, or `VERSION=X.Y.Z`. Soundness itself is left alone.
-sync-releases:
-	./etc/shared sync-releases.sh propensive/pyrocosm pyrocosmVersion $(VERSION)
+# Install every library pinned in etc/refs — releases and snapshots alike, transitively —
+# into the local ivy repository, as CI does, so the build resolves exactly the pinned jars rather
+# than whatever a sibling checkout's `publishLocal` last installed under the same version. A
+# snapshot not yet on GitHub is built from the sibling checkout named by the pin's commit.
+sync-deps:
+	./etc/shared sync-deps.sh
+
+# Install the commands pinned in etc/tools (fume) through their releases' installers.
+tools:
+	./etc/shared tools.sh
+
+# Publish HEAD's libraries as a snapshot — a `snapshot-<hex>` pre-release named by the filtered
+# tree of the commit, at version `<flameVersion>-<hex>` — for a dependent repository to pin in
+# its etc/refs before the next release. `LOCAL=1` stages and installs without publishing.
+# The last line printed is the pin. See snapshot.sh in propensive/.github.
+snapshot:
+	./etc/shared snapshot.sh flame "$$(sed -n 's/.*val flameVersion = "\(.*\)".*/\1/p' build.mill)"
+
+# Delete snapshot pre-releases older than DAYS (default 60) days.
+snapshot-prune:
+	./etc/shared snapshot-prune.sh flame $(DAYS)
 
 dev:
 	./mill -w flame.client.compile
 
-.PHONY: xeq-fetch sync-releases assembly release publishLocal run web test test-plain dev install
+.PHONY: xeq-fetch sync-deps tools snapshot snapshot-prune assembly release publishLocal run web test test-plain dev install
