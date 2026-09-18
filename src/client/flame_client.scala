@@ -43,10 +43,8 @@ import dysasymptotics.linearSize
 
 import escapade.Faint
 import escapade.Italic
-import escapade.Underline
 import termcapDefinitions.xtermTrueColorTermcap
 import textMetrics.wideCharacterWidthMetric
-import iridescence.WebColors
 // `soundness.*` also re-exports an unrelated `Signal` (embarcadero's workload-grant signal), so the
 // POSIX terminal signal type (whose `.Int` is SIGINT) is named explicitly to resolve the clash. It
 // is `profanity.Interrupt` as of Soundness 0.64 (`Signal` was its former name).
@@ -59,30 +57,66 @@ import filesystemBackends.javaBaseFilesystem
 import filesystemOptions.createNonexistentParents
 import filesystemOptions.deleteOnlyEmpty
 import filesystemOptions.failOnPreexisting
-import harlequin.Accent
 // `border` is the one ultimatum layout combinator the `soundness` umbrella does not re-export —
 // `panel`, `stack`, `strip`, `layout` and `paint` all are — so it is named directly from its own
 // package rather than reached through the umbrella.
 import pyrocosm.TerminalFrontend
+// `soundness.*` also exports an unrelated `Tool` (anthology's, since flame's classpath has the
+// compiler driver), so Pyrocosm's tool descriptor is named explicitly: an explicit import beats
+// the wildcard. Its extension methods (`standard`, `version`, `repoFile`, …) are top-level in the
+// `pyrocosm` package, so each is imported by name where it is used.
+import pyrocosm.Tool
 import pathInterfaces.pathOnLinux
 import internetAccess.online
 import interpreters.posixInterpreter
 import logging.silentLogging
 import probates.cancelProbate
 import socketBackends.javaBaseSockets
-import supervisors.globalSupervisor
 import systems.javaBaseSystem
 import temporaryDirectories.systemTemporaryDirectory
 import threading.platformThreading
 
 val Serve = Subcommand("serve", "serve the Flame web front-end")
-val Install = Subcommand("install", "install tab-completions into the shell")
 val Listen = Subcommand("listen", "serve the terminal REPL over TCP, for remote clients")
 val Port = Flag[Int]("port", false, List('p'), "a TCP port — the web front-end, or a remote REPL server")
 val Host = Flag[Text]("host", false, List('H'), "connect to a flame REPL server running on this host")
 val Join = Flag[Text]("join", false, List('j'), "join an existing REPL session by name")
 val Create = Flag[Text]("create", false, List('c'), "create a new REPL session with the given name")
 val Basic = Flag[Unit]("basic", false, Nil, "run a minimal, in-process, synchronous line-based REPL")
+
+// Flame as Pyrocosm's `Tool`: the name of the command and of its configuration directories
+// (`.pyrocosm/flame/config.tel` in a project, `~/.config/flame/config.tel` for the user), the
+// prose that opens its manpage, and the web front-end the daemon can keep serving. `Flame.standard`
+// (in `runClient`) gives flame the subcommands every Pyrocosm tool shares — `about`, `install`,
+// `quit` and `--version` — ahead of flame's own dispatch. Capitalised because `flame` is the package.
+val Flame: Tool =
+  Tool
+    ( t"flame",
+      prose = t"Flame is the REPL for the Soundness ecosystem: an interactive, live-highlighted "
+            + t"Scala 3 read-eval-print loop. It runs in the terminal against a per-project "
+            + t"session server, or in a browser through its web front-end.",
+      web   = FlameWeb )
+
+// The web REPL as the daemon serves it, at most once, when a `config.tel` in the cascade says
+// `serve` (on its `port`, or 8080): `serve` blocks in `serveHttp` until `stop` — from a later
+// `flame quit` invocation, on another thread — fulfils the promise it waits on. This is the same
+// server `flame serve` runs interactively (`httpServe`), minus the terminal and its Ctrl+C.
+object FlameWeb extends Tool.Web:
+  def port: Int = 8080
+
+  // The promise a running server waits on, so that `stop` can reach it from another invocation.
+  // A `Promise` holds no capability; vouched untracked so the field can be assigned from `serve`.
+  @caps.unsafe.untrackedCaptures
+  @volatile
+  private var quitting: Optional[Promise[Unit]] = Unset
+
+  def serve(port: Int)(using Monitor, Probate): Unit =
+    given Classloader = serverClassloader
+    val quit: Promise[Unit] = Promise()
+    quitting = quit
+    serveHttp(port, quit)
+
+  def stop(): Unit = quitting.let(_.offer(()))
 
 // One flag per `/set`/`/language` setting, so every setting is enabled by name —
 // `flame --experimental --captureChecking`. Derived from the single list in `Repl.settings`, so the
@@ -209,8 +243,6 @@ private def sessionIntent
 // a socket that refuses is skipped. A short timeout keeps a wedged server from stalling the shell.
 private def liveSessionNames(): List[Text] =
   def ask(path: Text): List[Text] =
-    import strategies.throwUnsafely
-
     connectDomain(DomainSocket(path)): duplex =>
       duplex.send(zephyrine.Stream(LengthPrefix.encode(SocketEngine.encode(Repl.Request.SessionList(0)))))
 
@@ -236,94 +268,97 @@ val defaultPort: Int = 4319
 // alone in the `launcher` module (`src/launcher/flame_launcher.scala`), which depends on this module
 // (and `core`/`web`) as PUBLISHED Maven artifacts — so `externalize` records their Central jar hashes
 // and the repackager turns them into on-demand `Burdock-Require` downloads instead of inlining them.
+//
+// `Flame.standard` handles the standard subcommands (`about`, `install`, `quit`) and `--version`
+// first, launches the web front-end once per daemon if a `config.tel` asks for it, and falls
+// through to flame's own dispatch otherwise. The `Configurator` it provides serves `Setting`s,
+// which flame does not use: its configuration is read whole, as `Workspace.Config`, below.
 def runClient(): Unit =
   cli:
-    // The project's `.pyrocosm/flame/config.tel`, resolved from the INVOCATION's working directory
-    // (each daemon client has its own), never the daemon process's. Its startup settings, classpath
-    // and connection defaults are folded into every launch below.
-    val workspace: Workspace.Config = Workspace.config(summon[Cli].workingDirectory.directory())
+    Flame.standard:
+      // The project's `.pyrocosm/flame/config.tel`, resolved from the INVOCATION's working
+      // directory (each daemon client has its own), never the daemon process's. Its startup
+      // settings, classpath and connection defaults are folded into every launch below.
+      val workspace: Workspace.Config = Workspace.config(summon[Cli].workingDirectory.directory())
 
-    // The prompt-history file and entry limit for this project (see `flame.History`): resolved from
-    // the same invocation working directory, and Unset (no persistence) unless a `.pyrocosm/flame`
-    // directory exists at or above it.
-    val history: Workspace.HistoryConfig =
-      Workspace.historyConfig(summon[Cli].workingDirectory.directory())
+      // The prompt-history file and entry limit for this project (see `flame.History`): resolved
+      // from the same invocation working directory, and Unset (no persistence) unless a
+      // `.pyrocosm/flame` directory exists at or above it.
+      val history: Workspace.HistoryConfig =
+        Workspace.historyConfig(summon[Cli].workingDirectory.directory())
 
-    // This invocation's directory and environment, reported to the session (see `ReplContext`).
-    val context: ClientContext =
-      ClientContext(summon[Cli].workingDirectory.directory(), environmentPairs(summon[Cli].environment))
+      // This invocation's directory and environment, reported to the session (see `ReplContext`).
+      val context: ClientContext =
+        ClientContext(summon[Cli].workingDirectory.directory(), environmentPairs(summon[Cli].environment))
 
-    arguments match
-      // `flame -<flag>…` — the terminal REPL with options: `-s NAME` joins a session, `--host HOST`
-      // (with optional `--port`) connects to a remote server (`flame listen`), and the settings flags
-      // enable settings on startup. This case fires only when the first token is a FLAG (`head` begins
-      // with `-`), which cannot be a subcommand.
-      //
-      // It is matched FIRST so that, when the word being completed is a flag, the subcommand patterns
-      // below are never evaluated. Matching a `Subcommand` also SUGGESTS it, and a suggestion at the
-      // cursor takes precedence over the flag list (`Completion`'s `cursorSuggestions` wins over
-      // `flagSuggestions`) — so trying the subcommands first left `flame --exp<TAB>` offering
-      // `serve`/`listen`/`install` and no flags at all. Ordering costs nothing at run time: a
-      // subcommand never begins with `-`, so no invocation changes meaning.
-      case Argument(head) :: _ if head.starts(t"-") =>
-        // EVERY flag this command accepts is read here, unconditionally and before any `command`,
-        // so that all of them register and are offered together for `flame --<TAB>`. Reading them
-        // lazily — at the point each is needed — would register only those on the branch actually
-        // taken, and reading them inside `command` would register none of them at all.
-        val settings: List[Text]     = startupCommands(flaggedSettings, workspace)
-        val basic:    Boolean        = Basic().present
-        val host:     Optional[Text] = Host().value.or(workspace.host)
-        val port:     Int            = Port().value.or(workspace.port).or(defaultPort)
-        // Both flags are read (registering them, and `--join`'s completion) before any branch.
-        val intent:   SessionIntent  = sessionIntent(arguments, joinFlag(), Create(), workspace)
+      arguments match
+        // `flame -<flag>…` — the terminal REPL with options: `-s NAME` joins a session, `--host HOST`
+        // (with optional `--port`) connects to a remote server (`flame listen`), and the settings flags
+        // enable settings on startup. This case fires only when the first token is a FLAG (`head` begins
+        // with `-`), which cannot be a subcommand.
+        //
+        // It is matched FIRST so that, when the word being completed is a flag, the subcommand patterns
+        // below are never evaluated. Matching a `Subcommand` also SUGGESTS it, and a suggestion at the
+        // cursor takes precedence over the flag list (`Completion`'s `cursorSuggestions` wins over
+        // `flagSuggestions`) — so trying the subcommands first left `flame --exp<TAB>` offering
+        // `serve`/`listen`/`install` and no flags at all. Ordering costs nothing at run time: a
+        // subcommand never begins with `-`, so no invocation changes meaning.
+        case Argument(head) :: _ if head.starts(t"-") =>
+          // EVERY flag this command accepts is read here, unconditionally and before any `command`,
+          // so that all of them register and are offered together for `flame --<TAB>`. Reading them
+          // lazily — at the point each is needed — would register only those on the branch actually
+          // taken, and reading them inside `command` would register none of them at all.
+          val settings: List[Text]     = startupCommands(flaggedSettings, workspace)
+          val basic:    Boolean        = Basic().present
+          val host:     Optional[Text] = Host().value.or(workspace.host)
+          val port:     Int            = Port().value.or(workspace.port).or(defaultPort)
+          // Both flags are read (registering them, and `--join`'s completion) before any branch.
+          val intent:   SessionIntent  = sessionIntent(arguments, joinFlag(), Create(), workspace)
 
-        // `flame --basic` — a minimal, self-contained, in-process synchronous REPL (no socket
-        // server, no TUI). Checked before `--host`, so it never falls through to a remote/socket
-        // connection; it still honours the startup settings. `--join`/`--create` do not apply to
-        // its single in-process session, so they are simply ignored here.
-        if basic then command(basicRepl(settings))
-        else intent match
-          case SessionIntent.Invalid(message) => command(sessionArgError(message))
-          case intent => host match
-            case host: Text => command(connectRemote(host, port, intent, settings, history, context))
-            case _          => command(connectSocket(intent, settings, history, context))
+          // `flame --basic` — a minimal, self-contained, in-process synchronous REPL (no socket
+          // server, no TUI). Checked before `--host`, so it never falls through to a remote/socket
+          // connection; it still honours the startup settings. `--join`/`--create` do not apply to
+          // its single in-process session, so they are simply ignored here.
+          if basic then command(basicRepl(settings))
+          else intent match
+            case SessionIntent.Invalid(message) => command(sessionArgError(message))
+            case intent => host match
+              case host: Text => command(connectRemote(host, port, intent, settings, history, context))
+              case _          => command(connectSocket(intent, settings, history, context))
 
-      // `flame serve [--port N | -p N]` — the web front-end (default port 8080). `Port()` registers
-      // the flag (so it is offered in tab-completion) and reads its value; the pure `Int`
-      // interpreter above yields `Unset` for an absent or non-numeric value, so `.or(8080)` falls back.
-      //
-      // The read is OUTSIDE `command`: in completion mode `execute` returns without running its
-      // block at all, so a flag read within it would never register and never be suggested.
-      case Serve() :: _ =>
-        val port: Int = Port().value.or(workspace.port).or(8080)
-        command(httpServe(port))
+        // `flame serve [--port N | -p N]` — the web front-end, interactively (default port
+        // `FlameWeb.port`). `Port()` registers the flag (so it is offered in tab-completion) and reads
+        // its value; the pure `Int` interpreter above yields `Unset` for an absent or non-numeric
+        // value, so `.or(FlameWeb.port)` falls back.
+        //
+        // The read is OUTSIDE `command`: in completion mode `execute` returns without running its
+        // block at all, so a flag read within it would never register and never be suggested.
+        case Serve() :: _ =>
+          val port: Int = Port().value.or(workspace.port).or(FlameWeb.port)
+          command(httpServe(port))
 
-      // `flame install` — install this command's tab-completions into the user's shell.
-      case Install() :: _ =>
-        command(installCompletions())
+        // `flame listen [--port N | -p N]` — a REPL server bound to a TCP port (not a per-process UNIX
+        // socket), so a `flame --host` client on another machine can reach its sessions. Defaults to
+        // `defaultPort`; a non-numeric `--port` also falls back to it.
+        case Listen() :: _ =>
+          val port: Int = Port().value.or(workspace.port).or(defaultPort)
+          command(serve(port))
 
-      // `flame listen [--port N | -p N]` — a REPL server bound to a TCP port (not a per-process UNIX
-      // socket), so a `flame --host` client on another machine can reach its sessions. Defaults to
-      // `defaultPort`; a non-numeric `--port` also falls back to it.
-      case Listen() :: _ =>
-        val port: Int = Port().value.or(workspace.port).or(defaultPort)
-        command(serve(port))
+        // Internal: the per-process UNIX-socket REPL server that `connectSocket`/`launchServer`
+        // spawns in the background (see `launchServer`). Not a user-facing command — `serve` now
+        // serves the web front-end — so it uses a distinct argument the launcher passes itself.
+        case Argument("serve-socket") :: Nil =>
+          command(serveSocket())
 
-      // Internal: the per-process UNIX-socket REPL server that `connectSocket`/`launchServer`
-      // spawns in the background (see `launchServer`). Not a user-facing command — `serve` now
-      // serves the web front-end — so it uses a distinct argument the launcher passes itself.
-      case Argument("serve-socket") :: Nil =>
-        command(serveSocket())
+        // `flame` — the terminal REPL (connects to, or starts, a background socket server). Bare `flame`
+        // starts a new session, with whatever the workspace's `config.tel` asks for.
+        case Nil =>
+          sessionIntent(Nil, Join(), Create(), workspace) match
+            case SessionIntent.Invalid(message) => command(sessionArgError(message))
+            case intent => command(connectSocket(intent, startupCommands(Nil, workspace), history, context))
 
-      // `flame` — the terminal REPL (connects to, or starts, a background socket server). Bare `flame`
-      // starts a new session, with whatever the workspace's `config.tel` asks for.
-      case Nil =>
-        sessionIntent(Nil, Join(), Create(), workspace) match
-          case SessionIntent.Invalid(message) => command(sessionArgError(message))
-          case intent => command(connectSocket(intent, startupCommands(Nil, workspace), history, context))
-
-      case _ =>
-        command(Exit.Fail(1))
+        case _ =>
+          command(Exit.Fail(1))
 
 // Runs a REPL server on the given TCP port and blocks until interrupted.
 private def serve(portNumber: Int)(using Stdio, Monitor, Probate, System): Exit =
@@ -390,11 +425,6 @@ private def basicRepl(settings: List[Text])(using Stdio, Monitor, Probate, Syste
       prompt(if buffer == t"" then t"> " else t"| ")
 
       Optional(reader.readLine()) match
-        case Unset =>
-          // EOF (Ctrl+D or a closed pipe): end the session on a fresh line.
-          Out.println()
-          running = false
-
         case line: String =>
           val text: Text = line.tt
 
@@ -414,6 +444,11 @@ private def basicRepl(settings: List[Text])(using Stdio, Monitor, Probate, Syste
             if !command && Repl.incomplete(code) then buffer = code else
               buffer = t""
               submit(code)
+
+        // `readLine` answers `null` at EOF (Ctrl+D or a closed pipe): end the session on a fresh line.
+        case _ =>
+          Out.println()
+          running = false
 
   Exit.Ok
 
@@ -455,31 +490,6 @@ private def httpServe(portNumber: Int)
 
   serveHttp(portNumber, quit)
   Exit.Ok
-
-// Installs this command's shell tab-completions (`flame install`) — the zsh/bash/fish completion
-// script that calls `flame '{completions}' …`, driven by the subcommand/flag tree the CLI registers
-// (`Serve`/`Install`/`WebPort`). Exoskeleton's `Completions.ensure` does the write (the same call the
-// built-in `{admin} install` uses); it needs an `Entrypoint`, which the ambient Ethereal
-// `DaemonService` supplies (it extends `Entrypoint`). `force` installs even when `flame` is not yet
-// on the `PATH`, so a freshly-built binary can set completions up before it is installed as a command.
-private def installCompletions()(using stdio: Stdio, service: DaemonService[?])(using erased Effectful)
-:   Exit =
-
-  import errorDiagnostics.stackTracesDiagnostics
-  import workingDirectories.javaBaseWorkingDirectory
-
-  // The `DaemonService` (which extends `Entrypoint`) carries the daemon's tracked capabilities; seal
-  // it to the pure `Entrypoint` the completions installer wants — it outlives this one call.
-  given Entrypoint = caps.unsafe.unsafeAssumePure(service)
-
-  recover:
-    case error: exoskeleton.Install.Error =>
-      Out.println(t"Could not install tab-completions")
-      Exit.Fail(8)
-
-  . protect:
-      Completions.ensure(force = true).each(Out.println(_))
-      Exit.Ok
 
 // The directory holding per-process REPL sockets, and this process's socket file.
 // UNIX domain sockets are a Unix-only feature, so the directory follows

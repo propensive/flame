@@ -35,7 +35,7 @@ package flame
 import soundness.*
 
 import filesystemBackends.javaBaseFilesystem
-import pathInterfaces.pathOnLinux
+// The `Tool` extensions that find and parse `.pyrocosm/flame/config.tel` (see `Flame`).
 
 // The per-project configuration: a `.pyrocosm/flame/config.tel` file in the invocation's working
 // directory or the nearest ancestor holding one — resolved upwards exactly like `.git` (and exactly
@@ -60,9 +60,12 @@ import pathInterfaces.pathOnLinux
 // `set`, `language` and `classpath` are ADDITIVE with the flags (a flag and a line naming the same
 // setting enable it once); `port`, `host`, `join` and `create` are defaults a flag overrides (and
 // naming both a `join` and a `create` is an error, exactly as passing both flags is). A file that
-// fails to parse is treated as absent — `flame` never requires one to exist — and, since `flame`
-// runs as a daemon, a parsed file is cached against its modification time and size, so an edit is
-// honoured by the very next launch.
+// fails to parse is treated as absent — `flame` never requires one to exist.
+//
+// The file is found and parsed by Pyrocosm's `Tool` (`Flame.repoFile`/`repoConfig`), which also
+// reads a bare `serve` from it (or from the user's `~/.config/flame/config.tel`) to keep the web
+// REPL running in the daemon on `port`; since `flame` runs as a daemon, `Tool` caches a parsed file
+// against its modification time and size, so an edit is honoured by the very next launch.
 object Workspace:
   case class Config
     ( sets:      List[Text] = Nil,
@@ -76,24 +79,6 @@ object Workspace:
 
   val empty: Config = Config()
 
-  private case class Cached(modified: Long, size: Long, config: Optional[Tel])
-
-  // An atomic cell holding an immutable map: an entry is installed whole, so a reader sees either
-  // the previous configuration or the reloaded one, never a half-built entry.
-  private val cache: Atomic.Ref[Map[Text, Cached]] = Atomic.Ref(Map())
-
-  // The nearest `.pyrocosm/flame/config.tel` at or above `directory`, or `Unset` if no ancestor
-  // has one. The FILE is what is sought: a `.pyrocosm` holding only other tools' directories does
-  // not end the search.
-  def locate(directory: Text): Optional[Path on Linux] =
-    safely:
-      val start: Path on Linux = directory.as[Path on Linux]
-
-      (start :: start.ancestors)
-      . map { dir => dir / Name[Linux](t".pyrocosm") / Name[Linux](t"flame") / Name[Linux](t"config.tel") }
-      . filter(_.existent())
-      . prim
-
   // The prompt-history configuration governing `directory`: the `history` FILE (only when a
   // `.pyrocosm/flame` directory already exists at or above `directory` — flame never creates it),
   // and the entry `limit` (the config's `history` value, or 100). `flame` appends to and loads from
@@ -101,8 +86,9 @@ object Workspace:
   case class HistoryConfig(file: Optional[Text], limit: Int)
 
   // The `.pyrocosm/flame/history` path if a `.pyrocosm/flame` directory exists at or above
-  // `directory`, resolved upwards exactly as `locate` finds `config.tel`. The FILE itself need not
-  // exist yet; the DIRECTORY must (its presence is how a project opts into history persistence).
+  // `directory`, resolved upwards exactly as `Flame.repoFile` finds `config.tel` — but for the
+  // DIRECTORY, which is a different thing: the history FILE need not exist yet, and the directory
+  // need hold no `config.tel` (its presence alone is how a project opts into history persistence).
   def historyPath(directory: Text): Optional[Text] =
     safely:
       val start: Path on Linux = directory.as[Path on Linux]
@@ -118,48 +104,27 @@ object Workspace:
   def historyConfig(directory: Text): HistoryConfig =
     HistoryConfig(historyPath(directory), config(directory).history.or(100))
 
-  // Two separately-scoped `safely` regions (the filesystem read, then the TEL parse), as fume's
-  // reader does: one region's tactic would be captured by both the path reader and the TEL
-  // aggregator, which separation checking rejects.
-  private def parse(file: Path on Linux): Optional[Tel] =
-    safely(file.read[Data]).let { data => safely(data.read[Tel]) }
-
-  // The parsed document at `file`, stat-checked on every call.
-  private def document(file: Path on Linux): Optional[Tel] =
-      safely(summon[FilesystemBackend on Linux].stat(file, true)).let: stat =>
-        val key: Text = file.encode
-
-        def reload(): Optional[Tel] =
-          val parsed: Optional[Tel] = parse(file)
-          cache.revise(_.define(key, Cached(stat.modified, stat.size, parsed)))
-          parsed
-
-        // A cached entry whose file is unchanged answers even when its config is `Unset` (an
-        // unreadable or unparseable file), so a bad file is not re-read on every lookup.
-        cache().at(key).lay(reload()): cached =>
-          if cached.modified == stat.modified && cached.size == stat.size then cached.config
-          else reload()
-
   // The configuration governing `directory`: `empty` when there is no (readable) file. Relative
   // `classpath` entries are made absolute here — against the project root, three levels above the
   // file (`<root>/.pyrocosm/flame/config.tel`) — since the REPL server that `/classload`s them is a
   // background daemon with a working directory of its own.
   def config(directory: Text): Config =
-    locate(directory).let { file => document(file).let((file, _)) }.lay(empty): (file, tel) =>
-      val root: Text = file.parent.let(_.parent).let(_.parent).let(_.encode).or(directory)
+    Flame.repoFile(directory).let { file => Flame.repoConfig(directory).let((file, _)) }.lay(empty):
+      (file, tel) =>
+        val root: Text = file.parent.let(_.parent).let(_.parent).let(_.encode).or(directory)
 
-      def atoms(keyword: Text): List[Text] =
-        tel.fields(keyword).to[List].map(_.primaryAtom).filter(_ != t"")
+        def atoms(keyword: Text): List[Text] =
+          tel.fields(keyword).to[List].map(_.primaryAtom).filter(_ != t"")
 
-      def absolute(entry: Text): Text =
-        if entry.starts(t"/") then entry else t"$root/$entry"
+        def absolute(entry: Text): Text =
+          if entry.starts(t"/") then entry else t"$root/$entry"
 
-      Config
-       ( sets      = atoms(t"set"),
-         languages = atoms(t"language"),
-         classpath = atoms(t"classpath").map(absolute),
-         port      = atoms(t"port").prim.let { (text: Text) => safely(text.as[Int]) },
-         host      = atoms(t"host").prim,
-         join      = atoms(t"join").prim,
-         create    = atoms(t"create").prim,
-         history   = atoms(t"history").prim.let { (text: Text) => safely(text.as[Int]) } )
+        Config
+         ( sets      = atoms(t"set"),
+           languages = atoms(t"language"),
+           classpath = atoms(t"classpath").map(absolute),
+           port      = atoms(t"port").prim.let { (text: Text) => safely(text.as[Int]) },
+           host      = atoms(t"host").prim,
+           join      = atoms(t"join").prim,
+           create    = atoms(t"create").prim,
+           history   = atoms(t"history").prim.let { (text: Text) => safely(text.as[Int]) } )
