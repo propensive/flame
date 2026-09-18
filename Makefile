@@ -13,7 +13,7 @@ assembly: publishLocal
 # indexed — the repackaged `flame` executables, added to the same release. See release-launcher.sh
 # in propensive/.github (run through etc/shared) for the two-step ordering and its verification.
 release:
-	./etc/shared release-launcher.sh flame "flame-core flame-web flame-client" $(VERSION)
+	FLAME_RELEASE_VERSION=$(VERSION) ./etc/shared release-launcher.sh flame "flame-core flame-web flame-client" $(VERSION)
 
 # Publish the libraries to the local ~/.ivy2 (the launcher resolves them from there; burdock will
 # NOT externalize a locally-published copy unless its bytes match a release asset).
@@ -60,7 +60,7 @@ web:
 	java -jar out/flame/web/assembly.dest/out.jar
 
 # Compile and run the test suite with fume, which discovers the suite from the assembly named in
-# .fume/config.tel (relative to this directory). Extra selection terms go in TESTS, e.g.
+# .pyrocosm/fume/config.tel (relative to this directory). Extra selection terms go in TESTS, e.g.
 # `make test TESTS='tag:repl'`. CI runs the same command (the shared workflow installs the fume
 # pinned in etc/tools). `make test-plain` is a fume-less fallback: `flame.runTests` (src/test/flame_test_main.scala) drives `Tests.invoke` in-process, since
 # a probably `Suite` has had no `main` of its own since Soundness 0.65.0.

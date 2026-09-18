@@ -17,6 +17,33 @@ per-platform executables (including `flame-windows-x64.exe`), the `flame` polygl
 script, and the library jars. The first run fetches flame's externalized dependencies; later runs
 start instantly.
 
+## The standard command line
+
+Flame is a [Pyrocosm](https://github.com/propensive/pyrocosm) tool, so it shares the command line
+every Pyrocosm tool has, alongside its own `serve` and `listen`:
+
+```sh
+flame about       # flame's version, its executable, the daemon's pid and uptime, and its config files
+flame install     # install shell tab-completions and the manpage (--force overwrites the manpage)
+flame quit        # stop the background daemon, and the web REPL if it is serving one
+flame --version   # (or -v) just the version
+```
+
+Flame reads two [TEL](https://soundness.dev/) files: the project's `.pyrocosm/flame/config.tel`,
+found by walking up from the working directory as `.git` is found, and the user's
+`~/.config/flame/config.tel` (under `$XDG_CONFIG_HOME` if set), the project's taking priority. Both
+accept the keywords documented in `src/client/flame.Workspace.scala` (`set`, `language`,
+`classpath`, `port`, `host`, `join`, `create`, `history`), and two more that Pyrocosm reads: a bare
+`serve` keeps the web REPL running in the daemon, on `port` (8080 by default), for as long as the
+daemon lives — so it is simply there, without a `flame serve` ever being run — and `flame quit`
+brings it down. A user file that does just that:
+
+```
+tel 1.0
+port 8192
+serve
+```
+
 ## Modules
 
 `core`, `web` and `client` are released to GitHub Releases under `dev.propensive` (as

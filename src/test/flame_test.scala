@@ -40,7 +40,7 @@ import pyrocosm.{Block, Event, Inline, Token, Tone}
 
 
 import classloaders.threadContextClassloader
-import dysasymptotics.{linearSize, linearAccess}
+import dysasymptotics.linearSize
 import internetAccess.online
 import socketBackends.javaBaseSockets
 import filesystemBackends.javaBaseFilesystem
@@ -1029,9 +1029,12 @@ object Tests extends Suite(m"Flame Tests"):
         Repl.settings.filter(_.name == t"jsr45").map(_.kind)
       . assert(_ == List(Repl.Kind.Set))
 
+      // `version` and `force` are the standard flags `Flame.standard` (pyrocosm-cli) reads ahead of
+      // flame's own, so a setting of either name would be shadowed by them.
       test(m"no setting name collides with an existing flag"):
         Repl.settings.map(_.name).filter: name =>
-          Set(t"port", t"host", t"session", t"set", t"language", t"basic").has(name)
+          Set(t"port", t"host", t"session", t"set", t"language", t"basic", t"version", t"force")
+          . has(name)
       . assert(_ == List())
 
     suite(m"Exhibiting replies"):
