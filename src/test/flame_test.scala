@@ -1262,6 +1262,71 @@ object Tests extends Suite(m"Flame Tests"):
           && requests.prim.lay(false) { case Repl.Request.Tokenize(_, t"val x = (") => true; case _ => false }
           && decoration.incomplete && decoration.tokens.exists(_.text == t"val")
 
+      // Whether the prompt marker is shown in the tone.
+      def toned(prompt: List[Inline], tone: Tone): Boolean =
+        prompt.exists { case Inline.Toned(`tone`, _) => true; case _ => false }
+
+      test(m"a settled entry echoes its line past the prompt marker's width"):
+        isolated:
+          val (engine, interface) = fresh()
+          interface.handle(Event.Submitted(interface.field.input, t"1 + 1"))
+          val id = engine.submissions.prim.let(_.id).or(0)
+          val blocks = blocksOf(t"res0: Int = 2")
+          engine.answer(id, Repl.Reply.Ran(id, Unset, t"", Unset, Unset, t"", Nil, Nil, blocks))
+          interface.transcript()
+
+      . assert: entries =>
+          def indented(block: Block): Boolean = block match
+            case Block.Code(_, lines, _) => lines.prim.lay(false)(_.tokens.prim.lay(false)(_.text == t"  "))
+            case _                       => false
+
+          entries.exists { case Block.Group(content) => content.exists(indented); case _ => false }
+
+      test(m"an import's confirmation is a notice of the clause"):
+        isolated:
+          val (engine, interface) = fresh()
+          interface.handle(Event.Submitted(interface.field.input, t"import scala.collection.mutable.*"))
+          val id = engine.submissions.prim.let(_.id).or(0)
+          val output = Repl.messages.imported(t"scala.collection.mutable.*")
+          engine.answer(id, Repl.Reply.Ran(id, Unset, t"$output\n", Unset, Unset, t"", Nil, Nil))
+          interface.transcript()
+
+      . assert: entries =>
+          val notices: List[Block] = entries.bind:
+            case Block.Group(content) => content.filter { case Block.Notice(Tone.Muted, _, _) => true; case _ => false }
+            case _                    => Nil
+
+          notices.size == 1 && texts(notices) == t"imported scala.collection.mutable.*"
+
+      test(m"the prompt marker takes the accent tone while the line reads as Scala"):
+        isolated:
+          val (engine, interface) = fresh()
+          val initial = interface.field.decoration().prompt
+          interface.handle(Event.Edited(interface.field.input, t"val x = 1", 9))
+          (initial, interface.field.decoration().prompt)
+
+      . assert: (initial, edited) =>
+          initial == edited && toned(initial, Tone.Accent)
+
+      test(m"the prompt marker takes the info tone once the line reads as natural language"):
+        isolated:
+          val (engine, interface) = fresh()
+          interface.handle(Event.Edited(interface.field.input, t"what is the type of x", 21))
+          interface.field.decoration().prompt
+
+      . assert(toned(_, Tone.Info))
+
+      test(m"a submission clears the decoration but keeps the prompt marker"):
+        isolated:
+          val (engine, interface) = fresh()
+          interface.handle(Event.Edited(interface.field.input, t"what is the type of x", 21))
+          interface.handle(Event.Edited(interface.field.input, t"", 0))
+          interface.handle(Event.Submitted(interface.field.input, t"what is the type of x"))
+          interface.field.decoration()
+
+      . assert: decoration =>
+          decoration.tokens.nil && decoration.detail.nil && toned(decoration.prompt, Tone.Accent)
+
       test(m"a multi-line entry submits only after a blank line"):
         isolated:
           val (engine, interface) = fresh()
