@@ -69,6 +69,14 @@ object ReplInterface:
 
   private def muted(text: Text): Inline = Inline.Toned(Tone.Muted, Inline.text(text))
 
+  // The marker before the user's text: the Powerline triangle (U+E0B0), in the accent tone while
+  // the line reads as Scala, and in the info tone once it reads as natural language.
+  private def prompt(prose: Boolean): List[Inline] =
+    List(Inline.Toned(if prose then Tone.Info else Tone.Accent, Inline.text(t"\ue0b0 ")))
+
+  // The columns the marker takes: a completed line is echoed past them, so it does not move.
+  private def promptWidth: Int = Inline.plain(prompt(false)).length
+
   private def lastBreak(text: Text): Optional[Ordinal] = text.pinpoint(_ == '\n', bidi = Rtl)
 
   private def blankLastLine(text: Text): Boolean =
@@ -86,6 +94,7 @@ class ReplInterface(engine: Engine, options: ReplInterface.Options)(using Monito
   val field: Control.Field =
     Control.Field
       ( Input(t"repl"), Control.Field.Kind.Code(Language.Scala),
+        decoration = pyrocosm.Live(Control.Field.Decoration(prompt = prompt(false))),
         notification = Control.Field.Notify.Keystrokes,
         history = pyrocosm.Live(options.history) )
 
@@ -247,7 +256,7 @@ class ReplInterface(engine: Engine, options: ReplInterface.Options)(using Monito
       case Repl.Reply.Crashed(_, _, highlight, _)            => highlight
       case _                                                 => tokens(text)
 
-    Blocks.code(highlight)
+    Blocks.indented(Blocks.code(highlight), promptWidth)
 
   private def tokens(text: Text): List[Repl.Token] =
     if text.starts(t"/") then Blocks.command(text) else Repl.tokenize(text)
@@ -342,7 +351,11 @@ class ReplInterface(engine: Engine, options: ReplInterface.Options)(using Monito
         && text.skip(completedFor.length).all { c => c.alphanumeric || c == '_' }
 
     val kept: List[Control.Field.Completion] = if extending then field.decoration().completions else Nil
-    field.decoration() = Control.Field.Decoration(tokens(text).map(Blocks.token), kept, incomplete, detail + scopeRow)
+
+    field.decoration() =
+      Control.Field.Decoration
+        ( tokens(text).map(Blocks.token), kept, incomplete, detail + scopeRow,
+          prompt = prompt(prose) )
 
     if text != t"" then
       engine.request(Repl.Request.Tokenize(_, text)): reply =>
@@ -454,6 +467,22 @@ class ReplInterface(engine: Engine, options: ReplInterface.Options)(using Monito
 
           case _ => ()
 
+  // A command flame does not know, echoed past the marker, with the refusal beneath it.
+  private def unknownCommand(text: Text): Block =
+    val echo: Block = Blocks.indented(Blocks.code(Blocks.command(text)), promptWidth)
+    val refusal: Text = Repl.messages.unknownCommand(text)
+    Block.Group(List(echo, Block.Notice(Tone.Warning, Unset, List(Block.paragraph(refusal)))))
+
+  // A line that reads as natural language, echoed past the marker, with the explanation beneath.
+  private def naturalLanguageEntry(text: Text): Block =
+    val echo: Block = Block.paragraph(t"${t" "*promptWidth}$text")
+
+    val explanation: Text =
+      t"This reads as natural language, which flame cannot answer yet. " +
+        t"To evaluate it as Scala, insert a space before it."
+
+    Block.Group(List(echo, Block.Paragraph(List(muted(explanation)))))
+
   private def remember(text: Text): Unit =
     field.history.amend { history => (history :+ text).keep(options.historyLimit, Rtl) }
     options.persist(text)
@@ -471,7 +500,7 @@ class ReplInterface(engine: Engine, options: ReplInterface.Options)(using Monito
       case Event.Submitted(_, submitted) =>
         val text = stripTrailingBlank(submitted)
         scopeRow = Nil
-        field.decoration() = Control.Field.Decoration()
+        field.decoration() = Control.Field.Decoration(prompt = prompt(false))
 
         if text.trim != t"" then
           if field.history().last != text then remember(text)
@@ -484,10 +513,8 @@ class ReplInterface(engine: Engine, options: ReplInterface.Options)(using Monito
               options.leave()
             else note(t"A page cannot stop the server; close the tab to leave the session")
           else if text == t"/session" || text.starts(t"/session ") then switchTo(text.chomp(t"/session").trim)
-          else if text.starts(t"/") && !Repl.isCommand(text) then
-            append(Block.Group(List(Blocks.code(Blocks.command(text)), Block.Notice(Tone.Warning, Unset, List(Block.paragraph(Repl.messages.unknownCommand(text)))))))
-          else if naturalLanguage(text) then
-            append(Block.Group(List(Block.paragraph(text), Block.Paragraph(List(muted(t"This reads as natural language, which flame cannot answer yet. To evaluate it as Scala, insert a space before it."))))))
+          else if text.starts(t"/") && !Repl.isCommand(text) then append(unknownCommand(text))
+          else if naturalLanguage(text) then append(naturalLanguageEntry(text))
           else submit(text)
 
       case Event.Pressed(action) =>
