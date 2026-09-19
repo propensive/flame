@@ -213,41 +213,6 @@ private def restApi(apiSessions: Sessions[3.9])(request: Http.Request)(using Mon
 
     case _ => Unset
 
-// Flame's web theme: the same Zed colours as the terminal's (see `FlameColours`).
-object FlameWebTheme extends pyrocosm.WebTheme:
-  import anticipation.Chroma
-  def background: Chroma = Chroma(FlameColours.background)
-  def surface: Chroma = Chroma(FlameColours.margin)
-  def foreground: Chroma = Chroma(FlameColours.foreground)
-  def muted: Chroma = Chroma(FlameColours.subdued)
-  def border: Chroma = Chroma(FlameColours.subdued)
-  def key: Chroma = Chroma(FlameColours.parameter)
-  def reference: Chroma = Chroma(FlameColours.term)
-  def figure: Chroma = Chroma(FlameColours.number)
-  def units: Chroma = Chroma(FlameColours.comment)
-  def link: Chroma = Chroma(FlameColours.string)
-  def selection: Chroma = Chroma(FlameColours.selection)
-
-  def tone(tone: pyrocosm.Tone): Chroma = tone match
-    case pyrocosm.Tone.Success => Chroma(FlameColours.tpe)
-    case pyrocosm.Tone.Failure => Chroma(FlameColours.error)
-    case pyrocosm.Tone.Warning => Chroma(FlameColours.parameter)
-    case pyrocosm.Tone.Muted   => Chroma(FlameColours.comment)
-    case pyrocosm.Tone.Accent  => Chroma(FlameColours.term)
-    case pyrocosm.Tone.Info    => Chroma(FlameColours.string)
-
-  def accent(accent: pyrocosm.Token.Accent): Chroma = accent match
-    case pyrocosm.Token.Accent.Keyword  => Chroma(FlameColours.keyword)
-    case pyrocosm.Token.Accent.Modifier => Chroma(FlameColours.keyword)
-    case pyrocosm.Token.Accent.Command  => Chroma(FlameColours.keyword)
-    case pyrocosm.Token.Accent.String   => Chroma(FlameColours.string)
-    case pyrocosm.Token.Accent.Number   => Chroma(FlameColours.number)
-    case pyrocosm.Token.Accent.Term     => Chroma(FlameColours.term)
-    case pyrocosm.Token.Accent.Typal    => Chroma(FlameColours.tpe)
-    case pyrocosm.Token.Accent.Symbol   => Chroma(FlameColours.symbol)
-    case pyrocosm.Token.Accent.Parens   => Chroma(FlameColours.operator)
-    case pyrocosm.Token.Accent.Error    => Chroma(FlameColours.error)
-    case pyrocosm.Token.Accent.Unparsed => Chroma(FlameColours.foreground)
 
 // Serves the web REPL on `port`: the REPL interface on Pyrocosm's web frontend, a session per
 // page, with the REST API answering what the frontend does not. The embedded engine's compile
@@ -270,7 +235,7 @@ def serveHttp(port: Int, quit: Promise[Unit])(using Monitor, System, Probate, Cl
   val apiSessions = Sessions(Repl.Rendering.Inspect)
 
   val frontend: pyrocosm.WebFrontend =
-    caps.unsafe.unsafeAssumePure(pyrocosm.WebFrontend(port, FlameWebTheme, { (request: Http.Request) => restApi(apiSessions)(request) }))
+    caps.unsafe.unsafeAssumePure(pyrocosm.WebFrontend(port, fallback = { (request: Http.Request) => restApi(apiSessions)(request) }))
 
   async:
     frontend.serve: () =>
