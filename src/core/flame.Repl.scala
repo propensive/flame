@@ -1104,6 +1104,13 @@ object Repl:
 
     def unknownCommand(line: Text): Text = t"Unknown command: $line"
 
+    // An import's confirmation, one per clause, as the engine's message after the run's output;
+    // a front-end recognises it by `importedClause` to show it as a notice.
+    def imported(clause: Text): Text = t"imported $clause"
+
+    def importedClause(line: Text): Optional[Text] =
+      if line.starts(t"imported ") then line.skip(t"imported ".length) else Unset
+
     val serverRestarted: Text =
       t"The server restarted — your previous session (definitions, imports and settings) was lost"
 
@@ -2440,8 +2447,10 @@ class Repl[version <: Scalac.Versions]
             imports = (imports + introduced).distinct
 
             if introduced.nil then deferred else
-              val confirmed: Text =
-                introduced.map { (each: Text) => t"Imported ${importClause(each)}" }.join(t"", t"\n", t"\n")
+              val confirmations: List[Text] = introduced.map: (each: Text) =>
+                Repl.messages.imported(importClause(each))
+
+              val confirmed: Text = confirmations.join(t"", t"\n", t"\n")
 
               mapRan(deferred) { ran => ran.copy(output = t"${ran.output}$confirmed") }
 

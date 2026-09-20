@@ -47,7 +47,7 @@ import vacuous.*
 
 import hieroglyph.charEncoders.utf8Encoder
 
-import pyrocosm.{Block, Inline, Language, Token}
+import pyrocosm.{Block, Inline, Language, Token, Tone}
 import pyrocosm.exhibit
 
 // The REPL's replies as Pyrocosm's semantic blocks: tokens with their marks as code with
@@ -115,6 +115,24 @@ object Blocks:
     flush()
     Block.Code(Language.Scala, lines.reverse, notes.reverse)
 
+  // The code shifted right by `columns`: a run of spaces before every line, and its notes moved
+  // with it. A transcript entry keeps the column its line was typed at, past the prompt marker.
+  def indented(code: Block.Code, columns: Int): Block.Code =
+    val space: Token = Token.plain(t" "*columns)
+    val lines: List[Block.Line] = code.lines.map { (line: Block.Line) => Block.Line(space :: line.tokens) }
+
+    val notes: List[Block.Note] = code.notes.map: (note: Block.Note) =>
+      note.copy(start = note.start + columns, end = note.end + columns)
+
+    Block.Code(code.language, lines, notes)
+
+  // An import's confirmation, `imported foo.*`: the word as an information message, the clause
+  // as code, behind a neutral band.
+  def imported(clause: Text): Block =
+    val word: Inline = Inline.Emphasis(List(Inline.Toned(Tone.Info, Inline.text(t"imported"))))
+    val code: Inline = Inline.Code(Language.Scala, Repl.tokenize(clause).map(token))
+    Block.Notice(Tone.Muted, Unset, List(Block.Paragraph(List(word, Inline.Textual(t" "), code))))
+
   // The marks alone, as notes by line, for a field's decoration.
   def marks(tokens: List[Repl.Token]): List[Block.Note] = code(tokens).notes
 
@@ -125,17 +143,31 @@ object Blocks:
     var blocks: List[Block] = Nil
     var at: Int = 0
 
-    // A message ends in a newline, which is not a line of its own.
+    // A message ends in a newline, which is not a line of its own. An import's confirmation is
+    // a notice of its own; the lines between are preformatted text.
     def gap(text: Text): Unit =
       val shown: Text = if ansi then text else SemanticRender.stripAnsi(text)
+
       if shown.trim != t"" then
         val lines: List[Text] = shown.lines.skip(_ == t"", Rtl)
+        var plain: List[Text] = Nil  // the preformatted lines in hand, in reverse
 
-        blocks =
-          Block.Code
-           ( Language.Plain,
-             lines.map { (line: Text) => Block.Line(if line == t"" then Nil else List(Token.plain(line))) } )
-          :: blocks
+        def flushPlain(): Unit =
+          if !plain.nil then
+            val shown: List[Block.Line] = plain.reverse.map: (line: Text) =>
+              Block.Line(if line == t"" then Nil else List(Token.plain(line)))
+
+            blocks = Block.Code(Language.Plain, shown) :: blocks
+            plain = Nil
+
+        lines.each: (line: Text) =>
+          val clause: Optional[Text] = Repl.messages.importedClause(line)
+
+          if clause.absent then plain = line :: plain else clause.let: (clause: Text) =>
+            flushPlain()
+            blocks = imported(clause) :: blocks
+
+        flushPlain()
 
     spans.each: (span: Repl.OutputSpan) =>
       if span.start > at then gap(plain.segment(at.z till span.start.z))

@@ -86,31 +86,51 @@ object Wire:
 // Every `Repl` and `Sessions` a test makes, registered as it is made (`Opened(Opened(Repl()))`) so that
 // `isolated` can close it when the test's block ends. Each keeps a warm compiler alive until it is
 // closed (see `Repl#close`), so a suite that merely dropped them would exhaust any heap.
+//
+// Each block registers against a deque OF ITS OWN, not one global stack indexed by depth: test
+// blocks run on several threads at once (a `probably` worker, fume's event stream), so a
+// depth-based scheme let one block close a `Repl` another block was still using — closing it
+// retires its scope inspector (see `Repl#close`), whose executor then REJECTS the inspection
+// already on its way, which `ScopeInspector#inspect` reports as an empty scope. The deque is
+// inherited by the threads a block spawns, so a `Repl` opened off-thread still belongs to the
+// block that opened it.
 object Opened:
-  private val opened: java.util.ArrayDeque[Repl[?] | Sessions[?]] = java.util.ArrayDeque()
+  private type Closeable = Repl[?] | Sessions[?]
 
-  def apply[value <: Repl[?] | Sessions[?]](value: value): value =
+  private val current: InheritableThreadLocal[java.util.ArrayDeque[Closeable]] =
+    new InheritableThreadLocal[java.util.ArrayDeque[Closeable]]:
+      override def initialValue(): java.util.ArrayDeque[Closeable] = java.util.ArrayDeque()
+
+  def apply[value <: Closeable](value: value): value =
+    val opened = current.get.nn
     opened.synchronized(opened.push(value))
     value
 
-  def depth: Int = opened.synchronized(opened.size)
+  // Runs `block` against a registry of its own, closing everything the block opened — newest
+  // first — once it has finished, and restoring the enclosing block's registry.
+  def closing[result](block: => result): result =
+    val enclosing = current.get.nn
+    val opened = java.util.ArrayDeque[Closeable]()
+    current.set(opened)
 
-  // Closes, newest first, everything opened since `depth` was read.
-  def closeTo(depth: Int): Unit =
-    val next: Optional[Repl[?] | Sessions[?]] =
-      opened.synchronized(if opened.size > depth then Optional(opened.pop()) else Unset)
+    try block finally
+      current.set(enclosing)
+      closeAll(opened)
+
+  private def closeAll(opened: java.util.ArrayDeque[Closeable]): Unit =
+    val next: Optional[Closeable] =
+      opened.synchronized(if opened.isEmpty then Unset else Optional(opened.pop()))
 
     next.let: value =>
       value match
         case repl: Repl[?]         => repl.close()
         case sessions: Sessions[?] => sessions.close()
 
-      closeTo(depth)
+      closeAll(opened)
 
 // `supervise`, closing whatever the block opened (see `Opened`) once it has finished.
 def isolated[result](block: Monitor ?=> result)(using Threading, Codepoint): result =
-  val depth = Opened.depth
-  try supervise(block) finally Opened.closeTo(depth)
+  Opened.closing(supervise(block))
 
 // Mimics a standard-REPL session: `size` references `greeting`, a field of the
 // enclosing object, by simple name (as `var name = …` would be in the Scala REPL).
@@ -1261,6 +1281,71 @@ object Tests extends Suite(m"Flame Tests"):
           requests.size == 1
           && requests.prim.lay(false) { case Repl.Request.Tokenize(_, t"val x = (") => true; case _ => false }
           && decoration.incomplete && decoration.tokens.exists(_.text == t"val")
+
+      // Whether the prompt marker is shown in the tone.
+      def toned(prompt: List[Inline], tone: Tone): Boolean =
+        prompt.exists { case Inline.Toned(`tone`, _) => true; case _ => false }
+
+      test(m"a settled entry echoes its line past the prompt marker's width"):
+        isolated:
+          val (engine, interface) = fresh()
+          interface.handle(Event.Submitted(interface.field.input, t"1 + 1"))
+          val id = engine.submissions.prim.let(_.id).or(0)
+          val blocks = blocksOf(t"res0: Int = 2")
+          engine.answer(id, Repl.Reply.Ran(id, Unset, t"", Unset, Unset, t"", Nil, Nil, blocks))
+          interface.transcript()
+
+      . assert: entries =>
+          def indented(block: Block): Boolean = block match
+            case Block.Code(_, lines, _) => lines.prim.lay(false)(_.tokens.prim.lay(false)(_.text == t"  "))
+            case _                       => false
+
+          entries.exists { case Block.Group(content) => content.exists(indented); case _ => false }
+
+      test(m"an import's confirmation is a notice of the clause"):
+        isolated:
+          val (engine, interface) = fresh()
+          interface.handle(Event.Submitted(interface.field.input, t"import scala.collection.mutable.*"))
+          val id = engine.submissions.prim.let(_.id).or(0)
+          val output = Repl.messages.imported(t"scala.collection.mutable.*")
+          engine.answer(id, Repl.Reply.Ran(id, Unset, t"$output\n", Unset, Unset, t"", Nil, Nil))
+          interface.transcript()
+
+      . assert: entries =>
+          val notices: List[Block] = entries.bind:
+            case Block.Group(content) => content.filter { case Block.Notice(Tone.Muted, _, _) => true; case _ => false }
+            case _                    => Nil
+
+          notices.size == 1 && texts(notices) == t"imported scala.collection.mutable.*"
+
+      test(m"the prompt marker takes the accent tone while the line reads as Scala"):
+        isolated:
+          val (engine, interface) = fresh()
+          val initial = interface.field.decoration().prompt
+          interface.handle(Event.Edited(interface.field.input, t"val x = 1", 9))
+          (initial, interface.field.decoration().prompt)
+
+      . assert: (initial, edited) =>
+          initial == edited && toned(initial, Tone.Accent)
+
+      test(m"the prompt marker takes the info tone once the line reads as natural language"):
+        isolated:
+          val (engine, interface) = fresh()
+          interface.handle(Event.Edited(interface.field.input, t"what is the type of x", 21))
+          interface.field.decoration().prompt
+
+      . assert(toned(_, Tone.Info))
+
+      test(m"a submission clears the decoration but keeps the prompt marker"):
+        isolated:
+          val (engine, interface) = fresh()
+          interface.handle(Event.Edited(interface.field.input, t"what is the type of x", 21))
+          interface.handle(Event.Edited(interface.field.input, t"", 0))
+          interface.handle(Event.Submitted(interface.field.input, t"what is the type of x"))
+          interface.field.decoration()
+
+      . assert: decoration =>
+          decoration.tokens.nil && decoration.detail.nil && toned(decoration.prompt, Tone.Accent)
 
       test(m"a multi-line entry submits only after a blank line"):
         isolated:
