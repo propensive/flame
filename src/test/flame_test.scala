@@ -86,31 +86,51 @@ object Wire:
 // Every `Repl` and `Sessions` a test makes, registered as it is made (`Opened(Opened(Repl()))`) so that
 // `isolated` can close it when the test's block ends. Each keeps a warm compiler alive until it is
 // closed (see `Repl#close`), so a suite that merely dropped them would exhaust any heap.
+//
+// Each block registers against a deque OF ITS OWN, not one global stack indexed by depth: test
+// blocks run on several threads at once (a `probably` worker, fume's event stream), so a
+// depth-based scheme let one block close a `Repl` another block was still using — closing it
+// retires its scope inspector (see `Repl#close`), whose executor then REJECTS the inspection
+// already on its way, which `ScopeInspector#inspect` reports as an empty scope. The deque is
+// inherited by the threads a block spawns, so a `Repl` opened off-thread still belongs to the
+// block that opened it.
 object Opened:
-  private val opened: java.util.ArrayDeque[Repl[?] | Sessions[?]] = java.util.ArrayDeque()
+  private type Closeable = Repl[?] | Sessions[?]
 
-  def apply[value <: Repl[?] | Sessions[?]](value: value): value =
+  private val current: InheritableThreadLocal[java.util.ArrayDeque[Closeable]] =
+    new InheritableThreadLocal[java.util.ArrayDeque[Closeable]]:
+      override def initialValue(): java.util.ArrayDeque[Closeable] = java.util.ArrayDeque()
+
+  def apply[value <: Closeable](value: value): value =
+    val opened = current.get.nn
     opened.synchronized(opened.push(value))
     value
 
-  def depth: Int = opened.synchronized(opened.size)
+  // Runs `block` against a registry of its own, closing everything the block opened — newest
+  // first — once it has finished, and restoring the enclosing block's registry.
+  def closing[result](block: => result): result =
+    val enclosing = current.get.nn
+    val opened = java.util.ArrayDeque[Closeable]()
+    current.set(opened)
 
-  // Closes, newest first, everything opened since `depth` was read.
-  def closeTo(depth: Int): Unit =
-    val next: Optional[Repl[?] | Sessions[?]] =
-      opened.synchronized(if opened.size > depth then Optional(opened.pop()) else Unset)
+    try block finally
+      current.set(enclosing)
+      closeAll(opened)
+
+  private def closeAll(opened: java.util.ArrayDeque[Closeable]): Unit =
+    val next: Optional[Closeable] =
+      opened.synchronized(if opened.isEmpty then Unset else Optional(opened.pop()))
 
     next.let: value =>
       value match
         case repl: Repl[?]         => repl.close()
         case sessions: Sessions[?] => sessions.close()
 
-      closeTo(depth)
+      closeAll(opened)
 
 // `supervise`, closing whatever the block opened (see `Opened`) once it has finished.
 def isolated[result](block: Monitor ?=> result)(using Threading, Codepoint): result =
-  val depth = Opened.depth
-  try supervise(block) finally Opened.closeTo(depth)
+  Opened.closing(supervise(block))
 
 // Mimics a standard-REPL session: `size` references `greeting`, a field of the
 // enclosing object, by simple name (as `var name = …` would be in the Scala REPL).
