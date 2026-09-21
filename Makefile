@@ -9,11 +9,21 @@ assembly: publishLocal
 	./mill clean flame.launcher
 	./mill flame.launcher.assembly
 
-# Publish flame to GitHub Releases: the three library jars first, then — once their digests are
-# indexed — the repackaged `flame` executables, added to the same release. See release-launcher.sh
-# in propensive/.github (run through etc/shared) for the two-step ordering and its verification.
+# Releases are cut by tagging, not by make. Bump `flameVersion`, merge it, and then `git tag -s
+# X.Y.Z && git push --tags`: the tag fires .github/workflows/release.yml, which runs the shared
+# release.sh in propensive/.github. That gates on a signed tag, on CI already being green on that
+# very commit, and on every pin being a release; publishes the library jars; repackages the
+# executables against them; and generates the notes. If anything fails, the release and the tag
+# are both deleted, so a retry is `git tag -d X.Y.Z && git tag -s X.Y.Z && git push --tags`. What
+# this repository needs beyond the common path is declared in etc/release. This target survives
+# only to say so.
 release:
-	FLAME_RELEASE_VERSION=$(VERSION) ./etc/shared release-launcher.sh flame "flame-core flame-web flame-client" $(VERSION)
+	@echo "Releases are triggered by tags, not by make. Bump flameVersion, merge it, then:" >&2
+	@echo "" >&2
+	@echo "    git tag -s X.Y.Z && git push --tags" >&2
+	@echo "" >&2
+	@echo "See propensive/.github." >&2
+	@exit 1
 
 # Publish the libraries to the local ~/.ivy2 (the launcher resolves them from there; burdock will
 # NOT externalize a locally-published copy unless its bytes match a release asset).
