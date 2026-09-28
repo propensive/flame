@@ -1078,6 +1078,7 @@ object Tests extends Suite(m"Flame Tests"):
           case Block.Output(text, _)       => text
           case Block.Code(_, lines, _)     => lines.map(_.tokens.map(_.text).join).join(t"\n")
           case Block.Table(_, rows, _)     => rows.map(_.cells.map(_.content.map(inline).join).join(t" ")).join(t"\n")
+          case Block.Trace(stacks)         => stacks.map { stack => t"${stack.className}: ${stack.message.map(inline).join}" }.join(t"\n")
           case _                           => t""
 
         blocks.map(block).join(t"\n")
@@ -1203,6 +1204,7 @@ object Tests extends Suite(m"Flame Tests"):
           case Block.Group(content)        => texts(content)
           case Block.Notice(_, _, content) => texts(content)
           case Block.Output(text, _)       => text
+          case Block.Trace(stacks)         => stacks.map { stack => t"${stack.className}: ${stack.message.map(inline).join}" }.join(t"\n")
           case _                           => t""
 
         blocks.map(block).join(t"\n")

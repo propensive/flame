@@ -60,7 +60,7 @@ import urticose.*
 import vacuous.*
 
 import classloaders.threadContextClassloader
-import hieroglyph.charDecoders.utf8Decoder
+import hieroglyph.charsets.utf8Charset
 import hieroglyph.textSanitizers.skipSanitizer
 
 // A named collection of independent REPL sessions served over one socket. Each connection is bound to

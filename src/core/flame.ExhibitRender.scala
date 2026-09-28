@@ -46,7 +46,7 @@ import vacuous.*
 import pyrocosm.{Block, Inline, Presentable}
 
 import contingency.strategies.throwUnsafely
-import hieroglyph.charEncoders.utf8Encoder
+import hieroglyph.codepages.utf8Codepage
 
 // The typeclass cascade for a result value under `Repl.Rendering.Exhibit`, expanded INSIDE
 // the compiled wrapper where the value's static type is known: Pyrocosm's `Presentable` (whose
