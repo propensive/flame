@@ -99,7 +99,7 @@ object SemanticRender:
   private val wrapWidth: Int = 80
 
   private def renderNotice(notice: Notice, reifier: Optional[Reifier])(using Imports): Text =
-    notice.semantic.lay(wrapPlain(notice.message)): message =>
+    notice.markup.let(SemanticMessage.parse(_)).lay(wrapPlain(notice.message)): message =>
       ansiMessage(message, reifier).render(xtermTrueColorTermcap)
 
   // ── ANSI (the CLI's `Inspect` mode) ──────────────────────────────────────────────────────────
@@ -224,7 +224,7 @@ object SemanticRender:
 
     // The message is shown trimmed of the whitespace around it: a compiler message often ends
     // in a newline, which would stand as a blank line of the notice.
-    val content: List[Block] = notice.semantic.lay(paragraphs(stripAnsi(notice.message).trim)): message =>
+    val content: List[Block] = notice.markup.let(SemanticMessage.parse(_)).lay(paragraphs(stripAnsi(notice.message).trim)): message =>
       markupBlocks(message.markup, reifier)
 
     Block.Notice(tone, Unset, content)

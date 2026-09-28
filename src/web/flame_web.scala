@@ -41,7 +41,7 @@ import perihelion.given
 import htmlDoms.whatwg.*
 import Control.*
 
-import charEncoders.utf8Encoder
+import codepages.utf8Codepage
 import classloaders.threadContextClassloader
 import formatting.compactJsonFormatting
 import logging.silentLogging

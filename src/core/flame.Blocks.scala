@@ -45,7 +45,7 @@ import symbolism.*
 import turbulence.*
 import vacuous.*
 
-import hieroglyph.charEncoders.utf8Encoder
+import hieroglyph.codepages.utf8Codepage
 
 import pyrocosm.{Block, Inline, Language, Token, Tone}
 import pyrocosm.exhibit

@@ -43,7 +43,7 @@ object settings:
   // inlining. Bump (and commit) per release; release.sh (in propensive/.github) refuses to
   // release when this pin disagrees with the tag being released. Snapshots override it through
   // `publishVersion` (below), never here.
-  val flameVersion = "0.3.0"
+  val flameVersion = "0.4.0"
 
   val scalaOptions = Seq(
     // The fork's opt-in behaviours, enabled by name, exactly as the Soundness build enables
@@ -138,6 +138,7 @@ object settings:
     "stenography-core",      // type rendering
     "prophesy-core",         // keyword completions
     "harlequin-core",        // syntax highlighting
+    "harlequin-typed",       // highlighting.typecheckedScala (moved out of harlequin-core in 0.69.0)
     "hellenism-jvm",         // classpaths and classloaders
     "escapade-core",         // Teletype output
     "iridescence-core",      // colours

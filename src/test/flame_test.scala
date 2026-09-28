@@ -1203,6 +1203,7 @@ object Tests extends Suite(m"Flame Tests"):
           case Block.Group(content)        => texts(content)
           case Block.Notice(_, _, content) => texts(content)
           case Block.Output(text, _)       => text
+          case Block.Trace(stacks)         => stacks.map { stack => t"${stack.className}: ${stack.message.map(inline).join}" }.join(t"\n")
           case _                           => t""
 
         blocks.map(block).join(t"\n")
