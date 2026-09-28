@@ -151,7 +151,6 @@ object settings:
     "parasite-jvm",          // async
     "turbulence-stdio",      // Stdio
     "stratiform-core",
-    "stratiform-binary",     // BinTEL, the session wire format
     "obligatory-core",       // LengthPrefix: the session protocol's record framing
     "distillate-core",
     "spectacular-core",      // /inspect
