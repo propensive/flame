@@ -1129,6 +1129,32 @@ object Tests extends Suite(m"Flame Tests"):
             !decoded.nil && texts(decoded).contains(t"Monitor")
           case _ => false
 
+      test(m"a raster image is exhibited as an image carried in a data: URI"):
+        isolated:
+          val repl = exhibiting
+          repl.react(0, t"/set experimental")
+          repl.react(0, t"import soundness.*")
+          repl.react(0, t"Raster(2, 2) { (x, y) => Chroma(255, 0, 0) }.to[Png]")
+      . assert:
+          case Repl.Reply.Ran(_, _, _, _, _, _, _, _, blocks) =>
+            Blocks.decode(blocks).sweep { case Block.Group(content) => content }.bind { (content: List[Block]) => content }.exists:
+              case Block.Image(source, alt) => source.starts(t"data:image/png;base64,") && alt == t"2×2 PNG"
+              case _                        => false
+          case _ => false
+
+      test(m"an SVG drawing is exhibited as a figure carrying its markup"):
+        isolated:
+          val repl = exhibiting
+          repl.react(0, t"/set experimental")
+          repl.react(0, t"import soundness.*")
+          repl.react(0, t"Svg(10, 5)")
+      . assert:
+          case Repl.Reply.Ran(_, _, _, _, _, _, _, _, blocks) =>
+            Blocks.decode(blocks).sweep { case Block.Group(content) => content }.bind { (content: List[Block]) => content }.exists:
+              case Block.Figure(figure) => figure.svg.starts(t"<svg")
+              case _                    => false
+          case _ => false
+
       test(m"a connection answers a submission and pushes an asynchronous one"):
         isolated:
           val sessions = Sessions(Repl.Rendering.Exhibit(true))

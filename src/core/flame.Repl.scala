@@ -2325,13 +2325,19 @@ class Repl[version <: Scalac.Versions]
   // `.inspect` (teletype text), `Exhibit` uses `flame.ExhibitRender.render` (the `Presentable`
   // cascade, to the model's blocks). The rendering runs INSIDE the wrapper, where `ref`'s static
   // type is known.
+  //
+  // The exhibit's media instances (`pyrocosm-media`: a raster as an image, an SVG as a drawing)
+  // are named givens, so they are imported here, INSIDE the initializer: `render` is inline and
+  // its `summonFrom` resolves where it is expanded, so an import within `ExhibitRender` would
+  // not be seen, and an import at file scope would name `@experimental` definitions in a line
+  // compiled without the flag. In lexical scope they outrank `Presentable`'s own fallback.
   private def renderInto(ref: Text, key: Text): List[Text] =
     val put: Text = render match
       case Repl.Rendering.Inspect =>
         t"flame.ReplBridge.put(${session.toString.tt}L, \"$key\", flame.InspectRender.render($ref))"
 
       case Repl.Rendering.Exhibit(_) =>
-        t"flame.ReplBridge.put(${session.toString.tt}L, \"$key\", flame.ExhibitRender.render($ref))"
+        t"import pyrocosm.{rasterPresentable, plainRasterPresentable, svgPresentable}; flame.ReplBridge.put(${session.toString.tt}L, \"$key\", flame.ExhibitRender.render($ref))"
 
     List
       ( t"@scala.annotation.experimental private val ${ref}_shown: scala.Unit =",
