@@ -32,8 +32,6 @@
                                                                                                   */
 package flame
 
-import scala.compiletime.summonFrom
-
 import anticipation.*
 import contingency.*
 import gossamer.*
@@ -48,16 +46,15 @@ import pyrocosm.{Block, Inline, Presentable}
 import contingency.strategies.throwUnsafely
 import hieroglyph.codepages.utf8Codepage
 
-// The typeclass cascade for a result value under `Repl.Rendering.Exhibit`, expanded INSIDE
-// the compiled wrapper where the value's static type is known: Pyrocosm's `Presentable` (whose
-// own fallbacks cover `Showable`, products and `toString`), else spectacular's `Inspectable`
-// with any styling stripped, else `toString`. The exhibit crosses `ReplBridge` as text, so
-// `Outcome` and the bridge keep their `Text`: TEL, tagged with whether it is phrasing or flow.
+// The rendering of a result value under `Repl.Rendering.Exhibit`, expanded INSIDE the compiled
+// wrapper where the value's static type is known: Pyrocosm's `Presentable`, whose own cascade
+// ends in `Showable`, a structural derivation and `Inspectable`, so it always resolves (the
+// media instances are imported at the expansion site; see `Repl.renderInto`). The exhibit
+// crosses `ReplBridge` as text, so `Outcome` and the bridge keep their `Text`: TEL, tagged with
+// whether it is phrasing or flow.
 object ExhibitRender:
-  inline def render[value](v: value): Text = summonFrom:
-    case presentable: (`value` is Presentable) => encode(presentable.exhibit(v))
-    case inspectable: (`value` is Inspectable) => encode(Inline.Textual(SemanticRender.stripAnsi(inspectable.text(v)).trim))
-    case _                                     => encode(Inline.Textual(v.toString.tt))
+  inline def render[value: Presentable as presentable](v: value): Text =
+    encode(presentable.exhibit(v))
 
   def encode(form: Inline | Block): Text = form match
     case inline: Inline => t"inline:${inline.in[Tel].show}"

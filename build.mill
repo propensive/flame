@@ -167,12 +167,16 @@ object settings:
     "quantitative-core", "quantitative-units", "hypotenuse-core", "kaleidoscope-core",
     "wisteria-core", "jacinta-core", "xylophone-core", "caesura-core", "gastronomy-core",
     "guillotine-core", "telekinesis-jvm", "urticose-url", "honeycomb-core", "cataclysm-core",
-    "probably-core", "escapade-io", "imperial-core", "serpentine-core")
+    "probably-core", "escapade-io", "imperial-core", "serpentine-core",
+    // Rich media, which the web front-end shows as images and drawings (see `pyrocosm-media`):
+    "hallucination-core", "hallucination-formats", "savagery-core", "escapade-graphics",
+    "anticipation-gfx", "monotonous-core")
   . map(component(soundness))
 
   def pyrocosmCoreDeps(pyrocosm: String) = Seq(
     mvn"dev.propensive:pyrocosm-model:$pyrocosm",
-    mvn"dev.propensive:pyrocosm-compiler:$pyrocosm")
+    mvn"dev.propensive:pyrocosm-compiler:$pyrocosm",
+    mvn"dev.propensive:pyrocosm-media:$pyrocosm")
 
   def clientDeps(soundness: String) = Seq(
     "ethereal-core",             // the daemon
