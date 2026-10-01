@@ -40,7 +40,7 @@ import pyrocosm.{Block, Event, Inline, Token, Tone}
 
 
 import classloaders.threadContextClassloader
-import dysasymptotics.linearSize
+import dysasymptotics.{linearAccess, linearSize}
 import internetAccess.online
 import socketBackends.javaBaseSockets
 import filesystemBackends.javaBaseFilesystem
@@ -1153,6 +1153,38 @@ object Tests extends Suite(m"Flame Tests"):
             Blocks.decode(blocks).sweep { case Block.Group(content) => content }.bind { (content: List[Block]) => content }.exists:
               case Block.Image(source, alt) => source.starts(t"data:image/gif;base64,") && alt == t"2×2 GIF"
               case _                        => false
+          case _ => false
+
+      // The collapsible tree a tree-shaped value exhibits as: its root, when the blocks hold one.
+      def treeRoot(blocks: Text): Optional[Block.TreeNode] =
+        Blocks.decode(blocks).sweep { case Block.Group(content) => content }.bind { (content: List[Block]) => content }.sweep:
+          case Block.Tree(root :: Nil) => root
+        . prim
+
+      test(m"a JSON value is exhibited as an expandable tree"):
+        isolated:
+          val repl = exhibiting
+          repl.react(0, t"/set experimental")
+          repl.react(0, t"import soundness.*")
+          repl.react(0, t"j\"\"\"{\"name\": \"Ada\", \"nested\": {\"deep\": {\"n\": 1}}}\"\"\"")
+      . assert:
+          case Repl.Reply.Ran(_, _, _, _, _, _, _, _, blocks) =>
+            treeRoot(blocks).let { (root: Block.TreeNode) =>
+              root.open == true && root.children.size == 2
+                && root.children.at(Sec).let(_.children.prim.let(_.open)) == false
+                && Inline.plain(root.children.prim.or(root).label).contains(t"Ada") }
+            . or(false)
+          case _ => false
+
+      test(m"an XML value is exhibited as an expandable tree"):
+        isolated:
+          val repl = exhibiting
+          repl.react(0, t"/set experimental")
+          repl.react(0, t"import soundness.*")
+          repl.react(0, t"x\"\"\"<a b=\"1\"><c>text</c><d><e/></d></a>\"\"\"")
+      . assert:
+          case Repl.Reply.Ran(_, _, _, _, _, _, _, _, blocks) =>
+            treeRoot(blocks).let { (root: Block.TreeNode) => root.open == true && Inline.plain(root.label) == t"<a b=\"1\">" && root.children.size == 2 }.or(false)
           case _ => false
 
       test(m"an SVG drawing is exhibited as a figure carrying its markup"):

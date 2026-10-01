@@ -170,7 +170,9 @@ object settings:
     "probably-core", "escapade-io", "imperial-core", "serpentine-core",
     // Rich media, which the web front-end shows as images and drawings (see `pyrocosm-media`):
     "hallucination-core", "hallucination-formats", "savagery-core", "escapade-graphics",
-    "anticipation-gfx", "monotonous-core")
+    "anticipation-gfx", "monotonous-core",
+    // The tree-shaped data formats, which the web front-end shows as expandable trees:
+    "breviloquence-core", "ypsiloid-core")
   . map(component(soundness))
 
   def pyrocosmCoreDeps(pyrocosm: String) = Seq(
