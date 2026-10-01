@@ -1423,6 +1423,14 @@ class Repl[version <: Scalac.Versions]
   // not reentrant and the REPL's state is mutable.
   private val mutex: Mutex = Mutex()
 
+  // Completions arrive with every keystroke and each costs a compile under `mutex`, so a burst
+  // would queue behind the first and a submitted line behind them all. Each completion takes a
+  // ticket, and one that is no longer the latest when its turn comes answers with nothing (the
+  // front-ends discard a stale reply by generation anyway), so a burst costs one compile; and a
+  // completion stands aside while a submission is pending, so a line never waits on a probe.
+  private val completionTickets: juc.atomic.AtomicLong = juc.atomic.AtomicLong(0)
+  private val pendingSubmissions: juc.atomic.AtomicInteger = juc.atomic.AtomicInteger(0)
+
   // Caches the full member list for each `expr.` base completed on the current line, so the
   // live suggestion and Tab completion filter it instead of recompiling per keystroke. The
   // type of `expr` is fixed within a line, so the cache holds until the next submission,
@@ -2787,10 +2795,19 @@ class Repl[version <: Scalac.Versions]
   // keyword names its direct callers (and tests) rely on.
   def completionsAt(code: Text, offset: Int)(using Monitor, System, Probate)
   :   List[Repl.CompletionItem] logs CompileEvent =
-    completionItems(code, offset).map: (item: Repl.CompletionItem) =>
+    val ticket: Long = completionTickets.incrementAndGet()
+
+    completionItems(code, offset, ticket).map: (item: Repl.CompletionItem) =>
       if item.kind == t"keyword" then item.copy(name = t"${item.name} ") else item
 
-  private def completionItems(code: Text, offset: Int)(using Monitor, System, Probate)
+  // A completion's turn at the compiler (see `completionTickets`): it waits while a submission
+  // is pending, then compiles under `mutex` unless a later completion has superseded it.
+  private def probe(ticket: Long)(block: => List[Repl.CompletionItem]): List[Repl.CompletionItem] =
+    def stale: Boolean = completionTickets.get != ticket
+    while pendingSubmissions.get > 0 && !stale do jl.Thread.sleep(10)
+    if stale then Nil else mutex(if stale then Nil else block)
+
+  private def completionItems(code: Text, offset: Int, ticket: Long)(using Monitor, System, Probate)
   :   List[Repl.CompletionItem] logs CompileEvent =
 
     // `/unimport <tokens>` completes against the imports currently in scope, so the user can pick
@@ -2820,18 +2837,18 @@ class Repl[version <: Scalac.Versions]
       Repl.classloadCompletions(partial)
 
     else exprHead match
-      case head: Text => scalaCompletions(code.skip(head.length), (offset - head.length).max(0))
+      case head: Text => scalaCompletions(code.skip(head.length), (offset - head.length).max(0), ticket)
       case _ =>
         // Up to the cursor, untrimmed: the space after `/set` is what selects its subcommands.
         if code.starts(t"/") then Repl.slashCompletions(code.keep(offset))
         else if code.trim.starts(t"/") then Repl.slashCompletions(code.trim)
-        else scalaCompletions(code, offset)
+        else scalaCompletions(code, offset, ticket)
 
   // Ordinary Scala completions at `offset` in `code`: member selection (`expr.partial`), infix
   // (`expr partial`, plus `match`), or — at a bare position — the syntactic keywords merged with
   // the compiler's name/definition completions. Split out of `completionsAt` so `/tasty <expr>`
   // can reuse it on the stripped expression.
-  private def scalaCompletions(code: Text, offset: Int)(using Monitor, System, Probate)
+  private def scalaCompletions(code: Text, offset: Int, ticket: Long)(using Monitor, System, Probate)
   :   List[Repl.CompletionItem] logs CompileEvent =
 
     given LocalClasspath = classpath
@@ -2853,14 +2870,14 @@ class Repl[version <: Scalac.Versions]
 
     harlequin.Fragment.memberBase(code, offset) match
       case (base: Text, prefix) =>
-        mutex(members(base)).filter(_.name.starts(prefix))
+        probe(ticket)(members(base)).filter(_.name.starts(prefix))
 
       case _ =>
         harlequin.Fragment.infixBase(code, offset) match
           // A value followed by a space: offer the receiver's methods (usable infix) plus the
           // `match` keyword (only ever offered here, i.e. after a trailing space).
           case (base: Text, prefix) =>
-            val matched  = mutex(members(base)).filter(_.name.starts(prefix))
+            val matched  = probe(ticket)(members(base)).filter(_.name.starts(prefix))
             val matchKw  =
               if t"match".starts(prefix) then List(Repl.CompletionItem(t"match", t"keyword", t"")) else Nil
 
@@ -2873,7 +2890,7 @@ class Repl[version <: Scalac.Versions]
           case _ =>
             val (keywords, binding) = Repl.keywordCompletions(code, offset)
             if binding then keywords
-            else keywords + mutex(safely(Repl.complete(context, code, offset, semanticImports)).or(Nil))
+            else keywords + probe(ticket)(safely(Repl.complete(context, code, offset, semanticImports)).or(Nil))
 
   // Typecheck-highlights, compiles, and runs `code`, returning a `Reply` with the highlighting, the
   // result value, its rendered type, and any diagnostics. Only COMPILATION and the session-state
@@ -2892,9 +2909,14 @@ class Repl[version <: Scalac.Versions]
     val tokens      = Repl.highlight(code)
     val unprocessed = Repl.Reply.Failed(id, t"the input could not be processed")
 
-    // Compile under the mutex; run the deferred load off it.
+    // Compile under the mutex (counted as pending, so completions stand aside); run the deferred
+    // load off it.
     val outcome: Optional[Outcome] = safely:
-      mutex(build(code, onOutput)) match
+      val built: Built^{onOutput} =
+        pendingSubmissions.incrementAndGet()
+        try mutex(build(code, onOutput)) finally pendingSubmissions.decrementAndGet()
+
+      built match
         case Built.Complete(result) => result
         case Built.Deferred(run)    => run()
 
