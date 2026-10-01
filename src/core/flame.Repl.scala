@@ -2337,7 +2337,7 @@ class Repl[version <: Scalac.Versions]
         t"flame.ReplBridge.put(${session.toString.tt}L, \"$key\", flame.InspectRender.render($ref))"
 
       case Repl.Rendering.Exhibit(_) =>
-        t"import pyrocosm.{rasterPresentable, plainRasterPresentable, svgPresentable}; flame.ReplBridge.put(${session.toString.tt}L, \"$key\", flame.ExhibitRender.render($ref))"
+        t"import pyrocosm.{rasterPresentable, svgPresentable}; flame.ReplBridge.put(${session.toString.tt}L, \"$key\", flame.ExhibitRender.render($ref))"
 
     List
       ( t"@scala.annotation.experimental private val ${ref}_shown: scala.Unit =",

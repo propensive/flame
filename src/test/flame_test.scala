@@ -1134,11 +1134,24 @@ object Tests extends Suite(m"Flame Tests"):
           val repl = exhibiting
           repl.react(0, t"/set experimental")
           repl.react(0, t"import soundness.*")
-          repl.react(0, t"Raster(2, 2) { (x, y) => Chroma(255, 0, 0) }.to[Png]")
+          repl.react(0, t"Raster(2, 2) { (x, y) => Chroma(255, 0, 0) }")
       . assert:
           case Repl.Reply.Ran(_, _, _, _, _, _, _, _, blocks) =>
             Blocks.decode(blocks).sweep { case Block.Group(content) => content }.bind { (content: List[Block]) => content }.exists:
               case Block.Image(source, alt) => source.starts(t"data:image/png;base64,") && alt == t"2×2 PNG"
+              case _                        => false
+          case _ => false
+
+      test(m"a raster image in a format is exhibited in that format"):
+        isolated:
+          val repl = exhibiting
+          repl.react(0, t"/set experimental")
+          repl.react(0, t"import soundness.*")
+          repl.react(0, t"Raster(2, 2) { (x, y) => Chroma(255, 0, 0) }.to[Gif]")
+      . assert:
+          case Repl.Reply.Ran(_, _, _, _, _, _, _, _, blocks) =>
+            Blocks.decode(blocks).sweep { case Block.Group(content) => content }.bind { (content: List[Block]) => content }.exists:
+              case Block.Image(source, alt) => source.starts(t"data:image/gif;base64,") && alt == t"2×2 GIF"
               case _                        => false
           case _ => false
 
