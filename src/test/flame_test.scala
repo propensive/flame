@@ -500,6 +500,35 @@ object Tests extends Suite(m"Flame Tests"):
       . assert: items =>
           items.exists(_.name == t"make") && items.all(!_.signature.contains(t"rs$$line$$"))
 
+      // Completions take tickets: of two overlapping requests, whichever took the later ticket
+      // gets its items, and the other, if superseded before its turn, yields nothing rather
+      // than a second compile (see `Repl.completionTickets`). Which is which depends on
+      // scheduling, so each answer is either empty or right, and at least one is right.
+      test(m"of two overlapping completions, the later yields its items"):
+        isolated:
+          val repl = Opened(Repl())
+          repl.interpret(t"object Foo { def make = 1; def mend = 2 }")
+          val first = async(repl.completionsAt(t"Foo.m", 5))
+          val second = repl.completionsAt(t"Foo.me", 6)
+          (first.await(), second)
+      . assert: (first, second) =>
+          (first.nil || first.exists(_.name == t"make")) && (second.nil || second.exists(_.name == t"mend"))
+            && !(first.nil && second.nil)
+
+      test(m"a submission is not delayed by a stream of completions"):
+        isolated:
+          val repl = Opened(Repl())
+          repl.interpret(t"object Foo { def make = 1 }")
+          val probe1 = async(repl.completionsAt(t"Foo.ma", 6))
+          val probe2 = async(repl.completionsAt(t"Foo.mak", 7))
+          val probe3 = async(repl.completionsAt(t"Foo.make", 8))
+          val reply = repl.react(0, t"Foo.make + 1")
+          probe1.await(); probe2.await(); probe3.await()
+          reply
+      . assert:
+          case Repl.Reply.Ran(_, value, _, _, _, _, _, _, _) => value.or(t"").contains(t"2")
+          case _ => false
+
       test(m"/classload reports a nonexistent path"):
         isolated:
           Opened(Repl()).interpret(t"/classload /no/such/directory/lib.jar")
