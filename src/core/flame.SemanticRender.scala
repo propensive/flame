@@ -106,15 +106,16 @@ object SemanticRender:
   // Mirrors `delicious.ansi`'s Teletype rendering (harlequin-highlighted code samples,
   // stenography-rendered and type-position-highlighted types), but WORD-WRAPS the prose at
   // `wrapWidth`: the flattened tree becomes a stream of `Piece`s — explicit line breaks, runs of
-  // spaces, atomic words (a prose word, or a whole highlighted type), and unbreakable code samples —
-  // and the flow inserts a newline (swallowing the intervening spaces) wherever the next word would
-  // overrun the width. Existing newlines and space runs are preserved verbatim, so the compiler's own
-  // alignment (`Found:    …`) survives; only overlong lines gain breaks, and never inside code.
+  // spaces, prose words, and the highlighted types and code samples that must stay whole — which
+  // `flow` concatenates and hands to tessellate's `Flow.wrap` with the latter as unbreakable
+  // spans. Existing newlines and space runs are preserved verbatim, so the compiler's own
+  // alignment (`Found:    …`) survives; only overlong lines gain breaks, and never inside a type
+  // or a code sample.
   private enum Piece:
-    case Break                                  // an explicit newline in the message
-    case Space(run: Text)                       // a run of spaces/tabs (dropped at a soft break)
-    case Word(styled: Teletype, width: Int)     // an atomic word: prose, or a highlighted type
-    case Atom(styled: Teletype, plain: Text)    // a code sample: emitted verbatim, never wrapped
+    case Break                   // an explicit newline in the message
+    case Space(run: Text)        // a run of spaces/tabs (dropped at a soft break)
+    case Word(styled: Teletype)  // a prose word, which may wrap
+    case Atom(styled: Teletype)  // a highlighted type or code sample: never broken inside
 
   private def ansiMessage(message: SemanticMessage, reifier: Optional[Reifier])(using Imports)
   :   Teletype =
@@ -131,11 +132,9 @@ object SemanticRender:
 
     def piece(markup: Markup): List[Piece] = markup match
       case Markup.Textual(text) => prose(text)
-      case Markup.Code(_, _)    => List(Piece.Atom(code(markup.plain, Scala.Context.Term), markup.plain))
-
+      case Markup.Code(_, _)    => List(Piece.Atom(code(markup.plain, Scala.Context.Term)))
       case typed: Markup.Typed =>
-        val text: Text = typeText(typed, reifier)
-        List(Piece.Word(code(text, Scala.Context.Type), text.length))
+        List(Piece.Atom(code(typeText(typed, reifier), Scala.Context.Type)))
 
       case Markup.Symbolic(_, _, _, children) => pieces(children)
       case Markup.Named(_, _, children)       => pieces(children)
@@ -143,37 +142,32 @@ object SemanticRender:
 
     flow(pieces(message.markup))
 
-  // Flows `pieces` into a Teletype, wrapping at `wrapWidth` (see `ansiMessage`).
+  // Flows `pieces` into a Teletype wrapped at `wrapWidth` (see `ansiMessage`): the pieces are
+  // concatenated, each `Atom`'s extent in the plain text noted, and tessellate's `Flow` wraps
+  // the result with those extents unbreakable — so a type or code sample moves whole to the
+  // next line when it does not fit, and a newline inside a multi-line sample is a hard break.
   private def flow(pieces: List[Piece]): Teletype =
-    var out:     Teletype = e""
-    var column:  Int      = 0
-    var pending: Text     = t""
+    import hieroglyph.textMetrics.uniformMetric
+
+    var content: Teletype       = e""
+    var length:  Int            = 0
+    var atoms:   List[Interval] = Nil
+
+    def append(styled: Teletype, width: Int): Unit =
+      content = content.append(styled)
+      length += width
 
     pieces.each:
-      case Piece.Break =>
-        out = out.append(e"\n")
-        column = 0
-        pending = t""
+      case Piece.Break      => append(e"\n", 1)
+      case Piece.Space(run) => append(e"$run", run.length)
+      case Piece.Word(word) => append(word, word.plain.length)
 
-      case Piece.Space(run) =>
-        pending = t"$pending$run"
+      case Piece.Atom(atom) =>
+        val width = atom.plain.length
+        atoms = (length.z thru (length + width).u) :: atoms
+        append(atom, width)
 
-      case Piece.Word(styled, width) =>
-        if column > 0 && column + pending.length + width > wrapWidth then
-          out = out.append(e"\n").append(styled)
-          column = width
-        else
-          out = out.append(e"$pending").append(styled)
-          column += pending.length + width
-        pending = t""
-
-      case Piece.Atom(styled, plain) =>
-        out = out.append(e"$pending").append(styled)
-        column = plain.pinpoint(_ == '\n', bidi = Rtl).lay(column + pending.length + plain.length):
-          newline => plain.length - newline.n0 - 1
-        pending = t""
-
-    out
+    Flow.wrap(content, wrapWidth, unbreakable = atoms.reverse).join(e"\n")
 
   // Splits plain prose into `Piece`s: explicit breaks, runs of spaces/tabs, and words — preserving
   // every character, so unwrapped text round-trips exactly.
@@ -193,13 +187,12 @@ object SemanticRender:
           recur(rest.skip(space.length), Piece.Space(space) :: pieces)
         else
           val word: Text = rest.keep { char => char != '\n' && !blank(char) }
-          recur(rest.skip(word.length), Piece.Word(e"$word", word.length) :: pieces)
+          recur(rest.skip(word.length), Piece.Word(e"$word") :: pieces)
 
     recur(plain, Nil)
 
-  // Word-wraps a PLAIN (no semantic markup) message for the terminal. With no code samples to hold
-  // together there is nothing `flow` protects, so this is tessellate's own wrap; `flow` survives
-  // only for the styled path, until `Flow` learns about unbreakable spans (Soundness #1992).
+  // Word-wraps a PLAIN (no semantic markup) message for the terminal: `flow` with nothing to
+  // protect.
   private def wrapPlain(text: Text): Text =
     import hieroglyph.textMetrics.uniformMetric
     Flow.wrap(text, wrapWidth).join(t"\n")
