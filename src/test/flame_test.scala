@@ -343,15 +343,16 @@ object Tests extends Suite(m"Flame Tests"):
       // type parameters are fixed by the `Joinable.Source` given it finds) resolves that given at
       // `Any` and then fails on `Any is Textual` — with or without `-Zdiagnostic-givens`. This is
       // frontier's catch-all satisfying a search made before inference has run; reported upstream.
-      test(m"a bare join over mapped elements still resolves with the advice in scope"):
-        isolated:
-          val repl = Opened(Repl())
-          repl.react(0, t"/set experimental")
-          repl.react(1, t"import soundness.*")
-          repl.interpret(t"List(t\"a\", t\"b\").map(_.upper).join")
-      . aspire:
-          case Repl.Outcome.Ran(_, value, _, _, _) => value.let(_.contains(t"AB")).or(false)
-          case _                                   => false
+      aspirationally:
+        test(m"a bare join over mapped elements still resolves with the advice in scope"):
+          isolated:
+            val repl = Opened(Repl())
+            repl.react(0, t"/set experimental")
+            repl.react(1, t"import soundness.*")
+            repl.interpret(t"List(t\"a\", t\"b\").map(_.upper).join")
+        . assert:
+            case Repl.Outcome.Ran(_, value, _, _, _) => value.let(_.contains(t"AB")).or(false)
+            case _                                   => false
 
       test(m"flatMap still resolves with the advice in scope"):
         isolated:
