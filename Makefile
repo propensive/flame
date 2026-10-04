@@ -47,14 +47,14 @@ flame.jar: assembly
 	cp out/flame/launcher/assembly.dest/out.jar flame.jar
 	java -cp flame.jar soundness.repackage --github propensive/flame,propensive/pyrocosm,propensive/soundness,propensive/proscala
 
-# Package the repackaged JAR as a native executable for this machine with the pinned `xeq` builder
-# script (fetched into dist/xeq and verified against etc/xeq.tsv).
-flame: flame.jar xeq-fetch
-	dist/xeq build --jar flame.jar --out flame
+# Package the repackaged JAR as a native executable for this machine with the pinned `xek` builder
+# (fetched into dist/xek and verified against etc/xek.tsv).
+flame: flame.jar xek-fetch
+	dist/xek flame.jar flame
 
-# Fetch the pinned `xeq` builder script into dist/xeq.
-xeq-fetch:
-	./etc/shared xeq-fetch.sh
+# Fetch the pinned `xek` builder into dist/xek.
+xek-fetch:
+	./etc/shared xek-fetch.sh
 
 install: flame
 	cp flame ${HOME}/.local/bin/
@@ -114,4 +114,4 @@ snapshot-prune:
 dev:
 	./mill -w flame.client.compile
 
-.PHONY: check xeq-fetch sync-deps tools snapshot snapshot-prune assembly release publishLocal run web test test-plain dev install
+.PHONY: check xek-fetch sync-deps tools snapshot snapshot-prune assembly release publishLocal run web test test-plain dev install
