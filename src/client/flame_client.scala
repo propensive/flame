@@ -137,7 +137,7 @@ given (Int is Interpretable) = new Interpretable:
     arguments.prim.lay(Unset): value =>
       safely(value().as[Int])
 
-// `execute` runs its block with an ambient `Invocation`/`DaemonService` whose derived capabilities
+// `execute` runs its block with an ambient `Invocation`/`Resident` whose derived capabilities
 // (`Stdio`, `Console`, `Environment`) are tracked; flame's command bodies take them as pure `using`
 // parameters. Seal all three once here — they outlive the command they drive — so every command body
 // type-checks under capture checking without a per-site cast. The capabilities are threaded through
@@ -387,7 +387,7 @@ private def serve(portNumber: Int)(using Stdio, Monitor, Probate, System): Exit 
 // `Rendering.Inspect` (teletype/text) mode by default. `--set`/`--language` startup settings are
 // applied first; `/quit` (or Ctrl+D / EOF) ends the session. `async` has no effect here (every
 // submission runs synchronously), so `/set async` is intercepted with a short notice.
-private def basicRepl(settings: List[Text])(using Stdio, Monitor, Probate, System, DaemonService[?]): Exit =
+private def basicRepl(settings: List[Text])(using Stdio, Monitor, Probate, System, Resident): Exit =
   given Scalac[3.9, Universe.Classfile] = Scalac(Nil)
   given Classloader = serverClassloader
 
@@ -414,7 +414,7 @@ private def basicRepl(settings: List[Text])(using Stdio, Monitor, Probate, Syste
   // launcher otherwise raw-modes a terminal stdin to forward keypresses to an interactive TUI, which
   // left `--basic` with no echo (Soundness #1648/#1651). A no-op for a pipe, and harmless against a
   // launcher too old to offer the control channel (it just stays in raw mode as before).
-  summon[DaemonService[?]].cooked:
+  summon[Resident].cooked:
     // Apply the `--set`/`--language` startup settings, so each confirmation prints before the first prompt.
     settings.each(submit)
     Out.println(Repl.messages.session(t"basic"))
