@@ -6,9 +6,9 @@ agent must follow when working in this repository.
 ## Dependencies are pinned in `etc/refs`
 
 Flame compiles against Soundness and Pyrocosm, both pinned in `etc/refs`. Its own libraries
-(`flame-core`, `flame-web`, `flame-client`) are versioned by `flameVersion` in `build.mill`,
-which the launcher resolves as a published coordinate; that value is not a pin and stays
-where it is.
+(`flame-core`, `flame-web`, `flame-client`) are versioned by the release tag alone: a release
+builds them at the tag's version, and the launcher resolves them at that same version; any
+other build is the patch after the latest release (`settings.nextVersion` in `build.mill`).
 
 `etc/refs` is tab-separated, one upstream per line: `repository`, `version`, and for a snapshot
 the `commit` it was built from. A version `X.Y.Z` is a GitHub Release. A version
@@ -48,7 +48,8 @@ A release is cut by tagging, and by nothing else:
 git tag -s X.Y.Z && git push --tags
 ```
 
-Bump `flameVersion` in `build.mill` and merge that first; the tag then fires
+The tag is the only place the version is declared: tag a commit on `main` once CI has passed
+on it, and the tag fires
 `.github/workflows/release.yml`, which runs the shared `release.sh` in
 propensive/.github. Never publish by hand, and never create a release or
 upload an asset with `gh`: the script exists so that every release is made the same way.

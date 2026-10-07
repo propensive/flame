@@ -86,8 +86,7 @@ libraries a REPL user expects to reach through `import soundness.*`.
 
 ## Releasing
 
-A release is cut by tagging. Bump `flameVersion` in `build.mill` to match, merge it, wait for
-CI to go green on that commit, and then:
+A release is cut by tagging. Wait for CI to go green on the commit, and then:
 
 ```sh
 git tag -s X.Y.Z && git push --tags
@@ -97,8 +96,7 @@ The tag fires `.github/workflows/release.yml`, which runs the shared `release.sh
 [propensive/.github](https://github.com/propensive/.github) — the same script the whole
 ecosystem releases with; what flame needs beyond the common path is the four lines in
 `etc/release`. Nothing is published until the gates pass: a signed, GitHub-verified tag, a CI
-run already green on that exact commit, `flameVersion` equal to the tag, and every dependency
-pin a published release. If a later step fails, the release and the tag are both deleted from
+run already green on that exact commit, and every dependency pin a published release. If a later step fails, the release and the tag are both deleted from
 origin.
 
 It then publishes in two ordered steps: first the three library jars, exactly as published
