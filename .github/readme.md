@@ -17,6 +17,16 @@ per-platform executables (including `flame-windows-x64.exe`), the `flame` polygl
 script, and the library jars. The first run fetches flame's externalized dependencies; later runs
 start instantly.
 
+A session warms up in the background while its first line is being typed — the compiler loads, and
+a few throwaway lines are run in a scratch session — with a gauge above the prompt until it is done,
+so that the first line is answered about as quickly as any other. Set `FLAME_NOPRIME` in the
+daemon's environment to turn this off.
+
+A line that fails for want of a given is rejected at once, with the compiler's own message, and
+Soundness's advice on the missing given — which givens would do, and what each lacks — follows a
+few seconds later in its place. The advice is sought only then: it is kept out of every other
+compile, where merely being in scope cost each line a search for it.
+
 ## The standard command line
 
 Flame is a [Pyrocosm](https://github.com/propensive/pyrocosm) tool, so it shares the command line
@@ -52,10 +62,10 @@ serve
 - **`core`** — the REPL engine. It drives the Scala 3 compiler to evaluate input, so it
   depends on `org.scala-lang:scala3-compiler_3` in addition to its Soundness components.
 - **`web`** — an alternative web front-end (`flame.web`), driving the same `core` engine.
-- **`client`** — the interactive front-end library: `flame.runClient` and its command dispatch.
+- **`client`** — the interactive front-end library: `flame.Client.run` and its command dispatch.
   `flame serve <port>` runs a REPL server; bare `flame` (over a per-process UNIX socket) connects.
 - **`launcher`** — the invocation point, alone in its own module: just
-  `@main def repl = externalize(runClient())`. It depends on `client`/`core`/`web` as **published
+  `@main def repl = externalize(Client.run())`. It depends on `client`/`core`/`web` as **published
   coordinates** (resolved from `~/.ivy2/local`), so Burdock's `externalize` records their jar
   hashes and the repackager turns them into on-demand downloads rather than inlining them (see
   below).

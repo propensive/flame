@@ -91,6 +91,10 @@ class ReplInterface(engine: Engine, options: ReplInterface.Options)(using Monito
   val transcript: pyrocosm.Live[List[Block]] = pyrocosm.Live(Nil)
   val sessions:   pyrocosm.Live[List[Block]] = pyrocosm.Live(Nil)
 
+  // What stands beside the prompt: the server's warm-up, while it lasts (see `Repl#prime`). Not
+  // in the transcript, whose settled entries the terminal commits to the scrollback.
+  val status: pyrocosm.Live[List[Block]] = pyrocosm.Live(Nil)
+
   val field: Control.Field =
     Control.Field
       ( Input(t"repl"), Control.Field.Kind.Code(Language.Scala),
@@ -105,7 +109,7 @@ class ReplInterface(engine: Engine, options: ReplInterface.Options)(using Monito
     val main: List[Panel] =
       List
         ( Panel(Panel.Id(t"transcript"), Panel.Role.Transcript, Unset, transcript, Panel.Priority.Essential, hints = Hints(hints.Follow, hints.terminal.Border.None)),
-          Panel(Panel.Id(t"prompt"), Panel.Role.Prompt, Unset, pyrocosm.Live(Nil: List[Block]), Panel.Priority.Essential, controls = List(field), hints = Hints(hints.terminal.Border.Rules)) )
+          Panel(Panel.Id(t"prompt"), Panel.Role.Prompt, Unset, status, Panel.Priority.Essential, controls = List(field), hints = Hints(hints.terminal.Border.Rules)) )
 
     Interface(Inline.text(options.title), navigation + main, hints = Hints(hints.terminal.Occupancy.Inline))
 
@@ -115,6 +119,10 @@ class ReplInterface(engine: Engine, options: ReplInterface.Options)(using Monito
   private val pending: Atomic.Ref[Map[Int, Block]] = Atomic.Ref(Map())
   private val outputs: Atomic.Ref[Map[Int, List[Block]]] = Atomic.Ref(Map())
   private val codes:   Atomic.Ref[Map[Int, Block]] = Atomic.Ref(Map())
+
+  // The entries whose rejection is to be followed by advice on a missing given (see
+  // `Repl#react`): each stays pending, showing its rejection, until the advice settles it.
+  private val advising: Atomic.Ref[List[Int]] = Atomic.Ref(Nil)
 
   // The sessions offered for selection, by their action.
   private val choices: Atomic.Ref[Map[Text, Action]] = Atomic.Ref(Map())
@@ -230,6 +238,10 @@ class ReplInterface(engine: Engine, options: ReplInterface.Options)(using Monito
       if blocks != t"" then Blocks.decode(blocks)
       else List(Block.Notice(Tone.Failure, Unset, List(Block.paragraph(SemanticRender.stripAnsi(diagnostics)))))
 
+    case Repl.Reply.Advised(_, diagnostics, _, blocks) =>
+      if blocks != t"" then Blocks.decode(blocks)
+      else List(Block.Notice(Tone.Failure, Unset, List(Block.paragraph(SemanticRender.stripAnsi(diagnostics)))))
+
     case Repl.Reply.Threw(_, output, diagnostics, _, spans, blocks) =>
       if blocks != t"" then Blocks.decode(blocks)
       else
@@ -280,7 +292,15 @@ class ReplInterface(engine: Engine, options: ReplInterface.Options)(using Monito
           case other =>
             val id = Repl.replyId(other)
             codes.revise(_.define(id, code(text, other)))
-            settle(id, content(other))
+
+            // A rejection with advice to come keeps its entry pending, under a gauge: an entry
+            // that has settled is history, which the terminal has put beyond amending.
+            if advising().has(id) then
+              val seeking: Block = Block.Gauge(Gauge.Indeterminate(), Inline.text(t"seeking advice"))
+              val shown: Block = codes().at(id).or(Block.Code(Language.Scala, Nil))
+              replace(id, Block.Group(framed(shown) + content(other) + List(seeking)))
+            else settle(id, content(other))
+
             done()
 
   private def pushed(reply: Repl.Reply): Unit = reply match
@@ -290,6 +310,17 @@ class ReplInterface(engine: Engine, options: ReplInterface.Options)(using Monito
       replace(id, entry(id))
 
     case Repl.Reply.Pending(_) => ()
+
+    case Repl.Reply.Advising(id) =>
+      advising.revise(id :: _)
+
+    case Repl.Reply.Advised(id, _, _, _) =>
+      advising.revise(_.filter(_ != id))
+      if pending().defines(id) then settle(id, content(reply))
+
+    case Repl.Reply.Warming(_, done, total) =>
+      if done >= total then status.amend(_ => Nil)
+      else status.amend(_ => List(Block.Gauge(Gauge.Fraction(done.toDouble/total), Inline.text(t"warming up"))))
 
     case other =>
       val id = Repl.replyId(other)

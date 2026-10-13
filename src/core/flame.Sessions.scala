@@ -88,8 +88,13 @@ object Sessions:
 
     loaded.let { list => if list.nil then Unset else list }.or(fallback)
 
+// `frontend` says the connections are a front-end's, which shows what the server pushes of its own
+// accord, rather than a client's that expects only answers to what it asked. Each session a
+// connection opens is then warmed up in the background (see `Repl#prime`), its progress pushed as
+// `Reply.Warming`; and a line that fails for want of a given is rejected at once, the advice on it
+// following as a `Reply.Advised` (see `Repl#react`) instead of holding the rejection up.
 class Sessions[version <: Scalac.Versions]
-  ( render: Repl.Rendering = Repl.Rendering.Inspect )
+  ( render: Repl.Rendering = Repl.Rendering.Inspect, frontend: Boolean = false )
   ( using scalac: Scalac[version, Universe.Classfile], classloader: Classloader,
     temporary: TemporaryDirectory ):
 
@@ -203,10 +208,18 @@ class Sessions[version <: Scalac.Versions]
   class Connection(send: Repl.Reply => Unit)(using Monitor, System, Probate):
     @volatile private var current: Optional[Text] = Unset
 
+    // `send`, vouched pure: it is the socket's or the page's, and outlives every task that
+    // pushes a reply through it (see `connection`), which a task could not otherwise hold.
+    private val push: Repl.Reply -> Unit = caps.unsafe.unsafeAssumePure(send)
+
     def currentName: Text = current.or:
       val name = create()
       current = name
+      prime(name)
       name
+
+    private def prime(name: Text): Unit = if frontend then
+      session(name).let(_.prime { (done, total) => push(Repl.Reply.Warming(0, done, total)) })
 
     def name: Optional[Text] = current
 
@@ -220,6 +233,9 @@ class Sessions[version <: Scalac.Versions]
 
           ReplContext.set(repl.session, ReplContext.Values(directory, variables))
 
+    // Where a submission's advice goes, if it is to follow the reply at all.
+    private val advice: Optional[Repl.Reply -> Unit] = if frontend then push else Unset
+
     def respond(request: Repl.Request): Optional[Repl.Reply] logs CompileEvent = request match
       case Repl.Request.Tokenize(id, code) =>
         val scope: List[Repl.ScopeBinding] = session(currentName).lay(Nil)(_.scopeAt(code))
@@ -228,17 +244,17 @@ class Sessions[version <: Scalac.Versions]
 
       case Repl.Request.Submit(id, code) =>
         session(currentName).lay(Repl.Reply.Failed(id, t"no active session")): repl =>
-          if !repl.asyncEnabled then repl.react(id, code)
+          if !repl.asyncEnabled then repl.react(id, code, onAdvice = advice)
           else
-            send(Repl.Reply.Pending(id))
+            push(Repl.Reply.Pending(id))
 
             async:
               val reply: Repl.Reply =
                 safely(repl.react(id, code, chunk => Repl.streamChunks(chunk).each { (stream, text) =>
-                  send(Repl.Reply.Output(id, text, stream)) })).or
+                  push(Repl.Reply.Output(id, text, stream)) }, advice)).or
                  (Repl.Reply.Failed(id, t"the submission could not be processed"))
 
-              send(reply)
+              push(reply)
 
             Unset
 
@@ -250,6 +266,7 @@ class Sessions[version <: Scalac.Versions]
         val wasAbsent: Boolean = current.absent
         val created: Boolean = if name == t"" then wasAbsent else open(name)
         if name != t"" then current = name
+        if created && name != t"" then prime(name)
         val outcome = if created then Repl.SessionOutcome.Created else Repl.SessionOutcome.Joined
         val reply = Repl.Reply.Session(id, currentName, names, outcome)
         applyContext()
@@ -265,6 +282,7 @@ class Sessions[version <: Scalac.Versions]
       case Repl.Request.Create(id, name) =>
         if open(name) then
           current = name
+          prime(name)
           applyContext()
           Repl.Reply.Session(id, name, names, Repl.SessionOutcome.Created)
         else Repl.Reply.Session(id, current.or(t""), names, Repl.SessionOutcome.Exists)

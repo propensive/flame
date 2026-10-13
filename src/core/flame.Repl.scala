@@ -480,6 +480,16 @@ object Repl:
     case Session(id: Int, name: Text, names: List[Text], outcome: Text)
     // Every session's name, in answer to a `SessionList` request; touches no current session.
     case SessionList(id: Int, names: List[Text])
+    // Pushed of the server's own accord while it warms up in the background (see `Repl#prime`):
+    // `done` of `total` units of the work are finished, and `done == total` says it is over. The
+    // `id` answers no request.
+    case Warming(id: Int, done: Int, total: Int)
+    // Pushed BEFORE the `Rejected` reply to a submission that failed for want of a given: advice
+    // on the missing given is being sought, and will follow as an `Advised` with the same `id`.
+    case Advising(id: Int)
+    // The follow-up to `Advising`: the submission's diagnostics again, in the shape of `Rejected`,
+    // now with Soundness's advice on the missing given (or as they were, if there was none).
+    case Advised(id: Int, diagnostics: Text, highlight: List[Token], blocks: Text = t"")
 
   // Pure anchors for the top-level wire enums, on the same footing as the leaf codecs above, so
   // `Bintel.read[Request]`/`[Reply]` (whose context bound requires a pure instance) resolves.
@@ -501,10 +511,8 @@ object Repl:
 
   // Highlights `code` with Harlequin's typechecked pipeline (the compiler
   // resolves symbols, so accents are accurate and each token carries its type).
-  // Needs the session's `Scalac` and compile classpath; used for `submit`.
-  def highlight(code: Text)(using Scalac[?, ?], LocalClasspath): List[Token] =
-    import highlighting.typecheckedScala
-    project(Scala.highlight(code))
+  // Needs a typechecked `Highlight` (see `Repl#typed`); used for `submit`.
+  def highlight(code: Text)(using Highlight): List[Token] = project(Scala.highlight(code))
 
   // Highlights `code` with Harlequin's standalone lexer — no compiler, so it is
   // fast enough to run on every keystroke for live editing (no type information).
@@ -848,9 +856,8 @@ object Repl:
   // session-defined member reads as the user would write it (`Foo.Bar.type`, not
   // `<empty>.rs$line$3.Foo.Bar.type`), exactly as the result line and diagnostics do.
   def complete(context: List[Text], code: Text, offset: Int, imports: stenography.Imports)
-      (using Scalac[?, ?], LocalClasspath)
+      (using Highlight)
   :   List[CompletionItem] =
-    import highlighting.typecheckedScala
 
     val contextLines: Text = context.map { (line: Text) => t"$line\n" }.join
 
@@ -1090,6 +1097,9 @@ object Repl:
     case Reply.Output(id, _, _)                  => id
     case Reply.Session(id, _, _, _)              => id
     case Reply.SessionList(id, _)                => id
+    case Reply.Warming(id, _, _)                 => id
+    case Reply.Advising(id)                      => id
+    case Reply.Advised(id, _, _, _)              => id
 
   object messages:
     def session(name: Text): Text = t"Session $name"
@@ -1148,10 +1158,7 @@ object Repl:
   // `__base` re-binds the result through an ORDINARY `val`, which widens the singleton straight
   // back to `Int`/`String`/`Boolean`. That is what `baseName` reads, so a precisely-typed `42` is
   // still named `int` rather than falling back to `resN`. Both types come from the one compile.
-  def resultType(context: List[Text], code: Text)(using Scalac[?, ?], LocalClasspath)
-  :   Optional[ResultType] =
-
-    import highlighting.typecheckedScala
+  def resultType(context: List[Text], code: Text)(using Highlight): Optional[ResultType] =
     val contextLines: Text = context.map { (line: Text) => t"$line\n" }.join
 
     val highlighted =
@@ -1219,7 +1226,7 @@ object Repl:
   // on a later line. Resolution is checked by asking the compiler to complete the bare name.
   // NOTE: each `taken` check is a full compiler run; `evaluate` no longer uses this (see the
   // compile-free `Repl#freeBindingName`), so it remains only for external callers.
-  def freeName(base: Text, context: List[Text])(using Scalac[?, ?], LocalClasspath): Text =
+  def freeName(base: Text, context: List[Text])(using Highlight): Text =
     def taken(candidate: Text): Boolean =
       allKeywords.has(candidate)
       || complete(context, candidate, candidate.length, stenography.Imports.empty)
@@ -1365,7 +1372,7 @@ object Repl:
   // one (`def f(a: Int) = a` → `def f(a: Int): Int`). Inference typechecks the def applied to `???`s;
   // if that fails (an unusual signature), the header is shown without a return type.
   def defSignature(line: Text, name: Text, context: List[Text], imports: stenography.Imports)
-      (using Scalac[?, ?], LocalClasspath)
+      (using Highlight)
   :   Text =
     val header: Text = defHeader(line)
     if annotatesReturnType(header) then header else
@@ -1394,6 +1401,75 @@ object Repl:
   enum Rendering:
     case Inspect
     case Exhibit(ansi: Boolean)
+
+  // ── Missing-given advice ─────────────────────────────────────────────────────────────────────
+  // Soundness's missing-given advice is a catch-all implicit, `soundness.explainMissingContext`,
+  // which a line reaches through `import soundness.*` — and which, as a candidate for every
+  // implicit search that fails, runs its (slow) explanation macro each time, in lines that go on
+  // to compile as much as in those that do not. So the session's wildcard imports of `soundness`
+  // are re-injected with that one member excluded (`unadvised`), in every compile and probe but
+  // the one that seeks the advice (`advised`, its inverse), for a line already known to need it.
+  // Excluded rather than shadowed: Scala 3 does not hold shadowing against an implicit.
+  private val unadvisedSelector: Text = t"explainMissingContext as _, "
+
+  // An escape hatch for A/B-ing against the advice in every compile, as it used to be (`make
+  // bench`). The DAEMON's own environment, as for `FLAME_COLD`.
+  private lazy val eagerAdvice: Boolean =
+    import environments.javaBaseEnvironment
+    safely(Environment(t"FLAME_EAGER_ADVICE")).present
+
+  // An escape hatch for A/B-ing the probes typed in the warm session against a compiler apiece.
+  private lazy val coldProbes: Boolean =
+    import environments.javaBaseEnvironment
+    safely(Environment(t"FLAME_COLD_PROBES")).present
+
+  def unadvised(statement: Text): Text =
+    val clause: Text = statement.trim.chomp(t"import ").trim.chomp(t"_root_.")
+
+    if eagerAdvice then statement
+    else if clause == t"soundness.*" || clause == t"soundness._" then t"import soundness.{$unadvisedSelector*}"
+    else if clause.starts(t"soundness.{") && clause.contains(t"*") && !clause.contains(unadvisedSelector)
+    then t"import soundness.{$unadvisedSelector${clause.skip(t"soundness.{".length)}"
+    else statement
+
+  def advised(statement: Text): Text = statement.sub(unadvisedSelector, t"")
+
+  // A value handed from one thread to another that then waits for it.
+  private final class Cell[value](@volatile var value: value)
+
+  // Whether a failed compile failed for want of a given, which is what the advice is about.
+  def missingGiven(notices: List[Notice]): Boolean = notices.exists: (notice: Notice) =>
+    notice.importance == Importance.Error && notice.message.contains(t"No given instance of type")
+
+  // ── Priming ──────────────────────────────────────────────────────────────────────────────────
+  // The lines a scratch session runs, once per JVM, before anybody's first line (see
+  // `Repl#prime`), each with its share (of 100) of the time they take in a JVM that has compiled
+  // nothing — measured with `flame.firstLine` (`make bench`). Between them they take the paths a
+  // first line otherwise pays for: the compiler and its symbol table, a result and its type, a
+  // lambda and a collection, a diagnostic, a stack trace, and Soundness's own macros.
+  private val primingLines: List[(Text, Int)] =
+    List
+      ( (t"1 + 1", 11),
+        (t"List(1, 2, 3).map(_ + 1)", 21),
+        (t"val wrong: Int = \"\"", 20),
+        (t"sys.error(\"\")", 2),
+        (t"/set experimental", 0),
+        (t"import soundness.*", 2),
+        (t"t\"\"", 16) )
+
+  // The share of the session's own compiler (see `Repl#primeSession`), which comes first.
+  private val primingSession: Int = 28
+  private val primingTotal: Int = 100
+
+  // Claimed by the first session to prime: the scratch session's work is the JVM's, not a
+  // session's, so it is done once.
+  private val jvmPrimed: juc.atomic.AtomicBoolean = juc.atomic.AtomicBoolean(false)
+
+  // An escape hatch for A/B-ing a primed session against an unprimed one (`make bench`). The
+  // DAEMON's own environment, as for `FLAME_COLD`.
+  private lazy val primingDisabled: Boolean =
+    import environments.javaBaseEnvironment
+    safely(Environment(t"FLAME_NOPRIME")).present || safely(Environment(t"FLAME_COLD")).present
 
   def make[version <: Scalac.Versions]
     ( prelude: Repl.Prelude, render: Repl.Rendering = Repl.Rendering.Inspect )
@@ -1513,7 +1589,7 @@ class Repl[version <: Scalac.Versions]
   def asyncEnabled: Boolean = asyncMode
 
   private val out: Path on Linux = unsafely(temporaryDirectory/Uuid())
-  locally(unsafely(out.create[Directory]()))
+  locally(unsafely(mute[Io.Event](out.create[Directory]())))
 
   // The run-time classloader over `out` (where each line's wrapper `.class` files land) plus any JARs
   // or directories added with `/classload`. It is a `URLClassLoader` SUBCLASS so `/classload` can
@@ -1884,6 +1960,9 @@ class Repl[version <: Scalac.Versions]
     // session block (and the thread with it).
     enum Request:
       case Compile(sources: Map[Text, Text], reply: juc.SynchronousQueue[(CompileResult, List[Notice])])
+      // Something to run on the session thread with the session's front end (see `inspect`);
+      // `done` is told when it has run, whether or not it threw.
+      case Probe(run: Scalac.Session.Frontend -> Unit, done: juc.SynchronousQueue[java.lang.Boolean])
       case Retire
 
   private class Warm(setup: Scalac.Setup[version, Universe.Classfile])(using System):
@@ -1930,6 +2009,33 @@ class Repl[version <: Scalac.Versions]
         // One last look: the thread may have replied and exited between the two checks.
         result.or(Optional(reply.poll(0, juc.TimeUnit.MILLISECONDS)).or(crashed))
 
+    // Runs `probe` on the session thread with typechecked highlighting that types IN the
+    // session (harlequin's `sessionScala`): against everything the session has compiled, and
+    // without loading the classpath's symbol table again, as highlighting on its own does for
+    // every snippet. `Unset` if the session thread is gone, or the probe threw. The result is
+    // plain data; nothing of the session leaves its thread.
+    def inspect[result](probe: Highlight ?=> result): Optional[result] =
+      val found: Repl.Cell[Optional[result]] = Repl.Cell(Unset)
+      val done: juc.SynchronousQueue[java.lang.Boolean] = juc.SynchronousQueue()
+
+      val run: Scalac.Session.Frontend -> Unit = caps.unsafe.unsafeAssumePure: frontend =>
+        given Scalac.Session.Frontend = frontend
+        found.value = probe(using highlighting.sessionScala)
+
+      val request = Warm.Request.Probe(run, done)
+      var handed: Boolean = false
+
+      while !handed && thread.isAlive do
+        handed = requests.offer(request, Warm.pollInterval, juc.TimeUnit.MILLISECONDS)
+
+      if handed then
+        var finished: Boolean = false
+
+        while !finished && thread.isAlive do
+          finished = done.poll(Warm.pollInterval, juc.TimeUnit.MILLISECONDS) != null
+
+      found.value
+
     // `true` when the session thread took the request within `pollInterval`.
     def retire(): Boolean = requests.offer(Warm.Request.Retire, Warm.pollInterval, juc.TimeUnit.MILLISECONDS)
 
@@ -1962,6 +2068,10 @@ class Repl[version <: Scalac.Versions]
 
         while running do requests.take().nn match
           case Warm.Request.Retire => running = false
+
+          case Warm.Request.Probe(run, done) =>
+            try run(compilation.frontend) catch case _: Throwable => ()
+            done.put(java.lang.Boolean.TRUE)
 
           case Warm.Request.Compile(sources, reply) =>
             val result: (CompileResult, List[Notice]) =
@@ -2035,21 +2145,14 @@ class Repl[version <: Scalac.Versions]
   @scala.caps.unsafe.untrackedCaptures
   private var warmKey: Optional[Text] = Unset
 
-  // Compiles `sources` through the warm session, opening (or re-opening) it if the effective
-  // compiler arguments or classpath have changed since it was opened. Called under `mutex`, which
-  // is what keeps one submission's request/reply pair from interleaving with another's.
-  private def warmCompile(sources: Map[Text, Text])(using System, Monitor, Probate)
-  :   (CompileResult, List[Notice]) =
+  // The warm session for the effective compiler arguments and classpath, opened (or re-opened)
+  // if either has changed since it was; `Unset` under `FLAME_COLD`. Called under `mutex`.
+  private def warmSession()(using System): Optional[Warm] =
+    if coldCompiles then Unset else
+      val scalac: Scalac[version, Universe.Classfile] = effectiveScalac
+      val path: LocalClasspath = classpath
+      val key: Text = t"${scalac.commandLineArguments.join(t" ")} ${path()}"
 
-    val scalac: Scalac[version, Universe.Classfile] = effectiveScalac
-    val path: LocalClasspath = classpath
-    val key: Text = t"${scalac.commandLineArguments.join(t" ")} ${path()}"
-
-    if coldCompiles then
-      import strategies.throwUnsafely
-      val process = scalac(path)(sources, out)
-      (process.complete(), process.notices)
-    else
       def open(): Warm =
         val fresh = Warm(scalac.on(path))
         warm = fresh
@@ -2059,12 +2162,32 @@ class Repl[version <: Scalac.Versions]
       // Reuse the open session only when its key still matches; otherwise retire it and open a
       // fresh one. Phrased over the `Optional` rather than around it, so the session is a value we
       // hold rather than one we have to prove is there.
-      val session = warm.lay(open()): existing =>
+      warm.lay(open()): existing =>
         if warmKey.lay(true)(_ != key) then
           existing.retire()
           open()
         else existing
 
+  // Runs `probe` — a result-type, signature or completion probe — with typechecked highlighting:
+  // in the warm session (see `Warm#inspect`), or, when there is none or it failed there, with a
+  // compiler of the probe's own, as every probe once had. Called under `mutex`.
+  private def typed[result](probe: Highlight ?=> result)(using System): result =
+    def cold: result = probe(using highlighting.typecheckedScala(using scalac, classpath))
+    if Repl.coldProbes then cold else warmSession().lay(cold) { session => session.inspect(probe).or(cold) }
+
+  // Compiles `sources` through the warm session, opening (or re-opening) it if the effective
+  // compiler arguments or classpath have changed since it was opened. Called under `mutex`, which
+  // is what keeps one submission's request/reply pair from interleaving with another's.
+  private def warmCompile(sources: Map[Text, Text])(using System, Monitor, Probate)
+  :   (CompileResult, List[Notice]) =
+
+    val opened: Optional[Warm] = warmSession()
+
+    opened.lay
+     ( locally:
+         import strategies.throwUnsafely
+         val process = effectiveScalac(classpath)(sources, out)
+         (process.complete(), process.notices) ): session =>
       val result = session.compile(sources)
 
       // A session that died takes its key with it, so the next line opens a fresh one rather than
@@ -2094,10 +2217,154 @@ class Repl[version <: Scalac.Versions]
       inspector = Unset
       inspectorKey = Unset
 
+    primeEpoch.incrementAndGet()
+    primeable = false
     scopeCache = Unset
     reifierCache = Unset
     ReplContext.clear(session)
     ReplBridge.clear(session)
+
+  // ── Priming ──────────────────────────────────────────────────────────────────────────────────
+  // A session's first line is far slower than its later ones: nothing of the compiler is loaded
+  // until it is submitted, and then the JVM loads and warms dotc and the rendering code, and the
+  // session opens its warm compiler and builds its reifier, all while the user waits. But a session
+  // is opened some seconds before its first line is finished being typed, so `prime` does that
+  // work in the background in the meantime, on a thread of its own:
+  //
+  //   * once per JVM, it runs `Repl.primingLines` in a SCRATCH session, which is then closed — real
+  //     lines, taking exactly the paths a user's will, without touching this session's state;
+  //   * for this session, it opens the warm compiler with a source nothing refers to, and builds
+  //     the semantic imports (`primeSession`). That part is repeated when a `/set`, `/language` or
+  //     `/classload` retires them.
+  //
+  // It never holds a real line up for work the line would not have done itself: the scratch
+  // session has its own compiler and mutex, and the session's part stands aside while a
+  // submission is pending. A failure is no more than a first line that is as slow as it was.
+  //
+  // `onProgress` is told `(done, total)` as the work proceeds, and `done == total` when it is over
+  // — which, once the JVM is warm, is a moment after it began.
+  private val primeLock: Mutex = Mutex()
+  private val primeEpoch: juc.atomic.AtomicInteger = juc.atomic.AtomicInteger(0)
+
+  @scala.caps.unsafe.untrackedCaptures
+  private var primer: Optional[Thread] = Unset
+  @scala.caps.unsafe.untrackedCaptures
+  private var primeAgain: Boolean = false
+  @scala.caps.unsafe.untrackedCaptures
+  private var primeListeners: List[(Int, Int) -> Unit] = Nil
+  @scala.caps.unsafe.untrackedCaptures
+  private var primeDone: Int = 0
+
+  // Set by `prime` and unset by `close`: only a session somebody asked to have primed is primed
+  // again after a change of settings, and a closed one never is.
+  @volatile
+  @scala.caps.unsafe.untrackedCaptures
+  private var primeable: Boolean = false
+
+  // Whether a primer is at work, for a caller that wants to wait it out.
+  def priming: Boolean = primeLock(primer.present)
+
+  def prime(onProgress: (Int, Int) => Unit = (_, _) => ())(using System, Probate): Unit =
+    if !Repl.primingDisabled then primeLock:
+      primeable = true
+
+      if primer.present then
+        // Somebody else's primer: a listener joins it if it is still reporting.
+        if !primeListeners.nil then
+          val listener: (Int, Int) -> Unit = caps.unsafe.unsafeAssumePure(onProgress)
+          primeListeners = listener :: primeListeners
+          safely(listener(primeDone, Repl.primingTotal))
+      else
+        primeDone = 0
+        primeListeners = List(caps.unsafe.unsafeAssumePure(onProgress))
+        safely(onProgress(0, Repl.primingTotal))
+        launchPrimer(Repl.jvmPrimed.compareAndSet(false, true))
+
+  // Primes the session's own part again, after a change that retired its compiler. Silent: no
+  // listener outlives the priming it asked for.
+  private def reprime()(using System, Probate): Unit =
+    if primeable && !Repl.primingDisabled then primeLock:
+      if primer.present then primeAgain = true else launchPrimer(false)
+
+  // Called under `primeLock`. The thread has the compile thread's stack, since the scratch
+  // session types its lines on it.
+  private def launchPrimer(cold: Boolean)(using System, Probate): Unit =
+    val runnable: Runnable = caps.unsafe.unsafeAssumePure(() => runPrimer(cold))
+    val created = Thread(null, runnable, "flame-primer", Warm.stackSize)
+    created.setDaemon(true)
+    created.setPriority(Thread.MIN_PRIORITY)
+    primer = created
+    created.start()
+
+  private def progress(done: Int): Unit = primeLock:
+    primeDone = done
+    primeListeners.each { listener => safely(listener(done, Repl.primingTotal)) }
+    if done >= Repl.primingTotal then primeListeners = Nil
+
+  private def runPrimer(cold: Boolean)(using System, Probate): Unit = mute[CompileEvent]:
+    // An orphan monitor, for the reason the warm session has one (see `Warm#session`).
+    given monitor: Monitor = caps.unsafe.unsafeAssumePure(parasite.unsupervised.orphanMonitor)
+
+    try
+      // The session's own part comes first: it is what the user's first line needs most, and on
+      // a JVM that has compiled nothing it is the first compile, so most of the loading too.
+      safely(primeSession())
+
+      if cold then
+        val scratch: Repl[version] = Repl.make[version](Repl.Prelude.empty, render)
+        var done: Int = Repl.primingSession
+        progress(done)
+
+        try
+          Repl.primingLines.each: (line, share) =>
+            // A line of the user's own goes first: the two would only compete for the machine.
+            while pendingSubmissions.get > 0 do jl.Thread.sleep(10)
+            safely(scratch.react(0, line))
+            done += share
+            progress(done)
+        finally scratch.close()
+
+      var more: Boolean = true
+
+      while more do
+        progress(Repl.primingTotal)
+
+        more = primeLock:
+          val again: Boolean = primeAgain
+          primeAgain = false
+          if !again then primer = Unset
+          again
+
+        if more then safely(primeSession())
+
+    catch case _: Throwable => ()
+    finally
+      progress(Repl.primingTotal)
+      primeLock { primer = Unset }
+
+  // The session's own part: its warm compiler, opened by a source no line will ever name, and its
+  // semantic imports. Neither is begun once a line is pending (which will do the same itself) or
+  // the session has been closed.
+  private def primeSession()(using Monitor, System, Probate): Unit logs CompileEvent =
+    val epoch: Int = primeEpoch.get
+    def wanted: Boolean = primeEpoch.get == epoch && pendingSubmissions.get == 0
+
+    // The `/set` that asked for this is itself a submission, pending for a moment yet.
+    var patience: Int = 40
+    while pendingSubmissions.get > 0 && patience > 0 do
+      jl.Thread.sleep(5)
+      patience -= 1
+
+    // What an expression line compiles to (see `expressionCode`), so that the session's compiler
+    // has typed the rendering of a result before it is asked for one — but under a name of its
+    // own, never run, and not in `history`.
+    val body: List[Text] = expressionCode(t"primed", t"prime", t"1").lines.map { (line: Text) => t"  $line" }
+    val source: Text = (contextImports(t"1") + (t"object flamePrimer:" :: body)).join(t"\n")
+
+    mutex:
+      if wanted then warmCompile(Map(t"flamePrimer.scala" -> source))
+
+    if wanted then semanticImports
 
   // commit the (mutable, mutex-guarded) session state during compilation and then run the object
   // load OUTSIDE the mutex: `Complete` is a line that produced its final `Outcome` already (a
@@ -2120,6 +2387,71 @@ class Repl[version <: Scalac.Versions]
 
     case complete => complete
 
+  // The notices of a compile of `file`, their spans rewritten into the user's coordinates (see
+  // `compile`): `bodyLine` is the line of the wrapped source the user's first line sits on.
+  private def positioned(raw: List[Notice], file: Text, bodyLine: Int, code: Text, origin: Optional[Text])
+  :   List[Notice] =
+
+    val typed: Text = origin.or(code)
+    val userLines: Int = typed.lines.size
+    val firstCode: Text = code.lines.prim.or(t"")
+    val firstUser: Text = typed.lines.prim.or(t"")
+
+    val prefix: Optional[Int] =
+      if firstCode.ends(firstUser) then firstCode.length - firstUser.length else Unset
+
+    raw.map: (notice: Notice) =>
+      val mapped: Optional[Span] =
+        if notice.file != file then Unset
+        else prefix.let: (prefix: Int) =>
+          notice.span.let: (span: Span) =>
+            Repl.userSpan(span, bodyLine, layout.indent, prefix, userLines)
+
+      notice.copy(span = mapped)
+
+  // ── Missing-given advice ─────────────────────────────────────────────────────────────────────
+  // Soundness explains a missing given — which givens would have done, and what each of those
+  // lacks — but the explanation takes seconds to work out, and its catch-all implicit is tried
+  // by every implicit search that fails, in lines that compile as in those that do not. So no
+  // line is compiled with it (see `Repl.unadvised`), and a line that fails for want of a given
+  // is compiled a SECOND time with it: by a compiler of its own, off the session's mutex, so the
+  // session is free meanwhile. `compile` leaves here how to do that, for `react` to pick up
+  // under the same hold of the mutex.
+  @scala.caps.unsafe.untrackedCaptures
+  private var pendingAdvice: Optional[() -> List[Notice]] = Unset
+
+  // The notices of `source` compiled with the advice, cold, into a directory nothing reads.
+  private def advise
+    ( scalac: Scalac[version, Universe.Classfile], path: LocalClasspath, file: Text, source: Text )
+    ( using System, Probate )
+  :   List[Notice] =
+
+    mute[CompileEvent]:
+      import strategies.throwUnsafely
+      given monitor: Monitor = caps.unsafe.unsafeAssumePure(parasite.unsupervised.orphanMonitor)
+      val scratch: Path on Linux = temporaryDirectory/Uuid()
+      scratch.create[Directory]()
+      val process = scalac(path)(Map(file -> source), scratch)
+      process.complete()
+      process.notices
+
+  // Runs `advice` on a thread with the compile thread's stack, handing what it found to `sink`:
+  // the advised notices if the compile reported an error, as it should, and `Unset` otherwise.
+  private def seek(advice: () -> List[Notice])(sink: Optional[List[Notice]] => Unit): Thread =
+    val runnable: Runnable = caps.unsafe.unsafeAssumePure: () =>
+      val found: Optional[List[Notice]] =
+        try
+          val notices: List[Notice] = advice()
+          if notices.exists(_.importance == Importance.Error) then notices else Unset
+        catch case _: Throwable => Unset
+
+      safely(sink(found))
+
+    val created = Thread(null, runnable, "flame-advice", Warm.stackSize)
+    created.setDaemon(true)
+    created.start()
+    created
+
   // Compiles `code` as the next wrapper object and, on success, returns a `Deferred` whose thunk
   // loads it (running its body) — off the mutex. `rendered` is evaluated after a successful run to
   // supply the `Outcome.Ran` value — `Unset` for statements, or the inspected result for an
@@ -2134,28 +2466,26 @@ class Repl[version <: Scalac.Versions]
     val source:  Text = layout.wrap(index, imported, imports, code)
     val (outcome, raw) = warmCompile(Map(t"$name.scala" -> source))
 
+    // A line that failed for want of a given is worth compiling again WITH the advice (see
+    // `Repl.unadvised`): how to is left for `react`, which decides when.
+    if outcome == CompileResult.Failure && Repl.missingGiven(raw) then
+      val advisedImports: List[Text] = imports.map(Repl.advised)
+      val advisedSource: Text = layout.wrap(index, imported, advisedImports, code)
+      val scalac: Scalac[version, Universe.Classfile] = effectiveScalac
+      val path: LocalClasspath = classpath
+      val line: Int = layout.bodyLine(imported, advisedImports)
+
+      pendingAdvice = caps.unsafe.unsafeAssumePure: () =>
+        positioned(advise(scalac, path, t"$name.scala", advisedSource), t"$name.scala", line, code, origin)
+
     // Every notice's span is rewritten into the USER's coordinates (`Repl.userSpan`), or dropped
     // when it lies outside the user's text, so the front-ends can underline it in the submitted
     // line. `origin` is the line as the user typed it; `code` embeds it — verbatim on every line
     // but the first, which a binding prefix (`final val x = `) may precede, measured here as
     // whatever the first line of `code` has in front of the first line of `origin`. A `code` that
     // does not embed `origin` that way (a probe) yields no positions.
-    val typed: Text = origin.or(code)
-    val userLines: Int = typed.lines.size
-    val firstCode: Text = code.lines.prim.or(t"")
-    val firstUser: Text = typed.lines.prim.or(t"")
-
-    val prefix: Optional[Int] =
-      if firstCode.ends(firstUser) then firstCode.length - firstUser.length else Unset
-
-    val notices: List[Notice] = raw.map: (notice: Notice) =>
-      val mapped: Optional[Span] =
-        if notice.file != t"$name.scala" then Unset
-        else prefix.let: (prefix: Int) =>
-          notice.span.let: (span: Span) =>
-            Repl.userSpan(span, layout.bodyLine(imported, imports), layout.indent, prefix, userLines)
-
-      notice.copy(span = mapped)
+    val notices: List[Notice] =
+      positioned(raw, t"$name.scala", layout.bodyLine(imported, imports), code, origin)
 
     outcome match
       case CompileResult.Crash(trace) =>
@@ -2305,7 +2635,8 @@ class Repl[version <: Scalac.Versions]
     val repeated = importsIn(line)
     def keep(statement: Text): Boolean = !repeated.has(statement)
 
-    ambientImports + prelude.imports.map(_.tt).filter(keep) + imports.filter(keep).map(qualifyImport)
+    ambientImports
+    + (prelude.imports.map(_.tt).filter(keep) + imports.filter(keep).map(qualifyImport)).map(Repl.unadvised)
 
   // The imports every line gets WITHOUT asking, and that `/context` does not list and `/unimport`
   // cannot remove — the REPL's equivalent of the console `println` writes to. Just the ambient
@@ -2447,7 +2778,8 @@ class Repl[version <: Scalac.Versions]
       case (t"def", defName: Text) =>
         // The signature is computed now (under the mutex, where the compiler is in use); the
         // run itself produces no output for a `def`.
-        val signature: Text = Repl.defSignature(line, defName, context, semanticImports)
+        val shown: stenography.Imports = semanticImports
+        val signature: Text = typed(Repl.defSignature(line, defName, context, shown))
         mapRan(compile(contextImports(line), line, onOutput)(Unset)):
           ran => ran.copy(output = t"$signature\n")
 
@@ -2479,7 +2811,7 @@ class Repl[version <: Scalac.Versions]
 
     // The scope this line sees, for typing the result and for checking name collisions.
     val context: List[Text] =
-      ambientImports + (prelude.imports.map(_.tt) + sessionImports) + historyImports
+      ambientImports + (prelude.imports.map(_.tt) + sessionImports).map(Repl.unadvised) + historyImports
 
     // A definition or declaration can never be an expression: go STRAIGHT to the definition/statement
     // path, skipping the result-type probe and the try-as-expression compile — two whole compiler
@@ -2496,7 +2828,7 @@ class Repl[version <: Scalac.Versions]
 
     given LocalClasspath = classpath
 
-    val result0: Optional[Repl.ResultType] = safely(Repl.resultType(context, line))
+    val result0: Optional[Repl.ResultType] = safely(typed(Repl.resultType(context, line)))
     val tpe:     Optional[Repl.TypeText]   = result0.let(typeText)
 
     // A line that is just an existing identifier (it type-checks, so it resolves) is echoed under
@@ -2558,7 +2890,7 @@ class Repl[version <: Scalac.Versions]
     given LocalClasspath = classpath
 
     val tpe: Optional[Repl.TypeText] =
-      safely(Repl.resultType(context, t"{ $line\n$bound }")).let(typeText)
+      safely(typed(Repl.resultType(context, t"{ $line\n$bound }"))).let(typeText)
 
     val lazyVal: Boolean =
       line.trim.cut(t" ").keep { word => word != t"val" && word != t"var" }.has(t"lazy")
@@ -2630,7 +2962,7 @@ class Repl[version <: Scalac.Versions]
   // `/set <name> [on|off]` toggles a compiler setting for every subsequent line (no argument = on);
   // `/set` with no name lists the compiler settings (plus `async`) and their state. `async` is a plain
   // session toggle, not a compiler flag, so it is handled here rather than in the shared `toggle`.
-  private def set(line: Text): Outcome = line.cut(t" ").filter(_ != t"") match
+  private def set(line: Text)(using System, Probate): Outcome = line.cut(t" ").filter(_ != t"") match
     case _ :: t"async" :: rest =>
       asyncMode = enabledBy(rest)
       Outcome.Ran(Nil, Unset, t"Async ${if asyncMode then t"enabled" else t"disabled"}\n")
@@ -2647,7 +2979,7 @@ class Repl[version <: Scalac.Versions]
 
   // `/language <name> [on|off]` toggles an `import language.*` feature; `/language` with no name lists
   // the plain features always and the experimental ones once `/set experimental` is on.
-  private def language(line: Text): Outcome = line.cut(t" ").filter(_ != t"") match
+  private def language(line: Text)(using System, Probate): Outcome = line.cut(t" ").filter(_ != t"") match
     case _ :: name :: rest => toggle(Kind.Language, t"language feature", name, rest)
 
     case _ =>
@@ -2661,7 +2993,7 @@ class Repl[version <: Scalac.Versions]
 
   // Toggles the setting of `kind` named `name`, gating experimental language features on `experimental`
   // being enabled; `label` names the category for the messages.
-  private def toggle(kind: Kind, label: Text, name: Text, rest: List[Text]): Outcome =
+  private def toggle(kind: Kind, label: Text, name: Text, rest: List[Text])(using System, Probate): Outcome =
     Repl.settings.seek { setting => setting.kind == kind && setting.name == name } match
       case setting: Repl.Setting if setting.experimental && !enabledSettings.has(t"experimental") =>
         Outcome.Ran(Nil, Unset, t"$name is experimental — enable it first with `/set experimental`\n")
@@ -2669,6 +3001,7 @@ class Repl[version <: Scalac.Versions]
       case setting: Repl.Setting =>
         val enable: Boolean = enabledBy(rest)
         enabledSettings = if enable then enabledSettings + Set(name) else enabledSettings.except(Set(name))
+        reprime()
         Outcome.Ran(Nil, Unset, t"$name ${if enable then t"enabled" else t"disabled"}\n")
 
       case _ =>
@@ -2708,7 +3041,7 @@ class Repl[version <: Scalac.Versions]
   // tab-completion offers), then canonicalised. A name ending in `.jar`/`.zip` is recorded as a JAR,
   // anything else as a directory (the run-time URL is classified by the filesystem regardless, so the
   // label is only cosmetic). Re-adding an entry is a no-op.
-  private def classload(line: Text)(using System): Outcome =
+  private def classload(line: Text)(using System, Probate): Outcome =
     val arg: Text = line.trim.skip(t"/classload".length).trim
 
     if arg == t"" then Outcome.Ran(Nil, Unset, t"Usage: /classload <jar-file-or-directory>\n")
@@ -2740,6 +3073,7 @@ class Repl[version <: Scalac.Versions]
             completionCache = Map()           // the set of resolvable names has changed
             reifierCache = Unset              // rebuild the diagnostics reifier with the new classpath
             importsCache = Unset              // its exports resolve against the classpath too
+            reprime()
             Outcome.Ran(Nil, Unset, t"Added to the classpath: ${path.encode}\n")
 
   // `/context` lists every import currently in scope — the prelude's baseline imports plus the
@@ -2760,6 +3094,7 @@ class Repl[version <: Scalac.Versions]
     // A submission can change the session scope (a new definition, import, or `/set`), so any
     // cached member lists may be stale; drop them.
     completionCache = Map()
+    pendingAdvice = Unset
 
     def lineOutcome: Built^{onOutput} =
       if line.trim.starts(t"/unimport") then Built.Complete(unimport(line.trim))
@@ -2856,7 +3191,7 @@ class Repl[version <: Scalac.Versions]
     // The scope a compiled line would see: the prelude's and the user's persistent imports,
     // plus the prior wrapper objects' members and givens (as `import rs$line$N.{given, *}`).
     val context: List[Text] =
-      ambientImports + (prelude.imports.map(_.tt) + sessionImports) + historyImports
+      ambientImports + (prelude.imports.map(_.tt) + sessionImports).map(Repl.unadvised) + historyImports
 
     // The full member list of `expr.`, compiled ONCE and cached under the base, so typing
     // further member characters (or backspacing) costs no recompilation. The base's type is
@@ -2864,7 +3199,8 @@ class Repl[version <: Scalac.Versions]
     // by member selection (`expr.partial`) and infix completion (`expr partial`).
     def members(base: Text): List[Repl.CompletionItem] =
       completionCache.at(base).or:
-        val items = safely(Repl.complete(context, base, base.length, semanticImports)).or(Nil)
+        val shown: stenography.Imports = semanticImports
+        val items = safely(typed(Repl.complete(context, base, base.length, shown))).or(Nil)
         completionCache = completionCache.define(base, items)
         items
 
@@ -2890,7 +3226,9 @@ class Repl[version <: Scalac.Versions]
           case _ =>
             val (keywords, binding) = Repl.keywordCompletions(code, offset)
             if binding then keywords
-            else keywords + probe(ticket)(safely(Repl.complete(context, code, offset, semanticImports)).or(Nil))
+            else
+              val shown: stenography.Imports = semanticImports
+              keywords + probe(ticket)(safely(typed(Repl.complete(context, code, offset, shown))).or(Nil))
 
   // Typecheck-highlights, compiles, and runs `code`, returning a `Reply` with the highlighting, the
   // result value, its rendered type, and any diagnostics. Only COMPILATION and the session-state
@@ -2901,20 +3239,55 @@ class Repl[version <: Scalac.Versions]
   // (`submit`, which encodes the reply) and by in-process front-ends (e.g. the web server).
   // `onOutput` (async mode) receives each chunk of the run's stdout as it appears, so a front-end can
   // stream it; the chunk is still captured and returned in the reply's `output` as usual.
-  def react(id: Int, code: Text, onOutput: Text => Unit = _ => ())(using Monitor, System, Probate)
+  //
+  // A line that fails for want of a given is answered with Soundness's advice on it (see
+  // `pendingAdvice`), which takes seconds to find. Without `onAdvice` the reply waits for it;
+  // with it, the reply is the plain rejection at once, preceded by an `Advising` and followed,
+  // when the advice is in, by an `Advised`, both handed to `onAdvice`.
+  def react
+    ( id: Int, code: Text, onOutput: Text => Unit = _ => (), onAdvice: Optional[Repl.Reply => Unit] = Unset )
+    ( using Monitor, System, Probate )
   :   Repl.Reply logs CompileEvent =
 
     given LocalClasspath = classpath
 
-    val tokens      = Repl.highlight(code)
+    // The line's own highlighting is typed apart from the session — as a source of the session,
+    // the definitions it makes at the top level would stay in the session's scope — and so with a
+    // compiler of its own, which is why it runs alongside the build rather than ahead of it.
+    val highlighted: Repl.Cell[Optional[List[Repl.Token]]] = Repl.Cell(Unset)
+
+    val highlighter: Thread =
+      val path: LocalClasspath = classpath
+
+      val runnable: Runnable = caps.unsafe.unsafeAssumePure: () =>
+        highlighted.value = safely(Repl.highlight(code)(using highlighting.typecheckedScala(using scalac, path)))
+
+      val created = Thread(null, runnable, "flame-highlight", Warm.stackSize)
+      created.setDaemon(true)
+      created.start()
+      created
+
+    lazy val tokens: List[Repl.Token] =
+      highlighter.join()
+      highlighted.value.or(Repl.tokenize(code))
+
     val unprocessed = Repl.Reply.Failed(id, t"the input could not be processed")
 
     // Compile under the mutex (counted as pending, so completions stand aside); run the deferred
     // load off it.
+    val advice: Repl.Cell[Optional[() -> List[Notice]]] = Repl.Cell(Unset)
+
     val outcome: Optional[Outcome] = safely:
       val built: Built^{onOutput} =
         pendingSubmissions.incrementAndGet()
-        try mutex(build(code, onOutput)) finally pendingSubmissions.decrementAndGet()
+
+        try
+          mutex:
+            val built = build(code, onOutput)
+            advice.value = pendingAdvice
+            pendingAdvice = Unset
+            built
+        finally pendingSubmissions.decrementAndGet()
 
       built match
         case Built.Complete(result) => result
@@ -2956,7 +3329,25 @@ class Repl[version <: Scalac.Versions]
 
       case Outcome.Rejected(notices) =>
         // The tokens carry the errors' spans, mapped into the line's own coordinates by `compile`.
-        Repl.Reply.Rejected(id, diagnosticsText(notices), Repl.mark(tokens, notices), Blocks.encode(noticeBlocks(notices)))
+        def rejected(notices: List[Notice]): Repl.Reply.Rejected =
+          Repl.Reply.Rejected(id, diagnosticsText(notices), Repl.mark(tokens, notices), Blocks.encode(noticeBlocks(notices)))
+
+        val advising: Optional[() -> List[Notice]] = advice.value
+
+        advising.lay(rejected(notices)): thunk =>
+          onAdvice.lay
+           ( locally:
+               val found: Repl.Cell[Optional[List[Notice]]] = Repl.Cell(Unset)
+               seek(thunk)(found.value = _).join()
+               rejected(found.value.or(notices)) ): sink =>
+            val push: Repl.Reply -> Unit = caps.unsafe.unsafeAssumePure(sink)
+            safely(push(Repl.Reply.Advising(id)))
+
+            seek(thunk): found =>
+              val advised: List[Notice] = found.or(notices)
+              push(Repl.Reply.Advised(id, diagnosticsText(advised), Repl.mark(tokens, advised), Blocks.encode(noticeBlocks(advised))))
+
+            rejected(notices)
 
       case Outcome.Threw(_, error, output) =>
         // Render the exception's (trimmed) stack trace as a coloured teletype listing, rather than
