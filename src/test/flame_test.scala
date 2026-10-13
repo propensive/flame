@@ -301,6 +301,32 @@ object Tests extends Suite(m"Flame Tests"):
           case Repl.Outcome.Ran(_, _, output, _, _) => !output.contains(t"silenced")
           case _                                    => false
 
+      // The product of two quantities is typed by a `transparent inline given`, which is not a
+      // stable path, so the line's type is a member selected from a skolem: `?1.Result`. It is
+      // shown as what that member aliases, and the binding is named from it.
+      def binding(outcome: Repl.Outcome): Text = outcome match
+        case Repl.Outcome.Ran(_, _, _, name, tpe) =>
+          t"${name.or(t"?")}: ${tpe.let(_.text).or(t"?")}"
+
+        case other =>
+          t"did not run"
+
+      test(m"a product of two quantities shows its units, not `<unknown>`"):
+        isolated:
+          val repl = Opened(Repl())
+          repl.react(0, t"/set experimental")
+          repl.react(0, t"import soundness.*")
+          binding(repl.interpret(t"Foot*Foot"))
+      . assert(_ == t"quantity: Quantity[Feet[2]]")
+
+      test(m"a product of a number and two quantities shows its units"):
+        isolated:
+          val repl = Opened(Repl())
+          repl.react(0, t"/set experimental")
+          repl.react(0, t"import soundness.*")
+          binding(repl.interpret(t"8*Foot*Foot"))
+      . assert(_ == t"quantity: Quantity[Feet[2]]")
+
       def diagnostics(reply: Repl.Reply): Text = reply match
         case r: Repl.Reply.Rejected => SemanticRender.stripAnsi(r.diagnostics)
         case _                      => t""
