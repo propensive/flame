@@ -40,6 +40,6 @@ import soundness.*
 // `flame-core` and `flame-web` as PUBLISHED Maven Central artifacts (see `build.mill`), the exact
 // jar bytes on the classpath match the published ones, so `soundness.repackage` resolves each via
 // deps.dev and rewrites it into an on-demand `Burdock-Require` download rather than inlining its
-// classes. The whole command dispatch lives in `flame.runClient` in the (published) `client` module.
+// classes. The whole command dispatch lives in `flame.Client.run` in the (published) `client` module.
 @main
-def repl(): Unit = externalize(runClient())
+def repl(): Unit = externalize(Client.run())

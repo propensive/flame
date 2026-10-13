@@ -88,7 +88,10 @@ class SocketEngine(duplex: Duplex)(using Monitor, Probate) extends Engine:
           val id = Repl.replyId(reply)
 
           reply match
-            case Repl.Reply.Output(_, _, _) => sink(reply)
+            case Repl.Reply.Output(_, _, _)  => sink(reply)
+            case Repl.Reply.Warming(_, _, _) => sink(reply)
+            case Repl.Reply.Advising(_)      => sink(reply)
+            case Repl.Reply.Advised(_, _, _, _) => sink(reply)
             case _ =>
               // Claimed atomically: the callback is removed and read in one transition, so a
               // reply can be delivered only once.
