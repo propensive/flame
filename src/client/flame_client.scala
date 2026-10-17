@@ -141,15 +141,18 @@ given (Int is Interpretable) = new Interpretable:
 // parameters. Seal all three once here — they outlive the command they drive — so every command body
 // type-checks under capture checking without a per-site cast. The capabilities are threaded through
 // `body`'s context-function type so they resolve to the sealed givens below (not the capturing ones
-// at the call site). Replaces a bare `execute(body)` at each dispatch arm.
+// at the call site). Replaces a bare `execute(body)` at each dispatch arm. The block's parameters
+// are bound by name: left to inference under the `cli` block's capture restriction, the
+// invocation's root is created at the wrong level.
 private inline def command
-   (inline body: (erased Effectful) ?=> (Stdio, Console, Environment) ?=> Exit)(using Cli)
+   (inline body: (erased effectful: Effectful) ?=> (Stdio, Console, Environment) ?=> Exit)(using Cli)
 :   Execution =
   execute:
-    given Stdio = caps.unsafe.unsafeAssumePure(summon[Invocation].stdio)
-    given Console = caps.unsafe.unsafeAssumePure(summon[Console])
-    given Environment = caps.unsafe.unsafeAssumePure(summon[Invocation].environment)
-    body
+    (erased effectful: Effectful) ?=> (invocation: Invocation) ?=>
+      given Stdio = caps.unsafe.unsafeAssumePure(invocation.stdio)
+      given Console = caps.unsafe.unsafeAssumePure(summon[Console])
+      given Environment = caps.unsafe.unsafeAssumePure(invocation.environment)
+      body
 
 // The settings named by their own flags (`--experimental`, `--feature`, …).
 //

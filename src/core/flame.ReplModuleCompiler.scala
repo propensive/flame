@@ -196,7 +196,7 @@ class ReplModuleCompiler extends dtd.Compiler:
           val packageTree = PackageDef(rootRef, moduleDef.trees).withSpan(span)
 
           val source = SourceFile.virtual("<repl-module>", "")
-          val info = CompilationUnitInfo(source.file, tastyInfo = None)
+          val info = CompilationUnitInfo(source.file, () => None)
 
           Some(CompilationUnit(source, packageTree, forceTrees = true, info)(using unitCtx))
 

@@ -823,7 +823,7 @@ object Repl:
 
   private def project(source: SourceCode): List[Token] =
     // `SourceCode.lines` is a frozen `Array`, so it crosses to a `List` through its readable view.
-    val lines: List[List[Token]] = List.from(source.lines.readable).map: line =>
+    val lines: List[List[Token]] = source.lines.to[List].map: line =>
       line.map: (token: harlequin.Token) =>
         Token
          ( token.text,
@@ -1164,7 +1164,7 @@ object Repl:
     val highlighted =
       Scala.highlight(t"${contextLines}final val __result = $code\nval __base = __result")
 
-    val tokens = List.from(highlighted.lines.readable).flat
+    val tokens = highlighted.lines.to[List].flat
 
     def typeOf(binding: Text): Optional[Syntax] =
       tokens.seek(_.text == binding).let(_.meta).let(_.tpe)
@@ -1611,9 +1611,12 @@ class Repl[version <: Scalac.Versions]
   // The decoded member names a wrapper object exports, read by reflection WITHOUT
   // initializing the class (the body — the user's code — must run only once, at the
   // line's own evaluation). Synthetic members (`MODULE$`, lambdas — anything with `$`
-  // left in its decoded name) are dropped. A bare `type` alias leaves no trace in
-  // bytecode, so a re-defined alias cannot be shadowed this way — an accepted
-  // limitation.
+  // left in its decoded name — and the module class's `writeReplace`) are dropped. A
+  // nested `object Foo` is the inner class `Foo$`: since Scala 3.10 it has no accessor
+  // method on the module class and is listed on the MIRROR class (`rs$line$N`), so the
+  // inner classes of both are read and a module class's name is taken without its `$`. A
+  // bare `type` alias leaves no trace in bytecode, so a re-defined alias cannot be shadowed
+  // this way — an accepted limitation.
   private def wrapperMembers(name: Text): Set[Text] =
     try
       // Java reflection hands back a nullable JVM array, so each element is read by index
@@ -1623,16 +1626,22 @@ class Repl[version <: Scalac.Versions]
         val elements = array.nn
         List.range(0, elements.length).map { index => name(elements(index).nn) }
 
+      def unmodule(simple: Text): Text =
+        if simple.s.endsWith("$") then simple.s.dropRight(1).tt else simple
+
       val cls     = Class.forName(t"$name$$".s, false, replLoader).nn
+      val mirror  = try Class.forName(name.s, false, replLoader).nn catch case _: Throwable => cls
       val methods = names(cls.getDeclaredMethods)(_.getName.nn.tt)
       val fields  = names(cls.getDeclaredFields)(_.getName.nn.tt)
-      val classes = names(cls.getDeclaredClasses)(_.getSimpleName.nn.tt)
+      val classes =
+        (names(cls.getDeclaredClasses)(_.getSimpleName.nn.tt)
+          + names(mirror.getDeclaredClasses)(_.getSimpleName.nn.tt)).map(unmodule)
 
       // `NameTransformer` is the compiler's own mangling, so undoing it is the compiler's job;
       // there is no Soundness equivalent.
       (methods + fields + classes)
         .map { each => scala.reflect.NameTransformer.decode(each.s).tt }
-        .filter { each => !each.contains(t"$$") }
+        .filter { each => !each.contains(t"$$") && each != t"writeReplace" }
         .to[Set]
 
     catch case _: Throwable => Set()
@@ -2380,10 +2389,14 @@ class Repl[version <: Scalac.Versions]
   // the deferred-run structure so the transformation runs off the mutex with the load.
   private def mapRan(built: Built^)(map: Outcome.Ran -> Outcome): Built^{built} = built match
     case Built.Deferred(run) =>
-      Built.Deferred: () =>
-        run() match
-          case ran: Outcome.Ran => map(ran)
-          case other            => other
+      // The new deferred run closes over `run`, a field of `built`, and over `map`, which is
+      // pure: it captures nothing `built` does not. The checker cannot see that a pattern-bound
+      // field lies within the scrutinee's captures, so the result is vouched to.
+      caps.unsafe.unsafeAssumePure:
+        Built.Deferred: () =>
+          run() match
+            case ran: Outcome.Ran => map(ran)
+            case other            => other
 
     case complete => complete
 

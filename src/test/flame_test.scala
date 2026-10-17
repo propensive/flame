@@ -1215,7 +1215,7 @@ object Tests extends Suite(m"Flame Tests"):
           val repl = exhibiting
           repl.react(0, t"/set experimental")
           repl.react(0, t"import soundness.*")
-          repl.react(0, t"delay(3*Second) yet println(\"hello\")")
+          repl.react(0, t"sleep(3*Second) yet println(\"hello\")")
       . assert:
           case Repl.Reply.Rejected(_, _, _, blocks) =>
             val decoded = Blocks.decode(blocks)

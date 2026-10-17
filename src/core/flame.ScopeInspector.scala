@@ -44,7 +44,7 @@ import dotty.tools.dotc.core.Contexts.NoContext
 import dotty.tools.dotc.core.Flags
 import dotty.tools.dotc.core.Symbols.Symbol
 import dotty.tools.dotc.interactive.Interactive
-import dotty.tools.dotc.interactive.InteractiveDriver
+import dotty.tools.dotc.interactive.{CachedLogicalPackage, InteractiveDriver}
 import dotty.tools.dotc.quoted.QuotesCache
 import dotty.tools.dotc.util.SourcePosition
 import dotty.tools.dotc.util.Spans
@@ -106,7 +106,8 @@ class ScopeInspector(arguments: List[Text]):
 
   // Created on first use, ON the executor thread (only `run` touches it), so its context base is
   // pinned to the thread that will drive it thereafter.
-  private lazy val driver: InteractiveDriver = InteractiveDriver(arguments.map(_.s).stdlib)
+  private lazy val driver: InteractiveDriver =
+    InteractiveDriver(arguments.map(_.s).stdlib, CachedLogicalPackage.none)
 
   // The bindings in scope at `offset` (where `ScopeInspector.marker` sits) in `source`, types
   // rendered against `imports`. Empty on any failure or timeout.
