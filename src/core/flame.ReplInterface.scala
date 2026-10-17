@@ -135,7 +135,10 @@ class ReplInterface(engine: Engine, options: ReplInterface.Options)(using Monito
   // Why the session could not start, if it could not: the driver turns it into an exit status.
   @volatile var failure: Optional[Text] = Unset
 
-  @volatile private var generation: Int = 0
+  // The version of the field's text as the front-end last reported it: the front-end numbers
+  // its edits (see Pyrocosm's `Control.Field`), a decoration says which version it describes,
+  // and a reply the engine computed for an older version is dropped when it arrives.
+  @volatile private var version: Int = 0
   @volatile private var language: Boolean = false
 
   // The text the field's completions were asked for: they stay while the user types on into
@@ -363,9 +366,8 @@ class ReplInterface(engine: Engine, options: ReplInterface.Options)(using Monito
     !text.starts(t"/") && !text.starts(t" ") && !text.starts(t"\t") && text.trim != t""
       && Repl.classify(text) == Repl.Verdict.Language
 
-  private def decorate(text: Text, caret: Int): Unit =
-    generation += 1
-    val current = generation
+  private def decorate(text: Text, caret: Int, current: Int): Unit =
+    version = current
     val command = text.starts(t"/")
     val prose = !command && naturalLanguage(text)
     language = prose
@@ -386,13 +388,13 @@ class ReplInterface(engine: Engine, options: ReplInterface.Options)(using Monito
     field.decoration() =
       Control.Field.Decoration
         ( tokens(text).map(Blocks.token), kept, incomplete, detail + scopeRow,
-          prompt = prompt(prose) )
+          prompt = prompt(prose), version = current )
 
     if text != t"" then
       engine.request(Repl.Request.Tokenize(_, text)): reply =>
         lock:
           reply match
-            case Repl.Reply.Tokenized(_, _, _, _, scope) if generation == current =>
+            case Repl.Reply.Tokenized(_, _, _, _, scope) if version == current =>
               val row: List[Block] =
                 if scope.nil then Nil
                 else
@@ -456,7 +458,7 @@ class ReplInterface(engine: Engine, options: ReplInterface.Options)(using Monito
       then
         async:
           snooze(ghostDelay.toDouble*Milli(Second))
-          if generation == current then complete(text, caret, current, apply = false)
+          if version == current then complete(text, caret, current, apply = false)
 
   private def whole(name: Text): Boolean = name.starts(t"/")
 
@@ -466,7 +468,7 @@ class ReplInterface(engine: Engine, options: ReplInterface.Options)(using Monito
     engine.request(Repl.Request.Complete(_, text, caret)): reply =>
       lock:
         reply match
-          case Repl.Reply.Completed(_, items) if generation == current =>
+          case Repl.Reply.Completed(_, items) if version == current =>
             // A lone candidate on a Tab goes straight into the text; otherwise the candidates
             // become the field's completion list.
             val lone: Optional[Repl.CompletionItem] =
@@ -486,8 +488,9 @@ class ReplInterface(engine: Engine, options: ReplInterface.Options)(using Monito
 
                   t"${text.keep(start)}$name${text.skip(caret)}"
 
-              field.value() = replaced
-              decorate(replaced, replaced.length)
+              // Proposed to the front-end, which owns the text: taken if nothing has been typed
+              // since, and reported back as the next edit, which decorates it.
+              field.revise(current, replaced, replaced.length)
 
             if lone.absent then
               val completions: List[Control.Field.Completion] =
@@ -520,18 +523,18 @@ class ReplInterface(engine: Engine, options: ReplInterface.Options)(using Monito
 
   def handle(event: Event): Unit = lock:
     event match
-      case Event.Edited(_, text, caret, _) => decorate(text, caret)
+      case Event.Edited(_, text, caret, edition) => decorate(text, caret, edition)
 
       case Event.Key(Keypress.Tab) =>
         val text = field.value()
-        if !language && text != t"" then complete(text, text.length, generation, apply = true)
+        if !language && text != t"" then complete(text, text.length, version, apply = true)
 
       case Event.Key(_) => ()
 
       case Event.Submitted(_, submitted) =>
         val text = stripTrailingBlank(submitted)
         scopeRow = Nil
-        field.decoration() = Control.Field.Decoration(prompt = prompt(false))
+        field.decoration() = Control.Field.Decoration(prompt = prompt(false), version = version)
 
         if text.trim != t"" then
           if field.history().last != text then remember(text)

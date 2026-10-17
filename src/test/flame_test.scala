@@ -36,7 +36,7 @@ import scala.caps
 
 import soundness.*
 
-import pyrocosm.{Block, Event, Inline, Token, Tone}
+import pyrocosm.{Block, Control, Event, Inline, Token, Tone}
 
 
 import classloaders.threadContextClassloader
@@ -1524,6 +1524,63 @@ object Tests extends Suite(m"Flame Tests"):
           interface.field.decoration()
       . assert: decoration =>
           !decoration.incomplete && decoration.tokens.prim.lay(false)(_.accent == Token.Accent.Command)
+
+      def scope(id: Int): Repl.Reply =
+        Repl.Reply.Tokenized(id, Nil, true, false, List(Repl.ScopeBinding(t"x", t"Int", false)))
+
+      test(m"a decoration says which version of the text it describes"):
+        isolated:
+          val (engine, interface) = fresh()
+          interface.handle(Event.Edited(interface.field.input, t"val x", 5, 3))
+          interface.field.decoration().version
+      . assert(_ == 3)
+
+      test(m"a scope computed for an older version of the text is dropped, a current one shown"):
+        isolated:
+          val (engine, interface) = fresh()
+          interface.handle(Event.Edited(interface.field.input, t"xs.map { x =>", 13, 1))
+          interface.handle(Event.Edited(interface.field.input, t"xs.map { x =>\n", 14, 2))
+          engine.answer(1, scope(1))
+          val stale = interface.field.decoration().detail
+          engine.answer(2, scope(2))
+          (stale.nil, interface.field.decoration().detail.nil)
+      . assert(_ == (true, false))
+
+      test(m"a lone completion is proposed as a revision of the version it was asked for"):
+        isolated:
+          val (engine, interface) = fresh()
+          interface.field.value() = t"1.toLo"
+          interface.handle(Event.Edited(interface.field.input, t"1.toLo", 6, 4))
+          interface.handle(Event.Key(Keypress.Tab))
+          val id = engine.requests.size
+          engine.answer(id, Repl.Reply.Completed(id, List(Repl.CompletionItem(t"toLong", t"method", t"Long"))))
+          (interface.field.value(), interface.field.revision())
+      . assert(_ == (t"1.toLo", Control.Field.Revision(4, t"1.toLong", 8)))
+
+      test(m"a completion for an older version of the text is dropped"):
+        isolated:
+          val (engine, interface) = fresh()
+          interface.field.value() = t"1.toLo"
+          interface.handle(Event.Edited(interface.field.input, t"1.toLo", 6, 4))
+          interface.handle(Event.Key(Keypress.Tab))
+          val id = engine.requests.size
+          interface.handle(Event.Edited(interface.field.input, t"1.toLon", 7, 5))
+          engine.answer(id, Repl.Reply.Completed(id, List(Repl.CompletionItem(t"toLong", t"method", t"Long"))))
+          (interface.field.revision(), interface.field.decoration().completions.nil)
+      . assert(_ == (Unset, true))
+
+      test(m"the clearing on submit overtakes a completion still in flight"):
+        isolated:
+          val (engine, interface) = fresh()
+          interface.field.value() = t"1.toLo"
+          interface.handle(Event.Edited(interface.field.input, t"1.toLo", 6, 4))
+          interface.handle(Event.Key(Keypress.Tab))
+          val id = engine.requests.size
+          interface.handle(Event.Edited(interface.field.input, t"", 0, 5))
+          interface.handle(Event.Submitted(interface.field.input, t"1.toLo"))
+          engine.answer(id, Repl.Reply.Completed(id, List(Repl.CompletionItem(t"toLong", t"method", t"Long"), Repl.CompletionItem(t"toLower", t"method", t"String"))))
+          (interface.field.revision(), interface.field.decoration().completions.nil, interface.field.decoration().version)
+      . assert(_ == (Unset, true, 5))
 
       test(m"/clear empties the transcript"):
         isolated:
