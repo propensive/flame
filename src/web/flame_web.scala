@@ -49,7 +49,7 @@ import probates.awaitProbate
 import strategies.throwUnsafely
 import systems.javaBaseSystem
 import temporaryDirectories.systemTemporaryDirectory
-import threading.virtualThreading
+import threads.virtualThreads
 import webserverErrorPages.minimalErrorPage
 
 // A web-based front-end for the Flame REPL that mirrors the terminal client's live
@@ -136,7 +136,10 @@ class LocalEngine(sessions: Sessions[3.9])(using Monitor, System, Probate) exten
     caps.unsafe.unsafeAssumePure(sessions.connection { (reply: Repl.Reply) => deliver(reply) })
 
   private def deliver(reply: Repl.Reply): Unit = reply match
-    case Repl.Reply.Output(_, _, _) => sink(reply)
+    case Repl.Reply.Output(_, _, _)  => sink(reply)
+    case Repl.Reply.Warming(_, _, _) => sink(reply)
+    case Repl.Reply.Advising(_)      => sink(reply)
+    case Repl.Reply.Advised(_, _, _, _) => sink(reply)
     case _ =>
       val id = Repl.replyId(reply)
 
@@ -227,7 +230,7 @@ def serveHttp(port: Int, quit: Promise[Unit])(using Monitor, System, Probate, Cl
 
   // Each page auto-starts a fresh randomly-named session and may `/session`-switch to any other.
   // Results are exhibited as blocks, without terminal colour.
-  val sessions = Sessions(Repl.Rendering.Exhibit(ansi = false))
+  val sessions = Sessions(Repl.Rendering.Exhibit(ansi = false), frontend = true)
 
   // The REST API's sessions are an INDEPENDENT registry, rendering results as plain text, so an
   // API caller gets a `value` field it can use. API session names and browser session names never

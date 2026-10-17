@@ -50,7 +50,7 @@ import logging.silentLogging
 import strategies.throwUnsafely
 import systems.javaBaseSystem
 import temporaryDirectories.systemTemporaryDirectory
-import threading.platformThreading
+import threads.platformThreads
 
 // One framed connection to a REPL server, as the client speaks it: each request and reply is a
 // record framed by its four-byte big-endian length (`obligatory.LengthPrefix`) carrying a BinTEL
@@ -301,6 +301,32 @@ object Tests extends Suite(m"Flame Tests"):
           case Repl.Outcome.Ran(_, _, output, _, _) => !output.contains(t"silenced")
           case _                                    => false
 
+      // The product of two quantities is typed by a `transparent inline given`, which is not a
+      // stable path, so the line's type is a member selected from a skolem: `?1.Result`. It is
+      // shown as what that member aliases, and the binding is named from it.
+      def binding(outcome: Repl.Outcome): Text = outcome match
+        case Repl.Outcome.Ran(_, _, _, name, tpe) =>
+          t"${name.or(t"?")}: ${tpe.let(_.text).or(t"?")}"
+
+        case other =>
+          t"did not run"
+
+      test(m"a product of two quantities shows its units, not `<unknown>`"):
+        isolated:
+          val repl = Opened(Repl())
+          repl.react(0, t"/set experimental")
+          repl.react(0, t"import soundness.*")
+          binding(repl.interpret(t"Foot*Foot"))
+      . assert(_ == t"quantity: Quantity[Feet[2]]")
+
+      test(m"a product of a number and two quantities shows its units"):
+        isolated:
+          val repl = Opened(Repl())
+          repl.react(0, t"/set experimental")
+          repl.react(0, t"import soundness.*")
+          binding(repl.interpret(t"8*Foot*Foot"))
+      . assert(_ == t"quantity: Quantity[Feet[2]]")
+
       def diagnostics(reply: Repl.Reply): Text = reply match
         case r: Repl.Reply.Rejected => SemanticRender.stripAnsi(r.diagnostics)
         case _                      => t""
@@ -336,6 +362,43 @@ object Tests extends Suite(m"Flame Tests"):
           repl.react(0, t"import soundness.*")
           diagnostics(repl.react(1, t"summon[rudiments.DecimalConverter]"))
       . assert { diag => diag.contains(t"decimalConverters.javaDecimalConverter") }
+
+      // With somewhere for the advice to go, the rejection does not wait for it: the plain
+      // rejection is the reply, announced by an `Advising`, and the advice follows as an `Advised`.
+      test(m"a missing given is rejected at once, its advice following"):
+        isolated:
+          val repl = Opened(Repl())
+          val lock = Mutex()
+          var pushed: List[Repl.Reply] = Nil
+          repl.react(0, t"import soundness.*")
+
+          val reply =
+            repl.react(1, t"summon[rudiments.DecimalConverter]", onAdvice = { reply => lock { pushed = reply :: pushed } })
+
+          var waited: Int = 0
+
+          while !lock(pushed.exists { case _: Repl.Reply.Advised => true; case _ => false }) && waited < 120000 do
+            snooze(50*Milli(Second))
+            waited += 50
+
+          (diagnostics(reply), lock(pushed.reverse))
+      . assert:
+          case (plain, Repl.Reply.Advising(1) :: Repl.Reply.Advised(1, advice, _, _) :: Nil) =>
+            plain.contains(t"No given instance of type") && !plain.contains(t"resolving")
+            && SemanticRender.stripAnsi(advice).contains(t"resolving")
+
+          case _ =>
+            false
+
+      test(m"a wildcard import of soundness is re-injected without the advice, and restored for it"):
+        List(t"import soundness.*", t"import soundness.{given, *}", t"import soundness.Json", t"import other.*")
+        . map { statement => (Repl.unadvised(statement), Repl.advised(Repl.unadvised(statement))) }
+      . assert:
+          _ == List
+                ( (t"import soundness.{explainMissingContext as _, *}", t"import soundness.{*}"),
+                  (t"import soundness.{explainMissingContext as _, given, *}", t"import soundness.{given, *}"),
+                  (t"import soundness.Json", t"import soundness.Json"),
+                  (t"import other.*", t"import other.*") )
 
       // The catch-all must not intrude on ordinary code: implicit searches the compiler retries
       // after inference (`join`'s element type, `flatMap`'s reshaping) must still resolve.
@@ -1152,7 +1215,7 @@ object Tests extends Suite(m"Flame Tests"):
           val repl = exhibiting
           repl.react(0, t"/set experimental")
           repl.react(0, t"import soundness.*")
-          repl.react(0, t"delay(3*Second) yet println(\"hello\")")
+          repl.react(0, t"sleep(3*Second) yet println(\"hello\")")
       . assert:
           case Repl.Reply.Rejected(_, _, _, blocks) =>
             val decoded = Blocks.decode(blocks)
@@ -1290,6 +1353,31 @@ object Tests extends Suite(m"Flame Tests"):
       . assert: (submissions, entries) =>
           submissions.prim.lay(false)(_.code == t"1 + 1") && submissions.size == 1
           && entries.size == 1 && entries.prim.lay(false)(pendingEntry)
+
+      test(m"the server's warm-up shows as a gauge beside the prompt until it is over"):
+        isolated:
+          val (engine, interface) = fresh()
+          engine.push(Repl.Reply.Warming(0, 30, 100))
+          val during = interface.status()
+          engine.push(Repl.Reply.Warming(0, 100, 100))
+          (during, interface.status(), interface.transcript())
+      . assert:
+          case (Block.Gauge(_, _) :: Nil, Nil, Nil) => true
+          case _                                    => false
+
+      test(m"a rejection with advice to come stays pending until the advice settles it"):
+        isolated:
+          val (engine, interface) = fresh()
+          interface.handle(Event.Submitted(interface.field.input, t"summon[Missing]"))
+          engine.push(Repl.Reply.Advising(1))
+          engine.answer(1, Repl.Reply.Rejected(1, t"", Nil, blocksOf(t"no given")))
+          val during = interface.transcript()
+          engine.push(Repl.Reply.Advised(1, t"", Nil, blocksOf(t"try this given")))
+          (during, interface.transcript())
+      . assert: (during, after) =>
+          during.prim.lay(false)(pendingEntry) && texts(during).contains(t"no given")
+          && !after.prim.lay(true)(pendingEntry) && texts(after).contains(t"try this given")
+          && !texts(after).contains(t"no given")
 
       test(m"a trailing blank line is stripped from a submission"):
         isolated:
@@ -1870,6 +1958,76 @@ object Tests extends Suite(m"Flame Tests"):
 
           case _ =>
             false
+
+    suite(m"session priming"):
+      given Scalac[3.9, Universe.Classfile] = Scalac(Nil)
+
+      // A connection to a session of its own, in sessions that are warmed up, and what the
+      // connection has been sent so far, oldest first.
+      def primed()(using Monitor, System, Probate): (Sessions[3.9]#Connection, () => List[Repl.Reply]) =
+        val sessions = Opened(Sessions[3.9](Repl.Rendering.Inspect, frontend = true))
+        val lock = Mutex()
+        var sent: List[Repl.Reply] = Nil
+        val connection = sessions.connection { reply => lock { sent = reply :: sent } }
+        connection.respond(Repl.Request.Session(1, t""))
+        (connection, () => lock(sent.reverse))
+
+      def finished(replies: List[Repl.Reply]): Boolean =
+        replies.exists { case Repl.Reply.Warming(_, done, total) => done == total; case _ => false }
+
+      // Priming is another thread's work, so its end is awaited: that, or a generous deadline.
+      def rising(values: List[Int]): Boolean = values match
+        case first :: second :: rest => first <= second && rising(second :: rest)
+        case _                       => true
+
+      def settled(sent: () => List[Repl.Reply])(using Monitor): List[Repl.Reply] =
+        var waited: Int = 0
+
+        while !finished(sent()) && waited < 120000 do
+          snooze(50*Milli(Second))
+          waited += 50
+
+        sent()
+
+      test(m"a primed session reports its progress from nothing to done"):
+        isolated:
+          val (_, sent) = primed()
+          settled(sent).sweep { case Repl.Reply.Warming(_, done, total) => (done, total) }
+      . assert: steps =>
+          steps.prim.lay(false) { (done, total) => done == 0 && total > 0 }
+          && steps.last.lay(false) { (done, total) => done == total }
+          && rising(steps.map(_(0)))
+
+      test(m"priming leaves no trace in the session"):
+        isolated:
+          val (connection, sent) = primed()
+          settled(sent)
+          val plain = Opened(Repl.make[3.9](Repl.Prelude.empty))
+          (connection.respond(Repl.Request.Submit(2, t"1 + 1")), plain.react(2, t"1 + 1"))
+      . assert:
+          case (Repl.Reply.Ran(_, value, _, tpe, name, _, _, _, _), Repl.Reply.Ran(_, value2, _, tpe2, name2, _, _, _, _)) =>
+            value == value2 && tpe == tpe2 && name == name2 && name.present
+
+          case _ =>
+            false
+
+      test(m"a line submitted while the session is priming still runs"):
+        isolated:
+          val (connection, _) = primed()
+          connection.respond(Repl.Request.Submit(2, t"40 + 2"))
+      . assert:
+          case Repl.Reply.Ran(_, value, _, _, _, _, _, _, _) => value.lay(false)(_.contains(t"42"))
+          case _                                             => false
+
+      test(m"a setting changed in a primed session is followed by a line that runs"):
+        isolated:
+          val (connection, sent) = primed()
+          settled(sent)
+          connection.respond(Repl.Request.Submit(2, t"/set experimental"))
+          connection.respond(Repl.Request.Submit(3, t"40 + 2"))
+      . assert:
+          case Repl.Reply.Ran(_, value, _, _, _, _, _, _, _) => value.lay(false)(_.contains(t"42"))
+          case _                                             => false
 
     suite(m"REPL block captures outside references"):
       given Scalac[3.9, Universe.Classfile] = Scalac(Nil)

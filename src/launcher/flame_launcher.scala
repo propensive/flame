@@ -32,7 +32,7 @@
                                                                                                   */
 package flame
 
-import soundness.*
+import soundness.{Client as _, *}
 
 // The invocation point, alone in its own build module. `externalize` (from burdock, re-exported
 // through `soundness.*`) records the SHA-256 of every jar on THIS module's compile classpath into
@@ -40,6 +40,10 @@ import soundness.*
 // `flame-core` and `flame-web` as PUBLISHED Maven Central artifacts (see `build.mill`), the exact
 // jar bytes on the classpath match the published ones, so `soundness.repackage` resolves each via
 // deps.dev and rewrites it into an on-demand `Burdock-Require` download rather than inlining its
-// classes. The whole command dispatch lives in `flame.runClient` in the (published) `client` module.
-@main
-def repl(): Unit = externalize(runClient())
+// classes. The whole command dispatch lives in `flame.Client.run` in the (published) `client` module.
+//
+// An object with a plain `main` rather than a `@main` method: `Client` declares its use of the
+// global `threads` and `Watcher`, so whatever names it must declare the same, and a top-level
+// definition can carry no `uses` clause. The entry point is still the class `flame.repl`.
+object repl uses parasite.threads, surveillance.Watcher:
+  def main(args: Array[String]): Unit = externalize(Client.run())

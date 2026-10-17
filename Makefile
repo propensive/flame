@@ -82,6 +82,15 @@ test-plain:
 	./mill flame.test.assembly
 	java -cp out/flame/test/assembly.dest/out.jar flame.runTests
 
+# Measure how long a session's first lines take against the same lines repeated, in one fresh JVM
+# (`flame.firstLine`, src/test/flame_bench.scala). ARGS: `--sessions` opens the session as a
+# front-end does, so that it is warmed up in the background; `--wait <ms>` idles before the first
+# line, as a user typing does; `--settle` waits for the warm-up and prints its steps.
+# `FLAME_NOPRIME=1 make bench ARGS=--sessions` is the same without the warm-up.
+bench:
+	./mill flame.test.assembly
+	java -cp out/flame/test/assembly.dest/out.jar flame.firstLine $(ARGS)
+
 # Install every library pinned in etc/refs — releases and snapshots alike, transitively —
 # into the local ivy repository, as CI does, so the build resolves exactly the pinned jars rather
 # than whatever a sibling checkout's `publishLocal` last installed under the same version. A
@@ -114,4 +123,4 @@ snapshot-prune:
 dev:
 	./mill -w flame.client.compile
 
-.PHONY: check xek-fetch sync-deps tools snapshot snapshot-prune assembly release publishLocal run web test test-plain dev install
+.PHONY: bench check xek-fetch sync-deps tools snapshot snapshot-prune assembly release publishLocal run web test test-plain dev install
