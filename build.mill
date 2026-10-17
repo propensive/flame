@@ -16,14 +16,14 @@ object settings:
   // so flame must compile with it too. A Proscala release from 1.0.0 (`SOUNDNESS_SCALA_RELEASE`)
   // is built for several upstream Scala versions, each shipped as `proscala-<scala version>.tar.gz`
   // and versioned `<scala version>-pro-<release>`; `SOUNDNESS_SCALA_BASE` selects the Scala
-  // version, so the default is `3.10.0-pro-1.0.1`, the build Soundness 0.72.0 is compiled with.
+  // version, so the default is `3.10.0-pro-1.0.2`: 1.0.1, the build Soundness 0.72.0 is compiled with, overflows its stack on this project (boxcycle).
   // `SOUNDNESS_SCALA_VERSION` overrides the composed version; a release from before 1.0.0 is a
   // single build, named by its tag, and is still accepted.
   //
   // NOTE these `sys.env` overrides do NOT work under Mill: the value is read when the build
   // script is evaluated, and neither a fresh daemon nor `--no-daemon` propagates the variable. To
   // switch toolchains, edit the defaults here.
-  val scalaRelease = sys.env.getOrElse("SOUNDNESS_SCALA_RELEASE", "1.0.1")
+  val scalaRelease = sys.env.getOrElse("SOUNDNESS_SCALA_RELEASE", "1.0.2")
   val scalaBase = sys.env.getOrElse("SOUNDNESS_SCALA_BASE", "3.10.0")
   val scalaVersion = sys.env.getOrElse("SOUNDNESS_SCALA_VERSION",
     if scalaRelease.matches("[0-9]+\\.[0-9]+\\.[0-9]+") then s"$scalaBase-pro-$scalaRelease"
