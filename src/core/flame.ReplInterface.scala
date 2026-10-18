@@ -520,7 +520,7 @@ class ReplInterface(engine: Engine, options: ReplInterface.Options)(using Monito
 
   def handle(event: Event): Unit = lock:
     event match
-      case Event.Edited(_, text, caret) => decorate(text, caret)
+      case Event.Edited(_, text, caret, _) => decorate(text, caret)
 
       case Event.Key(Keypress.Tab) =>
         val text = field.value()

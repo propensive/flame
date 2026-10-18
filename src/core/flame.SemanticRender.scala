@@ -49,7 +49,7 @@ import tessellate.Flow
 import vacuous.*
 
 import delicious.*  // Markup, SemanticMessage, Reifier, `semantic` on Notice, `teletype` on SemanticMessage
-import pyrocosm.{Block, Tone}
+import pyrocosm.{Block, Notices}
 import pyrocosm.{exhibit, sourceCodePresentable, flattened}
 import FlameColours.srgb
 
@@ -202,104 +202,14 @@ object SemanticRender:
   private def typeText(typed: Markup.Typed, reifier: Optional[Reifier])(using Imports): Text =
     reifier.lay(Unset: Optional[Syntax])(_.syntax(typed)).let(_.text).or(typed.plain)
 
-  // The notices as Pyrocosm blocks: one notice per `Notice`, its message as paragraphs (one
-  // per line of the message, so the compiler's `Found:`/`Required:` lines keep their own),
-  // types highlighted as Scala types after stenography's abbreviation, code samples as Scala
-  // terms, a multi-line sample as a code block of its own.
+  // The notices as Pyrocosm blocks: one diagnostic per `Notice`, through Pyrocosm's own
+  // conversion of the compiler's markup (types as types, code samples as code, a multi-line
+  // sample as a code block, the lines of a missing-given search toned), each type marker
+  // rendered by stenography when a reifier is given. A REPL's notice names a virtual file,
+  // which is not shown; the submission it concerns is already in the transcript, marked.
   def blocks(notices: List[Notice], reifier: Optional[Reifier])(using Imports): List[Block] =
-    notices.map { (notice: Notice) => noticeBlock(notice, reifier) }
-
-  private def noticeBlock(notice: Notice, reifier: Optional[Reifier])(using Imports): Block =
-    val tone: Tone = notice.importance match
-      case Importance.Error   => Tone.Failure
-      case Importance.Warning => Tone.Warning
-      case _                  => Tone.Info
-
-    // The message is shown trimmed of the whitespace around it: a compiler message often ends
-    // in a newline, which would stand as a blank line of the notice.
-    val content: List[Block] = notice.markup.let(SemanticMessage.parse(_)).lay(paragraphs(stripAnsi(notice.message).trim)): message =>
-      markupBlocks(message.markup, reifier)
-
-    Block.Notice(tone, Unset, content)
-
-  // A message's lines stay together in one paragraph, broken where the message breaks.
-  private def paragraphs(text: Text): List[Block] =
-    // The first line's phrasing stands alone; every later line is preceded by the break it
-    // follows, so the message's own line structure survives into the paragraph.
-    val content: List[pyrocosm.Inline] =
-      text.lines.map(lineInlines).fuse(Nil: List[pyrocosm.Inline]):
-        if state.nil then next else state + List(pyrocosm.Inline.Break()) + next
-
-    List(Block.Paragraph(content))
-
-  // One line of a message as phrasing: a line of a missing-given diagnostic's tree (frontier's
-  // `■ resolving Foo`, `└─ ▸ propose bar`, and so on) has its mark toned, its keyword kept and
-  // its name highlighted as the type or value it is; any other line is text.
-  private def lineInlines(line: Text): List[pyrocosm.Inline] = line match
-    case r"$prefix([\s│├└─]*)$mark([■✓✗▪▸])\s+$keyword(resolving|found|requires|candidate|propose)\s+$name(\S.*?)$label(\s+\(.*\))?" =>
-      val tone: Tone = mark match
-        case t"■" => Tone.Accent
-        case t"✓" => Tone.Success
-        case t"✗" => Tone.Failure
-        case t"▪" => Tone.Warning
-        case _    => Tone.Info
-
-      val context = if keyword == t"propose" then Scala.Context.Term else Scala.Context.Type
-
-      val labelled: List[pyrocosm.Inline] =
-        label.lay(Nil): label =>
-          List(pyrocosm.Inline.Toned(Tone.Muted, pyrocosm.Inline.text(label)))
-
-      List(pyrocosm.Inline.Toned(Tone.Muted, pyrocosm.Inline.text(prefix)),
-        pyrocosm.Inline.Toned(tone, pyrocosm.Inline.text(mark)),
-        pyrocosm.Inline.Textual(t" $keyword "),
-        highlighted(name, context)) + labelled
-
-    case _ => List(pyrocosm.Inline.Textual(line))
-
-  private def highlighted(text: Text, context: Scala.Context): pyrocosm.Inline =
-    pyrocosm.Inline.Code(pyrocosm.Language.Scala, Scala.highlight(stripAnsi(text), context).flattened)
-
-  // Runs of phrasing become one paragraph, broken at the message's own newlines; a code sample
-  // with a newline in it becomes a code block between paragraphs.
-  private def markupBlocks(nodes: List[Markup], reifier: Optional[Reifier])(using Imports): List[Block] =
-    // Both accumulators are built in reverse and turned round when they are drained: `run` is the
-    // phrasing of the paragraph being assembled, `blocks` the blocks completed so far.
-    var blocks: List[Block] = Nil
-    var run: List[pyrocosm.Inline] = Nil
-
-    // A paragraph is trimmed of the breaks and blank text at either end.
-    def blank(node: pyrocosm.Inline): Boolean = node match
-      case pyrocosm.Inline.Break()       => true
-      case pyrocosm.Inline.Textual(text) => text.blank
-      case _                             => false
-
-    def flush(): Unit =
-      val trimmed: List[pyrocosm.Inline] = run.skip(blank).reverse.skip(blank)
-      if !trimmed.nil then blocks = Block.Paragraph(trimmed) :: blocks
-      run = Nil
-
-    def phrase(markup: Markup): Unit = markup match
-      case Markup.Textual(text) =>
-        stripAnsi(text).lines.each: ordinal ?=>
-          line =>
-            if ordinal != Prim then run = pyrocosm.Inline.Break() :: run
-            if line != t"" then run = lineInlines(line).reverse + run
-
-      case Markup.Code(_, _) =>
-        if markup.plain.contains(t"\n") then
-          flush()
-          blocks = Scala.highlight(stripAnsi(markup.plain), Scala.Context.Term).exhibit :: blocks
-        else run = highlighted(markup.plain, Scala.Context.Term) :: run
-
-      case typed: Markup.Typed                => run = highlighted(typeText(typed, reifier), Scala.Context.Type) :: run
-      case Markup.Symbolic(_, _, _, children) => children.each(phrase)
-      case Markup.Named(_, _, children)       => children.each(phrase)
-      case Markup.Spanned(_, _, children)     => children.each(phrase)
-
-    nodes.each(phrase)
-    flush()
-    blocks.reverse
+    notices.map: (notice: Notice) =>
+      Notices.diagnostic(notice.copy(file = t""), types = { (typed: Markup.Typed) => typeText(typed, reifier) })
 
   def stripAnsi(text: Text): Text = text.unstyled
 
