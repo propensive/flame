@@ -1168,8 +1168,9 @@ object Tests extends Suite(m"Flame Tests"):
           case Block.Paragraph(content)    => content.map(inline).join
           case Block.Group(content)        => texts(content)
           case Block.Notice(_, _, content) => texts(content)
+          case Block.Diagnostic(_, _, message, excerpt, detail) => texts(message + excerpt + detail)
           case Block.Output(text, _)       => text
-          case Block.Code(_, lines, _)     => lines.map(_.tokens.map(_.text).join).join(t"\n")
+          case Block.Code(_, lines, _, _)  => lines.map(_.tokens.map(_.text).join).join(t"\n")
           case Block.Table(_, rows, _)     => rows.map(_.cells.map(_.content.map(inline).join).join(t" ")).join(t"\n")
           case Block.Trace(stacks)         => stacks.map { stack => t"${stack.className}: ${stack.message.map(inline).join}" }.join(t"\n")
           case _                           => t""
@@ -1194,12 +1195,12 @@ object Tests extends Suite(m"Flame Tests"):
             Blocks.decode(blocks).sweep { case Block.Output(text, error) => (text.trim, error) } == List((t"hi", false), (t"oh", true))
           case _ => false
 
-      test(m"a rejection's diagnostics are notices of failure"):
+      test(m"a rejection's diagnostics are diagnostics of failure"):
         isolated(exhibiting.react(0, t"val n: Int = \"hello\""))
       . assert:
           case Repl.Reply.Rejected(_, diagnostics, tokens, blocks) =>
             val decoded = Blocks.decode(blocks)
-            diagnostics == t"" && decoded.exists { case Block.Notice(Tone.Failure, _, _) => true; case _ => false }
+            diagnostics == t"" && decoded.exists { case Block.Diagnostic(Tone.Failure, _, _, _, _) => true; case _ => false }
               && texts(decoded).contains(t"Int") && tokens.exists(_.mark.present)
           case _ => false
 
@@ -1335,6 +1336,7 @@ object Tests extends Suite(m"Flame Tests"):
           case Block.Paragraph(content)    => content.map(inline).join
           case Block.Group(content)        => texts(content)
           case Block.Notice(_, _, content) => texts(content)
+          case Block.Diagnostic(_, _, message, excerpt, detail) => texts(message + excerpt + detail)
           case Block.Output(text, _)       => text
           case Block.Trace(stacks)         => stacks.map { stack => t"${stack.className}: ${stack.message.map(inline).join}" }.join(t"\n")
           case _                           => t""
@@ -1456,8 +1458,8 @@ object Tests extends Suite(m"Flame Tests"):
 
       . assert: entries =>
           def indented(block: Block): Boolean = block match
-            case Block.Code(_, lines, _) => lines.prim.lay(false)(_.tokens.prim.lay(false)(_.text == t"  "))
-            case _                       => false
+            case Block.Code(_, lines, _, _) => lines.prim.lay(false)(_.tokens.prim.lay(false)(_.text == t"  "))
+            case _                          => false
 
           entries.exists { case Block.Group(content) => content.exists(indented); case _ => false }
 
