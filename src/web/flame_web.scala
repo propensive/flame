@@ -52,16 +52,14 @@ import temporaryDirectories.systemTemporaryDirectory
 import threads.virtualThreads
 import webserverErrorPages.minimalErrorPage
 
-// A web-based front-end for the Flame REPL that mirrors the terminal client's live
-// editing: every keystroke is sent to the server, which tokenizes the line with the same
-// fast lexer the CLI uses (`Repl.tokenize`, no compiler) and returns the Harlequin accent
-// of each token; the browser re-paints the line accordingly. Submitting a line runs it
-// through the same typechecked engine (`Repl.react`) as the socket client, and the result
-// is appended to a scrollback log. The editor cannot be a `<textarea>` (those can't carry
-// styled spans), so it is a contenteditable `<code>` element driven by `replScript`.
-
-// Messages exchanged with the browser as JSON over the WebSocket. Flat case classes (not
-// enums) so the JSON shape — `{"kind":…,"seq":…,…}` — is predictable for the JavaScript.
+// The web front-end for the Flame REPL: Pyrocosm's `WebFrontend` showing the same
+// `ReplInterface` the terminal shows, with a `LocalEngine` calling the in-process sessions in
+// place of the socket. Every keystroke reaches `ReplInterface` as an `Edited` event carrying
+// the browser's version of the text; it decorates the field at once with the fast lexer
+// (`Repl.tokenize`, no compiler) and the parser's verdict on whether the line is complete, and
+// Pyrocosm's script paints the browser's editor from that, rebased through whatever has been
+// typed since. Submitting a line runs it through the same typechecked engine (`Repl.react`) as
+// the socket client, and the result joins the transcript.
 
 // The JSON REST API's request/response bodies (served alongside the browser UI and WebSocket — see
 // the `/api/…` routes in `serveHttp`). Flat case classes, so jacinta derives their JSON codecs
@@ -149,13 +147,19 @@ class LocalEngine(sessions: Sessions[3.9])(using Monitor, System, Probate) exten
       callbacks.revise(_.omit(id))
       callback.lay(sink(reply))(_(reply))
 
+  // Answered on a task of its own, as the socket server answers each request, so a keystroke's
+  // handler returns as soon as it has asked: a `Tokenize` may typecheck for the scope row, which
+  // must not hold up the WebSocket thread, nor the keystrokes behind it.
   def request(request: Int => Repl.Request)(reply: Repl.Reply => Unit): Unit =
     val id = nextId.ere(_ + 1)
     callbacks.revise(_.define(id, caps.unsafe.unsafeAssumePure(reply)))
-    connection.respond(request(id)).let(deliver)
+    val message: Repl.Request = request(id)
+    async(connection.respond(message).let(deliver))
+    ()
 
   def send(request: Int => Repl.Request): Unit =
-    connection.respond(request(nextId.ere(_ + 1)))
+    val message: Repl.Request = request(nextId.ere(_ + 1))
+    async(connection.respond(message))
     ()
 
   def pushed(sink: Repl.Reply => Unit): Unit = this.sink = caps.unsafe.unsafeAssumePure(sink)
