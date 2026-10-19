@@ -136,4 +136,4 @@ externalizes them.
 
 ## License
 
-Flame is made available under the [Apache 2.0 License](/.github/license.md).
+Flame is made available under the [Apache 2.0 License](/LICENSE).
