@@ -1170,7 +1170,7 @@ object Tests extends Suite(m"Flame Tests"):
           case Block.Notice(_, _, content) => texts(content)
           case Block.Diagnostic(_, _, message, excerpt, detail) => texts(message + excerpt + detail)
           case Block.Output(text, _)       => text
-          case Block.Code(_, lines, _, _)  => lines.map(_.tokens.map(_.text).join).join(t"\n")
+          case Block.Code(_, lines, _, _, _)  => lines.map(_.tokens.map(_.text).join).join(t"\n")
           case Block.Table(_, rows, _)     => rows.map(_.cells.map(_.content.map(inline).join).join(t" ")).join(t"\n")
           case Block.Trace(stacks)         => stacks.map { stack => t"${stack.className}: ${stack.message.map(inline).join}" }.join(t"\n")
           case _                           => t""
@@ -1458,7 +1458,7 @@ object Tests extends Suite(m"Flame Tests"):
 
       . assert: entries =>
           def indented(block: Block): Boolean = block match
-            case Block.Code(_, lines, _, _) => lines.prim.lay(false)(_.tokens.prim.lay(false)(_.text == t"  "))
+            case Block.Code(_, lines, _, _, _) => lines.prim.lay(false)(_.tokens.prim.lay(false)(_.text == t"  "))
             case _                          => false
 
           entries.exists { case Block.Group(content) => content.exists(indented); case _ => false }
