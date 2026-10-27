@@ -616,7 +616,7 @@ object Repl:
         case '(' => stack = ')' :: stack
         case '[' => stack = ']' :: stack
         case '{' => stack = '}' :: stack
-        case ')' | ']' | '}' => stack = stack.tail
+        case ')' | ']' | '}' => stack = stack.skip(1)
         case _ => ()
 
       i += 1
@@ -1075,11 +1075,11 @@ object Repl:
   // commands (`/session`, `/clear`, `/quit`, `/disconnect`) belong to the front-end and are handled
   // before this check.
   lazy val commandTokens: Set[Text] =
-    slashCommands.map { (entry: (Text, Text)) => entry(0).cut(t" ").prim.or(t"") }.to[Set]
+    slashCommands.map { (entry: (Text, Text)) => entry(0).cut(t" ").head }.to[Set]
 
   // True when `line` begins with a `/`-command the engine recognises. Used by both front-ends to give
   // the identical `unknown command` message (see `messages.unknownCommand`) for anything else.
-  def isCommand(line: Text): Boolean = line.cut(t" ").prim.lay(false)(commandTokens.has(_))
+  def isCommand(line: Text): Boolean = commandTokens.has(line.cut(t" ").head)
 
   // The user-facing status/notice lines that BOTH front-ends show, kept here so the CLI and the web
   // stay word-for-word identical. Each is a complete line, e.g. `/tasty` usage, already do); the
@@ -1259,7 +1259,7 @@ object Repl:
   def isBareIdentifier(code: Text): Boolean =
     val identifier: Text = code.trim
 
-    identifier.prim.lay(false)(!_.digit)
+    identifier.head.lay(false)(!_.digit)
     && identifier.all { char => identifierChar(char) || char == '$' }
     && !allKeywords.has(identifier)
 
@@ -1279,7 +1279,7 @@ object Repl:
       if definitionModifiers.has(word) then scan(after)
       else if (word == t"val" || word == t"var" || word == t"def") && after.length > 0 then
         val name: Text = after.keep { char => identifierChar(char) || char == '$' }
-        if name.prim.lay(true)(_.digit) then Unset else (word, name)
+        if name.head.lay(true)(_.digit) then Unset else (word, name)
       else Unset
 
     scan(line.trim)
@@ -1819,13 +1819,13 @@ class Repl[version <: Scalac.Versions]
         wildcard(prefix)
         exportable += Designator(prefix)
       else if body.contains(t"{") then
-        val prefix: Text = body.cut(t"{").prim.or(t"").trim.chomp(t".", Rtl)
-        body.cut(t"{").last.or(t"").cut(t"}").prim.or(t"").cut(t",").map(_.trim).filter(_ != t"").each: selector =>
+        val prefix: Text = body.cut(t"{").head.trim.chomp(t".", Rtl)
+        body.cut(t"{").last.cut(t"}").head.cut(t",").map(_.trim).filter(_ != t"").each: selector =>
           if selector == t"*" || selector == t"given" then
             wildcard(prefix)
             exportable += Designator(prefix)
           else
-            val name: Text = selector.cut(t"=>").prim.or(t"").trim  // a renamed import (`Foo => Bar`) keeps `Foo`
+            val name: Text = selector.cut(t"=>").head.trim  // a renamed import (`Foo => Bar`) keeps `Foo`
             if name != t"" then directType(t"$prefix.$name")
       else directType(body)
 
@@ -2407,8 +2407,8 @@ class Repl[version <: Scalac.Versions]
 
     val typed: Text = origin.or(code)
     val userLines: Int = typed.lines.size
-    val firstCode: Text = code.lines.prim.or(t"")
-    val firstUser: Text = typed.lines.prim.or(t"")
+    val firstCode: Text = code.lines.head.or(t"")
+    val firstUser: Text = typed.lines.head.or(t"")
 
     val prefix: Optional[Int] =
       if firstCode.ends(firstUser) then firstCode.length - firstUser.length else Unset
@@ -2535,7 +2535,7 @@ class Repl[version <: Scalac.Versions]
             private var pending: ji.ByteArrayOutputStream = ji.ByteArrayOutputStream()
 
             private def current(): ji.ByteArrayOutputStream =
-              runs.prim.let { run => if run(0) == stream then run(1) else Unset }.or:
+              runs.head.let { run => if run(0) == stream then run(1) else Unset }.or:
                 val fresh = ji.ByteArrayOutputStream()
                 runs = (stream, fresh) :: runs
                 fresh
@@ -2629,7 +2629,7 @@ class Repl[version <: Scalac.Versions]
   // match the import as it was typed.
   private def qualifyImport(statement: Text): Text =
     val body: Text = importClause(statement)
-    val root: Text = body.cut(t".").prim.or(t"").trim
+    val root: Text = body.cut(t".").head.trim
 
     val owner: Optional[Text] =
       history.reverse.seek { wrapper => historyMembers.at(wrapper).or(Set()).has(root) }
@@ -3175,7 +3175,7 @@ class Repl[version <: Scalac.Versions]
     // ones always, the experimental ones only once `experimental` is on (SESSION-aware, unlike the
     // static `slashCommands`). The partial is the token being typed after the `/language ` prefix.
     else if code.starts(t"/language ") then
-      val partial = code.keep(offset).cut(t" ").last.or(t"")
+      val partial = code.keep(offset).cut(t" ").last
       Repl.languageCompletions(partial, enabledSettings.has(t"experimental"))
 
     // `/classload <partial>` completes its argument against the filesystem (see `classloadCompletions`).

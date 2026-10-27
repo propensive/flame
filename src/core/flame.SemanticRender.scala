@@ -180,7 +180,7 @@ object SemanticRender:
     // built in reverse and turned round at the end — the immutable equivalent of appending to a
     // builder, and the same single pass.
     def recur(rest: Text, pieces: List[Piece]): List[Piece] =
-      rest.prim.lay(pieces.reverse): char =>
+      rest.head.lay(pieces.reverse): char =>
         if char == '\n' then recur(rest.skip(1), Piece.Break :: pieces)
         else if blank(char) then
           val space: Text = rest.keep(blank)

@@ -474,7 +474,7 @@ class ReplInterface(engine: Engine, options: ReplInterface.Options)(using Monito
             // A lone candidate on a Tab goes straight into the text; otherwise the candidates
             // become the field's completion list.
             val lone: Optional[Repl.CompletionItem] =
-              if apply && items.size == 1 then items.prim else Unset
+              if apply && items.size == 1 then items.head else Unset
 
             lone.let: single =>
               val name = single.name

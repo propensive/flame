@@ -118,9 +118,9 @@ class Sessions[version <: Scalac.Versions]
       val free: List[Text] = Sessions.animals.filter { animal => !registry.defines(animal) }
 
       val name: Text =
-        Random.global.shuffle(free).prim.or:
+        Random.global.shuffle(free).head.or:
           var n = 2
-          val base = Random.global.shuffle(Sessions.animals).prim.or(t"session")
+          val base = Random.global.shuffle(Sessions.animals).head.or(t"session")
           while registry.defines(t"$base$n") do n += 1
           t"$base$n"
 
