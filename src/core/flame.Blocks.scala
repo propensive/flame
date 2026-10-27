@@ -130,7 +130,7 @@ object Blocks:
   // as code, behind a neutral band.
   def imported(clause: Text): Block =
     val word: Inline = Inline.Emphasis(List(Inline.Toned(Tone.Info, Inline.text(t"imported"))))
-    val code: Inline = Inline.Code(Language.Scala, Repl.tokenize(clause).map(token))
+    val code: Inline = Inline.Snippet(Language.Scala, Repl.tokenize(clause).map(token))
     Block.Notice(Tone.Muted, Unset, List(Block.Paragraph(List(word, Inline.Textual(t" "), code))))
 
   // The marks alone, as notes by line, for a field's decoration.
@@ -182,11 +182,11 @@ object Blocks:
   def result(name: Optional[Text], value: Optional[Inline | Block], tpe: Optional[Repl.TypeText]): List[Block] =
     if value.absent && tpe.absent then Nil else
       val binding: List[Inline] = name.lay(Nil: List[Inline]): (name: Text) =>
-        List(Inline.Code(Language.Scala, List(Token(name, Token.Accent.Term, Token.Role.Binding), Token(t" ", Token.Accent.Unparsed), Token(t"=", Token.Accent.Parens), Token(t" ", Token.Accent.Unparsed))))
+        List(Inline.Snippet(Language.Scala, List(Token(name, Token.Accent.Term, Token.Role.Binding), Token(t" ", Token.Accent.Unparsed), Token(t"=", Token.Accent.Parens), Token(t" ", Token.Accent.Unparsed))))
 
       val typed: List[Inline] = tpe.lay(Nil: List[Inline]): (tpe: Repl.TypeText) =>
         val widened: List[Token] = tpe.base.lay(Nil: List[Token]) { (base: Text) => List(Token(t" <: ", Token.Accent.Symbol), Token(base, Token.Accent.Typal)) }
-        List(Inline.Code(Language.Scala, List(Token(t": ", Token.Accent.Symbol), Token(tpe.text, Token.Accent.Typal)) + widened))
+        List(Inline.Snippet(Language.Scala, List(Token(t": ", Token.Accent.Symbol), Token(tpe.text, Token.Accent.Typal)) + widened))
 
       value match
         case block: Block =>

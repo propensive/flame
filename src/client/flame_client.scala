@@ -133,7 +133,7 @@ val settingFlags: List[(Repl.Setting, Flag of Unit)] =
 given (Int is Interpretable) = new Interpretable:
   type Self = Int
   def interpret(arguments: List[Argument]): Optional[Int] =
-    arguments.prim.lay(Unset): value =>
+    arguments.head.lay(Unset): value =>
       safely(value().as[Int])
 
 // `execute` runs its block with an ambient `Invocation`/`Resident` whose derived capabilities
@@ -727,7 +727,7 @@ private def environmentPairs(environment: Environment): List[Repl.Pair] =
         val texts: List[Text] = List.from(lines.collect { case line: String => line.tt })
 
         texts.map(_.cut(t"=", 2)).sweep:
-          case List(key, value) => Repl.Pair(key, value)
+          case List(key: Text, value: Text) => Repl.Pair(key, value)
 
       case _ => Nil
   catch case _: Exception => Nil

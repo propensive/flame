@@ -250,7 +250,7 @@ object Tests extends Suite(m"Flame Tests"):
           val repl = Opened(Repl())
           repl.react(0, t"import soundness.*")
           repl.scopeAt(t"unsafely:\n  safely:\n    ").map(_.tpe)
-      . assert { types => types.prim.let(_.contains(t"Diagnostics")).or(false) && types.exists(_.contains(t"Unsafe")) }
+      . assert { types => types.head.let(_.contains(t"Diagnostics")).or(false) && types.exists(_.contains(t"Unsafe")) }
 
       test(m"a block's own definitions are in scope for its next statement"):
         isolated:
@@ -1156,13 +1156,13 @@ object Tests extends Suite(m"Flame Tests"):
       // Every piece of text in a run of blocks, for checks that do not care about structure.
       def texts(blocks: List[Block]): Text =
         def inline(node: Inline): Text = node match
-          case Inline.Textual(text)   => text
-          case Inline.Code(_, tokens) => tokens.map(_.text).join
-          case Inline.Phrase(content) => content.map(inline).join
-          case Inline.Emphasis(content) => content.map(inline).join
-          case Inline.Toned(_, content) => content.map(inline).join
-          case Inline.Figure(value, _)  => value.toString.tt
-          case _                      => t""
+          case Inline.Textual(text)      => text
+          case Inline.Snippet(_, tokens) => tokens.map(_.text).join
+          case Inline.Phrase(content)    => content.map(inline).join
+          case Inline.Emphasis(content)  => content.map(inline).join
+          case Inline.Toned(_, content)  => content.map(inline).join
+          case Inline.Numeral(value, _)  => value.toString.tt
+          case _                         => t""
 
         def block(node: Block): Text = node match
           case Block.Paragraph(content)    => content.map(inline).join
@@ -1170,7 +1170,7 @@ object Tests extends Suite(m"Flame Tests"):
           case Block.Notice(_, _, content) => texts(content)
           case Block.Diagnostic(_, _, message, excerpt, detail) => texts(message + excerpt + detail)
           case Block.Output(text, _)       => text
-          case Block.Code(_, lines, _, _, _)  => lines.map(_.tokens.map(_.text).join).join(t"\n")
+          case Block.Code(_, lines, _, _, _, _)  => lines.map(_.tokens.map(_.text).join).join(t"\n")
           case Block.Table(_, rows, _)     => rows.map(_.cells.map(_.content.map(inline).join).join(t" ")).join(t"\n")
           case Block.Trace(stacks)         => stacks.map { stack => t"${stack.className}: ${stack.message.map(inline).join}" }.join(t"\n")
           case _                           => t""
@@ -1324,13 +1324,13 @@ object Tests extends Suite(m"Flame Tests"):
 
       def texts(blocks: List[Block]): Text =
         def inline(node: Inline): Text = node match
-          case Inline.Textual(text)     => text
-          case Inline.Code(_, tokens)   => tokens.map(_.text).join
-          case Inline.Phrase(content)   => content.map(inline).join
-          case Inline.Emphasis(content) => content.map(inline).join
-          case Inline.Toned(_, content) => content.map(inline).join
-          case Inline.Figure(value, _)  => value.toString.tt
-          case _                        => t""
+          case Inline.Textual(text)      => text
+          case Inline.Snippet(_, tokens) => tokens.map(_.text).join
+          case Inline.Phrase(content)    => content.map(inline).join
+          case Inline.Emphasis(content)  => content.map(inline).join
+          case Inline.Toned(_, content)  => content.map(inline).join
+          case Inline.Numeral(value, _)  => value.toString.tt
+          case _                         => t""
 
         def block(node: Block): Text = node match
           case Block.Paragraph(content)    => content.map(inline).join
@@ -1353,10 +1353,10 @@ object Tests extends Suite(m"Flame Tests"):
           interface.handle(Event.Submitted(interface.field.input, t"1 + 1"))
           (engine.submissions, interface.transcript())
       . assert: (submissions, entries) =>
-          submissions.prim.lay(false)(_.code == t"1 + 1") && submissions.size == 1
-          && entries.size == 1 && entries.prim.lay(false)(pendingEntry)
+          submissions.head.lay(false)(_.code == t"1 + 1") && submissions.size == 1
+          && entries.size == 1 && entries.head.lay(false)(pendingEntry)
 
-      test(m"the server's warm-up shows as a gauge beside the prompt until it is over"):
+      test(m"the server's warm-up shows as a gauge above the prompt until it is over"):
         isolated:
           val (engine, interface) = fresh()
           engine.push(Repl.Reply.Warming(0, 30, 100))
@@ -1377,8 +1377,8 @@ object Tests extends Suite(m"Flame Tests"):
           engine.push(Repl.Reply.Advised(1, t"", Nil, blocksOf(t"try this given")))
           (during, interface.transcript())
       . assert: (during, after) =>
-          during.prim.lay(false)(pendingEntry) && texts(during).contains(t"no given")
-          && !after.prim.lay(true)(pendingEntry) && texts(after).contains(t"try this given")
+          during.head.lay(false)(pendingEntry) && texts(during).contains(t"no given")
+          && !after.head.lay(true)(pendingEntry) && texts(after).contains(t"try this given")
           && !texts(after).contains(t"no given")
 
       test(m"a trailing blank line is stripped from a submission"):
@@ -1404,23 +1404,23 @@ object Tests extends Suite(m"Flame Tests"):
           prompt.handle(Event.Submitted(prompt.field.input, t"1 + 1"))
           prompt.transcript()
       . assert: entries =>
-          entries.size == 1 && !entries.prim.lay(false)(pendingEntry) && texts(entries).contains(t"at once")
+          entries.size == 1 && !entries.head.lay(false)(pendingEntry) && texts(entries).contains(t"at once")
 
       test(m"the reply settles the entry in place"):
         isolated:
           val (engine, interface) = fresh()
           interface.handle(Event.Submitted(interface.field.input, t"1 + 1"))
-          val id = engine.submissions.prim.let(_.id).or(0)
+          val id = engine.submissions.head.let(_.id).or(0)
           engine.answer(id, Repl.Reply.Ran(id, Unset, t"", Unset, Unset, t"", Nil, Nil, blocksOf(t"res0: Int = 2")))
           interface.transcript()
       . assert: entries =>
-          entries.size == 1 && !entries.prim.lay(false)(pendingEntry) && texts(entries).contains(t"res0: Int = 2")
+          entries.size == 1 && !entries.head.lay(false)(pendingEntry) && texts(entries).contains(t"res0: Int = 2")
 
       test(m"an asynchronous run streams its output before its reply fills the entry"):
         isolated:
           val (engine, interface) = fresh()
           interface.handle(Event.Submitted(interface.field.input, t"slow()"))
-          val id = engine.submissions.prim.let(_.id).or(0)
+          val id = engine.submissions.head.let(_.id).or(0)
           engine.answer(id, Repl.Reply.Pending(id))
           engine.push(Repl.Reply.Output(id, t"hi\n", Repl.stdoutStream))
           val streaming = interface.transcript()
@@ -1430,8 +1430,8 @@ object Tests extends Suite(m"Flame Tests"):
           case (streaming, settled) =>
             // The streamed chunk shows while the run is pending; the reply then carries the whole
             // output itself, shown once.
-            streaming.prim.lay(false)(pendingEntry) && texts(streaming).contains(t"hi")
-              && !settled.prim.lay(false)(pendingEntry) && texts(settled).cut(t"hi").size == 2
+            streaming.head.lay(false)(pendingEntry) && texts(streaming).contains(t"hi")
+              && !settled.head.lay(false)(pendingEntry) && texts(settled).cut(t"hi").size == 2
 
       test(m"editing decorates the prompt at once and asks the engine for the scope"):
         isolated:
@@ -1440,7 +1440,7 @@ object Tests extends Suite(m"Flame Tests"):
           (engine.requests, interface.field.decoration())
       . assert: (requests, decoration) =>
           requests.size == 1
-          && requests.prim.lay(false) { case Repl.Request.Tokenize(_, t"val x = (") => true; case _ => false }
+          && requests.head.lay(false) { case Repl.Request.Tokenize(_, t"val x = (") => true; case _ => false }
           && decoration.incomplete && decoration.tokens.exists(_.text == t"val")
 
       // Whether the prompt marker is shown in the tone.
@@ -1451,14 +1451,14 @@ object Tests extends Suite(m"Flame Tests"):
         isolated:
           val (engine, interface) = fresh()
           interface.handle(Event.Submitted(interface.field.input, t"1 + 1"))
-          val id = engine.submissions.prim.let(_.id).or(0)
+          val id = engine.submissions.head.let(_.id).or(0)
           val blocks = blocksOf(t"res0: Int = 2")
           engine.answer(id, Repl.Reply.Ran(id, Unset, t"", Unset, Unset, t"", Nil, Nil, blocks))
           interface.transcript()
 
       . assert: entries =>
           def indented(block: Block): Boolean = block match
-            case Block.Code(_, lines, _, _, _) => lines.prim.lay(false)(_.tokens.prim.lay(false)(_.text == t"  "))
+            case Block.Code(_, lines, _, _, _, _) => lines.head.lay(false)(_.tokens.head.lay(false)(_.text == t"  "))
             case _                          => false
 
           entries.exists { case Block.Group(content) => content.exists(indented); case _ => false }
@@ -1467,7 +1467,7 @@ object Tests extends Suite(m"Flame Tests"):
         isolated:
           val (engine, interface) = fresh()
           interface.handle(Event.Submitted(interface.field.input, t"import scala.collection.mutable.*"))
-          val id = engine.submissions.prim.let(_.id).or(0)
+          val id = engine.submissions.head.let(_.id).or(0)
           val output = Repl.messages.imported(t"scala.collection.mutable.*")
           engine.answer(id, Repl.Reply.Ran(id, Unset, t"$output\n", Unset, Unset, t"", Nil, Nil))
           interface.transcript()
@@ -1523,7 +1523,7 @@ object Tests extends Suite(m"Flame Tests"):
           interface.handle(Event.Edited(interface.field.input, t"/set async", 10))
           interface.field.decoration()
       . assert: decoration =>
-          !decoration.incomplete && decoration.tokens.prim.lay(false)(_.accent == Token.Accent.Command)
+          !decoration.incomplete && decoration.tokens.head.lay(false)(_.accent == Token.Accent.Command)
 
       def scope(id: Int): Repl.Reply =
         Repl.Reply.Tokenized(id, Nil, true, false, List(Repl.ScopeBinding(t"x", t"Int", false)))
@@ -1594,7 +1594,7 @@ object Tests extends Suite(m"Flame Tests"):
         isolated:
           val (engine, interface) = fresh()
           interface.handle(Event.Submitted(interface.field.input, t"/session other"))
-          val id = engine.requests.sweep { case Repl.Request.Session(id, t"other") => id }.prim.or(0)
+          val id = engine.requests.sweep { case Repl.Request.Session(id, t"other") => id }.head.or(0)
           engine.answer(id, Repl.Reply.Session(id, t"other", List(t"default", t"other"), Repl.SessionOutcome.Joined))
           texts(interface.transcript())
       . assert(_.contains(Repl.messages.switched(t"other")))
@@ -2053,7 +2053,7 @@ object Tests extends Suite(m"Flame Tests"):
           val (_, sent) = primed()
           settled(sent).sweep { case Repl.Reply.Warming(_, done, total) => (done, total) }
       . assert: steps =>
-          steps.prim.lay(false) { (done, total) => done == 0 && total > 0 }
+          steps.head.lay(false) { (done, total) => done == 0 && total > 0 }
           && steps.last.lay(false) { (done, total) => done == total }
           && rising(steps.map(_(0)))
 

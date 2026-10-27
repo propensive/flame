@@ -96,7 +96,7 @@ object Workspace:
       (start :: start.ancestors)
       . map { dir => dir / Name[Linux](t".pyrocosm") / Name[Linux](t"flame") }
       . filter(_.existent())
-      . prim
+      . head
       . let { dir => (dir / Name[Linux](t"history")).encode }
 
   // The history configuration for `directory`, combining the resolved file path with the config's
@@ -123,8 +123,8 @@ object Workspace:
          ( sets      = atoms(t"set"),
            languages = atoms(t"language"),
            classpath = atoms(t"classpath").map(absolute),
-           port      = atoms(t"port").prim.let { (text: Text) => safely(text.as[Int]) },
-           host      = atoms(t"host").prim,
-           join      = atoms(t"join").prim,
-           create    = atoms(t"create").prim,
-           history   = atoms(t"history").prim.let { (text: Text) => safely(text.as[Int]) } )
+           port      = atoms(t"port").head.let { (text: Text) => safely(text.as[Int]) },
+           host      = atoms(t"host").head,
+           join      = atoms(t"join").head,
+           create    = atoms(t"create").head,
+           history   = atoms(t"history").head.let { (text: Text) => safely(text.as[Int]) } )
