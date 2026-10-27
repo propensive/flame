@@ -1156,13 +1156,13 @@ object Tests extends Suite(m"Flame Tests"):
       // Every piece of text in a run of blocks, for checks that do not care about structure.
       def texts(blocks: List[Block]): Text =
         def inline(node: Inline): Text = node match
-          case Inline.Textual(text)   => text
-          case Inline.Code(_, tokens) => tokens.map(_.text).join
-          case Inline.Phrase(content) => content.map(inline).join
-          case Inline.Emphasis(content) => content.map(inline).join
-          case Inline.Toned(_, content) => content.map(inline).join
-          case Inline.Figure(value, _)  => value.toString.tt
-          case _                      => t""
+          case Inline.Textual(text)      => text
+          case Inline.Snippet(_, tokens) => tokens.map(_.text).join
+          case Inline.Phrase(content)    => content.map(inline).join
+          case Inline.Emphasis(content)  => content.map(inline).join
+          case Inline.Toned(_, content)  => content.map(inline).join
+          case Inline.Numeral(value, _)  => value.toString.tt
+          case _                         => t""
 
         def block(node: Block): Text = node match
           case Block.Paragraph(content)    => content.map(inline).join
@@ -1324,13 +1324,13 @@ object Tests extends Suite(m"Flame Tests"):
 
       def texts(blocks: List[Block]): Text =
         def inline(node: Inline): Text = node match
-          case Inline.Textual(text)     => text
-          case Inline.Code(_, tokens)   => tokens.map(_.text).join
-          case Inline.Phrase(content)   => content.map(inline).join
-          case Inline.Emphasis(content) => content.map(inline).join
-          case Inline.Toned(_, content) => content.map(inline).join
-          case Inline.Figure(value, _)  => value.toString.tt
-          case _                        => t""
+          case Inline.Textual(text)      => text
+          case Inline.Snippet(_, tokens) => tokens.map(_.text).join
+          case Inline.Phrase(content)    => content.map(inline).join
+          case Inline.Emphasis(content)  => content.map(inline).join
+          case Inline.Toned(_, content)  => content.map(inline).join
+          case Inline.Numeral(value, _)  => value.toString.tt
+          case _                         => t""
 
         def block(node: Block): Text = node match
           case Block.Paragraph(content)    => content.map(inline).join
@@ -1356,7 +1356,7 @@ object Tests extends Suite(m"Flame Tests"):
           submissions.prim.lay(false)(_.code == t"1 + 1") && submissions.size == 1
           && entries.size == 1 && entries.prim.lay(false)(pendingEntry)
 
-      test(m"the server's warm-up shows as a gauge beside the prompt until it is over"):
+      test(m"the server's warm-up shows as a gauge above the prompt until it is over"):
         isolated:
           val (engine, interface) = fresh()
           engine.push(Repl.Reply.Warming(0, 30, 100))

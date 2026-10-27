@@ -91,8 +91,9 @@ class ReplInterface(engine: Engine, options: ReplInterface.Options)(using Monito
   val transcript: pyrocosm.Live[List[Block]] = pyrocosm.Live(Nil)
   val sessions:   pyrocosm.Live[List[Block]] = pyrocosm.Live(Nil)
 
-  // What stands beside the prompt: the server's warm-up, while it lasts (see `Repl#prime`). Not
-  // in the transcript, whose settled entries the terminal commits to the scrollback.
+  // What stands above the prompt, outside its frame: the server's warm-up, while it lasts (see
+  // `Repl#prime`). Not in the transcript, whose settled entries the terminal commits to the
+  // scrollback.
   val status: pyrocosm.Live[List[Block]] = pyrocosm.Live(Nil)
 
   val field: Control.Field =
@@ -109,7 +110,8 @@ class ReplInterface(engine: Engine, options: ReplInterface.Options)(using Monito
     val main: List[Panel] =
       List
         ( Panel(Panel.Id(t"transcript"), Panel.Role.Transcript, Unset, transcript, Panel.Priority.Essential, hints = Hints(hints.Follow, hints.terminal.Border.None)),
-          Panel(Panel.Id(t"prompt"), Panel.Role.Prompt, Unset, status, Panel.Priority.Essential, controls = List(field), hints = Hints(hints.terminal.Border.Rules)) )
+          Panel(Panel.Id(t"status"), Panel.Role.Prompt, Unset, status, Panel.Priority.Essential, hints = Hints(hints.terminal.Border.None)),
+          Panel(Panel.Id(t"prompt"), Panel.Role.Prompt, Unset, pyrocosm.Live(Nil), Panel.Priority.Essential, controls = List(field), hints = Hints(hints.terminal.Border.Rules)) )
 
     Interface(Inline.text(options.title), navigation + main, hints = Hints(hints.terminal.Occupancy.Inline))
 
@@ -441,7 +443,7 @@ class ReplInterface(engine: Engine, options: ReplInterface.Options)(using Monito
                   val content: List[Inline] =
                     val pieces: List[List[Inline]] = lines.indexed.map: (tokens, ordinal) =>
                       val break: List[Inline] = if ordinal == Prim then Nil else List(Inline.Break())
-                      break :+ Inline.Code(Language.Scala, tokens)
+                      break :+ Inline.Snippet(Language.Scala, tokens)
 
                     pieces.flat
 
