@@ -856,8 +856,25 @@ object Repl:
   // session-defined member reads as the user would write it (`Foo.Bar.type`, not
   // `<empty>.rs$line$3.Foo.Bar.type`), exactly as the result line and diagnostics do.
   def complete(context: List[Text], code: Text, offset: Int, imports: stenography.Imports)
-      (using Highlight)
+      (using highlight: Highlight)
   :   List[CompletionItem] =
+
+    // Completion is computed with semantic diagnostics OFF. Completions never show a diagnostic,
+    // but the compiler tries every extension method in scope against the receiver and builds a
+    // message for each attempt that fails — and under `-Zsemantic-diagnostics` that message
+    // pickles its types: wasted work at best, and at worst unbounded (a found type the pickler
+    // cannot write sends it into the pickler again, until the heap is gone). Only the
+    // completion's own compiler is affected: a submission on the same session still renders
+    // its diagnostics semantically.
+    given Highlight = new Highlight:
+      def depth: Depth = highlight.depth
+
+      val compilation: Optional[Highlight.Compilation] = highlight.compilation.let: compilation =>
+        new Highlight.Compilation:
+          def arguments: List[Text] = compilation.arguments.filter(_ != semanticDiagnostics)
+          def classpath: Text = compilation.classpath
+          def compiler(): dotty.tools.dotc.Compiler = compilation.compiler()
+          override def context(): Optional[DottyContexts.Context] = compilation.context()
 
     val contextLines: Text = context.map { (line: Text) => t"$line\n" }.join
 
@@ -1434,6 +1451,9 @@ object Repl:
 
   def advised(statement: Text): Text = statement.sub(unadvisedSelector, t"")
 
+  // The compiler flag for semantic diagnostics (see `effectiveScalac`), which completion drops.
+  val semanticDiagnostics: Text = t"-Zsemantic-diagnostics"
+
   // A value handed from one thread to another that then waits for it.
   private final class Cell[value](@volatile var value: value)
 
@@ -1895,8 +1915,7 @@ class Repl[version <: Scalac.Versions]
     // Emit SEMANTIC diagnostics: the compiler wraps each type it interpolates into an error message
     // with in-band markers carrying pickled TASTy, which `delicious` re-renders through stenography
     // (see `SemanticRender`). Harmless when unused — a plain consumer reads the marker-stripped message.
-    val semantic: Scalac.Option[version] =
-      Scalac.Option[version](t"-Zsemantic-diagnostics")
+    val semantic: Scalac.Option[version] = Scalac.Option[version](Repl.semanticDiagnostics)
 
     // The fork's opt-in behaviours that Soundness is compiled with (see the Soundness build's
     // `settings.scalaOptions`), enabled for every line: user code is compiled against Soundness
