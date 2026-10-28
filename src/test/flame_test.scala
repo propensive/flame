@@ -424,7 +424,8 @@ object Tests extends Suite(m"Flame Tests"):
           repl.react(1, t"import soundness.*")
           repl.interpret(t"List(1, 2).flatMap { n => List(n, n) }")
       . assert:
-          case Repl.Outcome.Ran(_, value, _, _, _) => value.let(_.contains(t"List(1, 1, 2, 2)")).or(false)
+          // Through the umbrella, `List` is Soundness's own (since 0.74.0), which renders as `[…]`.
+          case Repl.Outcome.Ran(_, value, _, _, _) => value.let(_.contains(t"[1, 1, 2, 2]")).or(false)
           case _                                   => false
 
       // The wrapper objects (`rs$line$N`, in the empty package) are session bookkeeping: no rendering
