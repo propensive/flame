@@ -1984,13 +1984,18 @@ class Repl[version <: Scalac.Versions]
     // Stands in for a cause when the session thread is gone but left no trace of why.
     class DeadSession() extends Exception("the compiler session ended")
 
+    // How many times `close` offers the session thread its `Retire`, each for `pollInterval`.
+    val retireAttempts: Int = 100
+
     // A compile request and the single-use channel its result comes back on. `Retire` ends the
-    // session block (and the thread with it).
+    // session block (and the thread with it). Each channel holds its one answer, so the session
+    // thread hands it over without waiting: a caller that has gone (one that died waiting) must
+    // not leave the session thread blocked on a rendezvous nobody will keep.
     enum Request:
-      case Compile(sources: Map[Text, Text], reply: juc.SynchronousQueue[(CompileResult, List[Notice])])
+      case Compile(sources: Map[Text, Text], reply: juc.BlockingQueue[(CompileResult, List[Notice])])
       // Something to run on the session thread with the session's front end (see `inspect`);
       // `done` is told when it has run, whether or not it threw.
-      case Probe(run: Scalac.Session.Frontend -> Unit, done: juc.SynchronousQueue[java.lang.Boolean])
+      case Probe(run: Scalac.Session.Frontend -> Unit, done: juc.BlockingQueue[java.lang.Boolean])
       case Retire
 
   private class Warm(setup: Scalac.Setup[version, Universe.Classfile])(using System):
@@ -2017,7 +2022,7 @@ class Repl[version <: Scalac.Versions]
     // caller already knows how to render, and which retires the session so the next line opens a
     // fresh one.
     def compile(sources: Map[Text, Text]): (CompileResult, List[Notice]) =
-      val reply: juc.SynchronousQueue[(CompileResult, List[Notice])] = juc.SynchronousQueue()
+      val reply: juc.BlockingQueue[(CompileResult, List[Notice])] = juc.ArrayBlockingQueue(1)
       val request = Warm.Request.Compile(sources, reply)
 
       def crashed: (CompileResult, List[Notice]) =
@@ -2044,7 +2049,7 @@ class Repl[version <: Scalac.Versions]
     // plain data; nothing of the session leaves its thread.
     def inspect[result](probe: Highlight ?=> result): Optional[result] =
       val found: Repl.Cell[Optional[result]] = Repl.Cell(Unset)
-      val done: juc.SynchronousQueue[java.lang.Boolean] = juc.SynchronousQueue()
+      val done: juc.BlockingQueue[java.lang.Boolean] = juc.ArrayBlockingQueue(1)
 
       val run: Scalac.Session.Frontend -> Unit = caps.unsafe.unsafeAssumePure: frontend =>
         given Scalac.Session.Frontend = frontend
@@ -2099,7 +2104,7 @@ class Repl[version <: Scalac.Versions]
 
           case Warm.Request.Probe(run, done) =>
             try run(compilation.frontend) catch case _: Throwable => ()
-            done.put(java.lang.Boolean.TRUE)
+            done.offer(java.lang.Boolean.TRUE)
 
           case Warm.Request.Compile(sources, reply) =>
             val result: (CompileResult, List[Notice]) =
@@ -2112,7 +2117,7 @@ class Repl[version <: Scalac.Versions]
                 (outcome, process.notices)
               catch case error: Throwable => (CompileResult.Crash(error.stackTrace), Nil)
 
-            reply.put(result)
+            reply.offer(result)
 
   // The scope inspector (see `ScopeInspector`) and the key — line index, compiler arguments and
   // classpath — it was opened with; as with the warm session, a change to any retires it. `scopeCache` is the
@@ -2231,11 +2236,16 @@ class Repl[version <: Scalac.Versions]
   // `Repl` that is merely dropped is never collected), and the values its lines filed in
   // `ReplBridge` and `ReplContext`. Taken under `mutex`, so no compile is in flight on the session
   // thread, which is therefore waiting for its next request and takes the `Retire` promptly. The
-  // `Repl` stays usable: a later line opens a fresh session, as after a `/set`.
+  // `Repl` stays usable: a later line opens a fresh session, as after a `/set`. A session thread
+  // that has not taken the `Retire` within `Warm.retireAttempts` offers is stuck in work of its own,
+  // and is abandoned — it is a daemon — rather than waited on forever.
   def close(): Unit =
     mutex:
       warm.let: session =>
-        while session.alive && !session.retire() do ()
+        def retire(attempts: Int): Unit =
+          if attempts > 0 && session.alive && !session.retire() then retire(attempts - 1)
+
+        retire(Warm.retireAttempts)
 
       warm = Unset
       warmKey = Unset
