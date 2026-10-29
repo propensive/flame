@@ -133,6 +133,21 @@ object Blocks:
     val code: Inline = Inline.Snippet(Language.Scala, Repl.tokenize(clause).map(token))
     Block.Notice(Tone.Muted, Unset, List(Block.Paragraph(List(word, Inline.Textual(t" "), code))))
 
+  // A setting's confirmation, `experimental enabled`: the name as code, the state as an
+  // information message, behind a neutral band.
+  def toggled(name: Text, enabled: Boolean): Block =
+    val code: Inline = Inline.Snippet(Language.Scala, List(Token(name, Token.Accent.Term)))
+    val state: Text = if enabled then t"enabled" else t"disabled"
+    val word: Inline = Inline.Emphasis(List(Inline.Toned(Tone.Info, Inline.text(state))))
+    Block.Notice(Tone.Muted, Unset, List(Block.Paragraph(List(code, Inline.Textual(t" "), word))))
+
+  // An engine's one-line message as a notice: an import's or a setting's confirmation in its
+  // own form, any other behind the same neutral band.
+  private def message(line: Text): Block =
+    Repl.messages.importedClause(line).let(imported(_))
+    . or(Repl.messages.toggledSetting(line).let { (name, enabled) => toggled(name, enabled) })
+    . or(Block.Notice(Tone.Muted, Unset, List(Block.paragraph(line))))
+
   // The marks alone, as notes by line, for a field's decoration.
   def marks(tokens: List[Repl.Token]): List[Block.Note] = code(tokens).notes
 
@@ -143,8 +158,9 @@ object Blocks:
     var blocks: List[Block] = Nil
     var at: Int = 0
 
-    // A message ends in a newline, which is not a line of its own. An import's confirmation is
-    // a notice of its own; the lines between are preformatted text.
+    // A message ends in a newline, which is not a line of its own. A lone line is a
+    // confirmation, shown as a notice; among several (a listing), an import's confirmation is a
+    // notice of its own and the lines between are preformatted text.
     def gap(text: Text): Unit =
       val shown: Text = if ansi then text else SemanticRender.stripAnsi(text)
 
@@ -160,14 +176,17 @@ object Blocks:
             blocks = Block.Code(Language.Plain, shown) :: blocks
             plain = Nil
 
-        lines.each: (line: Text) =>
-          val clause: Optional[Text] = Repl.messages.importedClause(line)
+        lines match
+          case List(line) => blocks = message(line) :: blocks
+          case _ =>
+            lines.each: (line: Text) =>
+              val clause: Optional[Text] = Repl.messages.importedClause(line)
 
-          if clause.absent then plain = line :: plain else clause.let: (clause: Text) =>
+              if clause.absent then plain = line :: plain else clause.let: (clause: Text) =>
+                flushPlain()
+                blocks = imported(clause) :: blocks
+
             flushPlain()
-            blocks = imported(clause) :: blocks
-
-        flushPlain()
 
     spans.each: (span: Repl.OutputSpan) =>
       if span.start > at then gap(plain.segment(at.z till span.start.z))

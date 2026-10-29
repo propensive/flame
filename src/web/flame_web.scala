@@ -259,6 +259,6 @@ def serveHttp(port: Int, quit: Promise[Unit])(using Monitor, System, Probate, Cl
   frontend.stop()
 
 @main
-def web(): Unit =
+def web(port: Int = 8080): Unit =
   given Classloader = threadContextClassloader
-  supervise(serveHttp(8080, Promise[Unit]()))
+  supervise(serveHttp(port, Promise[Unit]()))

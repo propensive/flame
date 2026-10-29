@@ -1138,6 +1138,16 @@ object Repl:
     def importedClause(line: Text): Optional[Text] =
       if line.starts(t"imported ") then line.skip(t"imported ".length) else Unset
 
+    // A setting's confirmation, `experimental enabled`, as the engine's message; a front-end
+    // recognises it by `toggledSetting` to show it as a notice.
+    def toggled(name: Text, enabled: Boolean): Text =
+      t"$name ${if enabled then t"enabled" else t"disabled"}"
+
+    def toggledSetting(line: Text): Optional[(Text, Boolean)] = line.cut(t" ") match
+      case List(name, t"enabled")  => (name, true)
+      case List(name, t"disabled") => (name, false)
+      case _                       => Unset
+
     val serverRestarted: Text =
       t"The server restarted — your previous session (definitions, imports and settings) was lost"
 
@@ -3007,7 +3017,7 @@ class Repl[version <: Scalac.Versions]
   private def set(line: Text)(using System, Probate): Outcome = line.cut(t" ").filter(_ != t"") match
     case _ :: t"async" :: rest =>
       asyncMode = enabledBy(rest)
-      Outcome.Ran(Nil, Unset, t"Async ${if asyncMode then t"enabled" else t"disabled"}\n")
+      Outcome.Ran(Nil, Unset, t"${Repl.messages.toggled(t"async", asyncMode)}\n")
 
     case _ :: name :: rest => toggle(Kind.Set, t"setting", name, rest)
 
@@ -3044,7 +3054,7 @@ class Repl[version <: Scalac.Versions]
         val enable: Boolean = enabledBy(rest)
         enabledSettings = if enable then enabledSettings + Set(name) else enabledSettings.except(Set(name))
         reprime()
-        Outcome.Ran(Nil, Unset, t"$name ${if enable then t"enabled" else t"disabled"}\n")
+        Outcome.Ran(Nil, Unset, t"${Repl.messages.toggled(name, enable)}\n")
 
       case _ =>
         val expOn = enabledSettings.has(t"experimental")
@@ -3296,22 +3306,28 @@ class Repl[version <: Scalac.Versions]
     // The line's own highlighting is typed apart from the session — as a source of the session,
     // the definitions it makes at the top level would stay in the session's scope — and so with a
     // compiler of its own, which is why it runs alongside the build rather than ahead of it.
+    // A `/`-command is not Scala: its tokens are the command word and its parameters, as the
+    // front-ends decorate it while it is typed, and no highlighter runs for it.
+    val command: Boolean = code.trim.starts(t"/")
     val highlighted: Repl.Cell[Optional[List[Repl.Token]]] = Repl.Cell(Unset)
 
-    val highlighter: Thread =
-      val path: LocalClasspath = classpath
+    val highlighter: Optional[Thread] =
+      if command then Unset else
+        val path: LocalClasspath = classpath
 
-      val runnable: Runnable = caps.unsafe.unsafeAssumePure: () =>
-        highlighted.value = safely(Repl.highlight(code)(using highlighting.typecheckedScala(using scalac, path)))
+        val runnable: Runnable = caps.unsafe.unsafeAssumePure: () =>
+          highlighted.value = safely(Repl.highlight(code)(using highlighting.typecheckedScala(using scalac, path)))
 
-      val created = Thread(null, runnable, "flame-highlight", Warm.stackSize)
-      created.setDaemon(true)
-      created.start()
-      created
+        val created = Thread(null, runnable, "flame-highlight", Warm.stackSize)
+        created.setDaemon(true)
+        created.start()
+        created
 
     lazy val tokens: List[Repl.Token] =
-      highlighter.join()
-      highlighted.value.or(Repl.tokenize(code))
+      if command then Blocks.command(code)
+      else
+        highlighter.let(_.join())
+        highlighted.value.or(Repl.tokenize(code))
 
     val unprocessed = Repl.Reply.Failed(id, t"the input could not be processed")
 
