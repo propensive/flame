@@ -35,14 +35,8 @@ package flame
 import scala.caps
 
 import soundness.*
-import perihelion.*
-import perihelion.given
-
-import htmlDoms.whatwg.*
-import Control.*
-
-import codepages.utf8Codepage
 import classloaders.threadContextClassloader
+import codepages.utf8Codepage
 import formatting.compactJsonFormatting
 import logging.silentLogging
 import probates.awaitProbate
@@ -65,23 +59,24 @@ import webserverErrorPages.minimalErrorPage
 // the `/api/…` routes in `serveHttp`). Flat case classes, so jacinta derives their JSON codecs
 // automatically.
 case class ApiEval(code: Text)                        // POST body for `/api/sessions/{name}/eval`
-case class ApiComplete(code: Text, offset: Int)       // POST body for `/api/sessions/{name}/complete`
+case class ApiComplete(code: Text, offset: Int)  // POST body for `/api/sessions/{name}/complete`
 case class ApiCompletion(name: Text, kind: Text, signature: Text)  // one completion candidate
 case class ApiCompletions(completions: List[ApiCompletion])        // the completion response
 case class ApiSessionsList(sessions: List[Text])      // GET  /api/sessions
 case class ApiSessionCreated(session: Text)           // POST /api/sessions
 case class ApiError(error: Text)                      // a 400/404 error body
 
-// An evaluation result: `status` is `"ran"` or `"error"`; the remaining fields mirror the plain-text
-// REPL result (`name = value : tpe`, plus captured stdout and any diagnostics), each empty when absent.
+// An evaluation result: `status` is `"ran"` or `"error"`; the remaining fields mirror the
+// plain-text REPL result (`name = value : tpe`, plus captured stdout and any diagnostics), each
+// empty when absent.
 case class ApiResult
-   ( status:      Text,
-     value:       Text = t"",
-     tpe:         Text = t"",
-     output:      Text = t"",
-     name:        Text = t"",
-     diagnostics: Text = t"",
-     base:        Text = t"" )   // the type `tpe` widens to, when `tpe` is a singleton
+  ( status:      Text,
+    value:       Text = t"",
+    tpe:         Text = t"",
+    output:      Text = t"",
+    name:        Text = t"",
+    diagnostics: Text = t"",
+    base:        Text = t"" )   // the type `tpe` widens to, when `tpe` is a singleton
 
 // The browser-side editor and styling. No `$` (it would interpolate) and `\n` is written
 // `\\n` so the served script carries a real newline escape. Selects its two controls by
@@ -93,16 +88,20 @@ case class ApiResult
 private def apiResult(reply: Repl.Reply): ApiResult = reply match
   case Repl.Reply.Ran(_, value, output, tpe, name, diagnostics, _, _, _) =>
     ApiResult
-     ( t"ran", value.or(t""), tpe.let(_.text).or(t""), output, name.or(t""), plain(diagnostics),
-       base = tpe.let(_.base).or(t"") )
+      ( t"ran", value.or(t""), tpe.let(_.text).or(t""), output, name.or(t""), plain(diagnostics),
+        base = tpe.let(_.base).or(t"") )
 
   case Repl.Reply.Threw(_, output, diagnostics, _, _, _) =>
     ApiResult(t"error", output = output, diagnostics = plain(diagnostics))
 
-  case Repl.Reply.Rejected(_, diagnostics, _, _) => ApiResult(t"error", diagnostics = plain(diagnostics))
-  case Repl.Reply.Crashed(_, diagnostics, _, _)  => ApiResult(t"error", diagnostics = plain(diagnostics))
-  case Repl.Reply.Failed(_, message)          => ApiResult(t"error", diagnostics = message)
-  case _                                      => ApiResult(t"error")
+  case Repl.Reply.Rejected(_, diagnostics, _, _) =>
+    ApiResult(t"error", diagnostics = plain(diagnostics))
+
+  case Repl.Reply.Crashed(_, diagnostics, _, _) =>
+    ApiResult(t"error", diagnostics = plain(diagnostics))
+
+  case Repl.Reply.Failed(_, message) => ApiResult(t"error", diagnostics = message)
+  case _                             => ApiResult(t"error")
 
 // The REST API's sessions render as `Inspect`, so a diagnostic is coloured ANSI (types re-rendered
 // through stenography); strip the ANSI so the JSON carries clean text with the stenography-rendered
@@ -134,10 +133,11 @@ class LocalEngine(sessions: Sessions[3.9])(using Monitor, System, Probate) exten
     caps.unsafe.unsafeAssumePure(sessions.connection { (reply: Repl.Reply) => deliver(reply) })
 
   private def deliver(reply: Repl.Reply): Unit = reply match
-    case Repl.Reply.Output(_, _, _)  => sink(reply)
-    case Repl.Reply.Warming(_, _, _) => sink(reply)
-    case Repl.Reply.Advising(_)      => sink(reply)
+    case Repl.Reply.Output(_, _, _)     => sink(reply)
+    case Repl.Reply.Warming(_, _, _)    => sink(reply)
+    case Repl.Reply.Advising(_)         => sink(reply)
     case Repl.Reply.Advised(_, _, _, _) => sink(reply)
+
     case _ =>
       val id = Repl.replyId(reply)
 
@@ -171,7 +171,9 @@ class LocalEngine(sessions: Sessions[3.9])(using Monitor, System, Probate) exten
 // session; `POST /api/sessions/{name}/complete` returns the tab-completion candidates at a cursor
 // `offset` in `code`. Routing is exact-string, so the `{name}` path segment is peeled off by
 // stripping the fixed prefix and suffix. Anything else is not the API's (`Unset`).
-private def restApi(apiSessions: Sessions[3.9])(request: Http.Request)(using Monitor): Optional[Http.Response] =
+private def restApi(apiSessions: Sessions[3.9])(request: Http.Request)(using Monitor)
+:   Optional[Http.Response] =
+
   request.target match
     case t"/api/sessions" if request.method == Http.Post =>
       jsonResponse(Http.Ok, ApiSessionCreated(apiSessions.create()).in[Json].show)
@@ -179,12 +181,12 @@ private def restApi(apiSessions: Sessions[3.9])(request: Http.Request)(using Mon
     case t"/api/sessions" if request.method == Http.Get =>
       jsonResponse(Http.Ok, ApiSessionsList(apiSessions.names).in[Json].show)
 
-    case target if request.method == Http.Post
-                   && target.starts(t"/api/sessions/") && target.ends(t"/eval") =>
+    case target if request.method == Http.Post &&
+      target.starts(t"/api/sessions/") && target.ends(t"/eval") =>
       val name: Text = target.chomp(t"/api/sessions/").chomp(t"/eval", Rtl)
+      val missing: Text = ApiError(t"no session named '$name'").in[Json].show
 
-      apiSessions.session(name).lay
-       (jsonResponse(Http.NotFound, ApiError(t"no session named '$name'").in[Json].show)): repl =>
+      apiSessions.session(name).lay(jsonResponse(Http.NotFound, missing)): repl =>
         // Read and parse the body as `{"code": "…"}`; a stream/parse failure yields `Unset` → 400.
         // `react` is synchronous (async mode has no REST analogue), so evaluate directly with a
         // fixed id.
@@ -193,20 +195,22 @@ private def restApi(apiSessions: Sessions[3.9])(request: Http.Request)(using Mon
             jsonResponse(Http.Ok, apiResult(repl.react(0, eval.code)).in[Json].show)
 
           case _ =>
-            jsonResponse(Http.BadRequest, ApiError(t"the request body must be JSON: {\"code\": \"…\"}").in[Json].show)
+            val error: ApiError = ApiError(t"the request body must be JSON: {\"code\": \"…\"}")
+            jsonResponse(Http.BadRequest, error.in[Json].show)
 
-    case target if request.method == Http.Post
-                   && target.starts(t"/api/sessions/") && target.ends(t"/complete") =>
+    case target if request.method == Http.Post &&
+      target.starts(t"/api/sessions/") && target.ends(t"/complete") =>
       val name: Text = target.chomp(t"/api/sessions/").chomp(t"/complete", Rtl)
+      val missing: Text = ApiError(t"no session named '$name'").in[Json].show
 
-      apiSessions.session(name).lay
-       (jsonResponse(Http.NotFound, ApiError(t"no session named '$name'").in[Json].show)): repl =>
+      apiSessions.session(name).lay(jsonResponse(Http.NotFound, missing)): repl =>
         // Body is `{"code": "…", "offset": N}`; a stream/parse failure yields `Unset` → 400. The
         // cursor is clamped to the code, then the engine's completions at that point are returned:
         // Scala members/keywords, or the `/`-command completions when `code` starts with `/`.
         safely(request.body().memoize.utf8.read[Json].as[ApiComplete]) match
           case req: ApiComplete =>
             val offset: Int = req.offset.max(0).min(req.code.length)
+
             val items: List[ApiCompletion] =
               repl.completionsAt(req.code, offset).map: item =>
                 ApiCompletion(item.name, item.kind, item.signature)
@@ -214,9 +218,10 @@ private def restApi(apiSessions: Sessions[3.9])(request: Http.Request)(using Mon
             jsonResponse(Http.Ok, ApiCompletions(items).in[Json].show)
 
           case _ =>
-            jsonResponse
-             (Http.BadRequest,
-              ApiError(t"the request body must be JSON: {\"code\": \"…\", \"offset\": N}").in[Json].show)
+            val error: ApiError =
+              ApiError(t"the request body must be JSON: {\"code\": \"…\", \"offset\": N}")
+
+            jsonResponse(Http.BadRequest, error.in[Json].show)
 
     case _ => Unset
 
@@ -232,6 +237,7 @@ private def restApi(apiSessions: Sessions[3.9])(request: Http.Request)(using Mon
 def serveHttp(port: Int, quit: Promise[Unit], address: Optional[Text] = Unset)
   ( using Monitor, System, Probate, Classloader )
 :   Unit =
+
   given Scalac[3.9, Universe.Classfile] = Scalac(Nil)
 
   // Each page auto-starts a fresh randomly-named session and may `/session`-switch to any other.
@@ -244,7 +250,7 @@ def serveHttp(port: Int, quit: Promise[Unit], address: Optional[Text] = Unset)
   val apiSessions = Sessions(Repl.Rendering.Inspect)
 
   val frontend: pyrocosm.WebFrontend =
-    caps.unsafe.unsafeAssumePure(pyrocosm.WebFrontend(port, fallback = { (request: Http.Request) => restApi(apiSessions)(request) }))
+    caps.unsafe.unsafeAssumePure(pyrocosm.WebFrontend(port, fallback = restApi(apiSessions)(_)))
 
   async:
     frontend.serve: () =>

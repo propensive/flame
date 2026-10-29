@@ -35,65 +35,67 @@ package flame
 import java.io as ji
 import java.lang as jl
 import java.net as jn
+
 import scala.caps
-import soundness.*
-import dysasymptotics.linearSize
 
-// The stdlib-shaped operations on the prelude's opaque collections (Soundness #1693).
-
-import escapade.Faint
-import escapade.Italic
-import termcapDefinitions.xtermTrueColorTermcap
-import textMetrics.wideCharacterWidthMetric
 // `soundness.*` also re-exports an unrelated `Signal` (embarcadero's workload-grant signal), so the
 // POSIX terminal signal type (whose `.Int` is SIGINT) is named explicitly to resolve the clash. It
 // is `profanity.Interrupt` as of Soundness 0.64 (`Signal` was its former name).
-import profanity.Interrupt
-
+import soundness.*
 import backstops.silentBackstop
 import classloaders.threadContextClassloader
+import dysasymptotics.linearSize
+import escapade.Faint
+import escapade.Italic
 import filesystemBackends.javaBaseFilesystem
 import filesystemOptions.createNonexistentParents
 import filesystemOptions.deleteOnlyEmpty
 import filesystemOptions.failOnPreexisting
-// `border` is the one ultimatum layout combinator the `soundness` umbrella does not re-export —
-// `panel`, `stack`, `strip`, `layout` and `paint` all are — so it is named directly from its own
-// package rather than reached through the umbrella.
+import internetAccess.online
+import interpreters.posixInterpreter
+import logging.silentLogging
+import pathInterfaces.pathOnLinux
+import probates.cancelProbate
+import profanity.Interrupt
 import pyrocosm.TerminalFrontend
 // `soundness.*` also exports an unrelated `Tool` (anthology's, since flame's classpath has the
 // compiler driver), so Pyrocosm's tool descriptor is named explicitly: an explicit import beats
 // the wildcard. Its extension methods (`standard`, `version`, `repoFile`, …) are top-level in the
 // `pyrocosm` package, so each is imported by name where it is used.
 import pyrocosm.Tool
-import pathInterfaces.pathOnLinux
-import internetAccess.online
-import interpreters.posixInterpreter
-import logging.silentLogging
-import probates.cancelProbate
 import socketBackends.javaBaseSockets
 import systems.javaBaseSystem
 import temporaryDirectories.systemTemporaryDirectory
+import termcapDefinitions.xtermTrueColorTermcap
+import textMetrics.wideCharacterWidthMetric
 import threads.platformThreads
 
 val Serve = Subcommand("serve", "serve the Flame web front-end")
 val Listen = Subcommand("listen", "serve the terminal REPL over TCP, for remote clients")
-val Port = Flag[Int]("port", false, List('p'), "a TCP port — the web front-end, or a remote REPL server")
-val Host = Flag[Text]("host", false, List('H'), "connect to a flame REPL server running on this host")
+
+val Port =
+  Flag[Int]("port", false, List('p'), "a TCP port — the web front-end, or a remote REPL server")
+
+val Host =
+  Flag[Text]("host", false, List('H'), "connect to a flame REPL server running on this host")
+
 val Join = Flag[Text]("join", false, List('j'), "join an existing REPL session by name")
 val Create = Flag[Text]("create", false, List('c'), "create a new REPL session with the given name")
-val Basic = Flag[Unit]("basic", false, Nil, "run a minimal, in-process, synchronous line-based REPL")
+
+val Basic =
+  Flag[Unit]("basic", false, Nil, "run a minimal, in-process, synchronous line-based REPL")
 
 // Flame as Pyrocosm's `Tool`: the name of the command and of its configuration directories
-// (`.pyrocosm/flame/config.tel` in a project, `~/.config/flame/config.tel` for the user), the
-// prose that opens its manpage, and the web front-end the daemon can keep serving. `Flame.standard`
-// (in `Client.run`) gives flame the subcommands every Pyrocosm tool shares — `about`, `install`,
-// `quit` and `--version` — ahead of flame's own dispatch. Capitalised because `flame` is the package.
+// (`.pyrocosm/flame/config.tel` in a project, `~/.config/flame/config.tel` for the user), the prose
+// that opens its manpage, and the web front-end the daemon can keep serving. `Flame.standard` (in
+// `Client.run`) gives flame the subcommands every Pyrocosm tool shares — `about`, `install`, `quit`
+// and `--version` — ahead of flame's own dispatch. Capitalised because `flame` is the package.
 val Flame: Tool =
   Tool
     ( t"flame",
-      prose = t"Flame is the REPL for the Soundness ecosystem: an interactive, live-highlighted "
-            + t"Scala 3 read-eval-print loop. It runs in the terminal against a per-project "
-            + t"session server, or in a browser through its web front-end.",
+      prose = t"Flame is the REPL for the Soundness ecosystem: an interactive, live-highlighted " +
+        t"Scala 3 read-eval-print loop. It runs in the terminal against a per-project " +
+        t"session server, or in a browser through its web front-end.",
       web   = FlameWeb )
 
 // The web REPL as the daemon serves it, at most once, when a `config.tel` in the cascade says
@@ -107,7 +109,8 @@ object FlameWeb extends Tool.Web:
   // Where the REPL on `port` is found: under the hub's origin for port 0, which the hub holds,
   // and at the port itself otherwise.
   def address(port: Int): Text =
-    if port == 0 then t"http://localhost:${pyrocosm.Hubs.port}/flame/" else t"http://localhost:$port/"
+    if port == 0 then t"http://localhost:${pyrocosm.Hubs.port}/flame/"
+    else t"http://localhost:$port/"
 
   // The promise a running server waits on, so that `stop` can reach it from another invocation.
   // A `Promise` holds no capability; vouched untracked so the field can be assigned from `serve`.
@@ -128,8 +131,7 @@ object FlameWeb extends Tool.Web:
 // flags, the REPL's own commands and their completions cannot drift apart: a setting added there is
 // a `--flag` here for free, and this is the ONLY way to set one from the command line.
 val settingFlags: List[(Repl.Setting, Flag of Unit)] =
-  Repl.settings.map: setting =>
-    (setting, Flag[Unit](setting.name, false, Nil, setting.description))
+  Repl.settings.map: setting => (setting, Flag[Unit](setting.name, false, Nil, setting.description))
 
 // Exoskeleton's derived `Int is Interpretable` decodes through a `Decodable[Int]` that captures its
 // `Tactic[NumberError]`; under capture checking that impure instance cannot satisfy `Flag.apply`'s
@@ -138,21 +140,23 @@ val settingFlags: List[(Repl.Setting, Flag of Unit)] =
 // exactly as the old `recover`/`protect` on `NumberError` did, without a tracked capability.
 given (Int is Interpretable) = new Interpretable:
   type Self = Int
+
   def interpret(arguments: List[Argument]): Optional[Int] =
-    arguments.head.lay(Unset): value =>
-      safely(value().as[Int])
+    arguments.head.lay(Unset): value => safely(value().as[Int])
 
 // `execute` runs its block with an ambient `Invocation`/`Resident` whose derived capabilities
 // (`Stdio`, `Console`, `Environment`) are tracked; flame's command bodies take them as pure `using`
-// parameters. Seal all three once here — they outlive the command they drive — so every command body
-// type-checks under capture checking without a per-site cast. The capabilities are threaded through
-// `body`'s context-function type so they resolve to the sealed givens below (not the capturing ones
-// at the call site). Replaces a bare `execute(body)` at each dispatch arm. The block's parameters
-// are bound by name: left to inference under the `cli` block's capture restriction, the
-// invocation's root is created at the wrong level.
+// parameters. Seal all three once here — they outlive the command they drive — so every command
+// body type-checks under capture checking without a per-site cast. The capabilities are threaded
+// through `body`'s context-function type so they resolve to the sealed givens below (not the
+// capturing ones at the call site). Replaces a bare `execute(body)` at each dispatch arm. The
+// block's parameters are bound by name: left to inference under the `cli` block's capture
+// restriction, the invocation's root is created at the wrong level.
 private inline def command
-   (inline body: (erased effectful: Effectful) ?=> (Stdio, Console, Environment) ?=> Exit)(using Cli)
+  ( inline body: (erased effectful: Effectful) ?=> (Stdio, Console, Environment) ?=> Exit )
+  ( using Cli )
 :   Execution =
+
   execute:
     (erased effectful: Effectful) ?=> (invocation: Invocation) ?=>
       given Stdio = caps.unsafe.unsafeAssumePure(invocation.stdio)
@@ -167,7 +171,7 @@ private inline def command
 // completion output. A read placed behind a condition — or inside `execute`, whose block does not
 // run at all in completion mode — silently costs that flag its tab-completion.
 private def flaggedSettings(using Cli, Interpreter): List[Repl.Setting] =
-  settingFlags.filter { (_, flag) => flag().present }.map { (setting, _) => setting }
+  settingFlags.filter { (_, flag) => flag().present }.map: (setting, _) => setting
 
 // The commands to run on startup: the `/set`/`/language` settings named by flags and by the
 // workspace's `config.tel` (see `Workspace`), then a `/classload` per configured classpath entry.
@@ -179,9 +183,14 @@ private def startupCommands(flagged: List[Repl.Setting], workspace: Workspace.Co
   def named(kind: Repl.Kind): List[Text] = flagged.filter(_.kind == kind).map(_.name)
   def distinct(names: List[Text]): List[Text] = names.distinct
 
-  distinct(named(Repl.Kind.Set) + workspace.sets).map { (name: Text) => t"/set $name" }
-  + distinct(named(Repl.Kind.Language) + workspace.languages).map { (name: Text) => t"/language $name" }
-  + workspace.classpath.map { (entry: Text) => t"/classload $entry" }
+  val sets: List[Text] = distinct(named(Repl.Kind.Set) + workspace.sets).map: name => t"/set $name"
+
+  val languages: List[Text] =
+    distinct(named(Repl.Kind.Language) + workspace.languages).map: name => t"/language $name"
+
+  val classpath: List[Text] = workspace.classpath.map: entry => t"/classload $entry"
+
+  sets + languages + classpath
 
 // How a launch chooses its session: create a fresh one under a made-up name (the default, when
 // neither flag is given), JOIN a named existing one (`--join`), or CREATE a named new one
@@ -214,18 +223,19 @@ private def joinFlag()(using Cli, Interpreter): Prospective[Text] =
 private def flagGiven(arguments: List[Argument], long: Text, short: Char): Boolean =
   arguments.exists: (argument: Argument) =>
     val text: Text = argument()
-    text == long || text.starts(t"$long=") || text == t"-$short"
-    || (text.starts(t"-$short") && !text.starts(t"--"))
+    text == long || text.starts(t"$long=") || text == t"-$short" ||
+      (text.starts(t"-$short") && !text.starts(t"--"))
 
 // Resolves the session intent from the `--join`/`--create` flags and the workspace config. The
 // flags win; only when NEITHER flag appears is the config consulted (its own `join`/`create`
 // keys). A flag present without a name, or both a join and a create at once, is `Invalid`.
 private def sessionIntent
-   ( arguments: List[Argument],
-     join:      Prospective[Text],
-     create:    Prospective[Text],
-     workspace: Workspace.Config )
+  ( arguments: List[Argument],
+    join:      Prospective[Text],
+    create:    Prospective[Text],
+    workspace: Workspace.Config )
 :   SessionIntent =
+
   // A value flag reports `present` only once its operand PARSES (`Prospective.present` is
   // `value.present`), so a bare `--join` with no name would look absent and silently fall through
   // to the default. Presence is therefore read from the raw arguments — the flag TOKEN in any of
@@ -238,12 +248,16 @@ private def sessionIntent
   else if joinGiven then
     join.value.lay(SessionIntent.Invalid(t"--join requires a session name"))(SessionIntent.Join(_))
   else if createGiven then
-    create.value.lay(SessionIntent.Invalid(t"--create requires a session name"))(SessionIntent.Create(_))
-  else (workspace.join, workspace.create) match
-    case (join: Text, create: Text) => SessionIntent.Invalid(t"config.tel names both a join and a create session")
-    case (join: Text, _)            => SessionIntent.Join(join)
-    case (_, create: Text)          => SessionIntent.Create(create)
-    case _                          => SessionIntent.Default
+    val missing: SessionIntent = SessionIntent.Invalid(t"--create requires a session name")
+    create.value.lay(missing)(SessionIntent.Create(_))
+  else
+    (workspace.join, workspace.create) match
+      case (join: Text, create: Text) =>
+        SessionIntent.Invalid(t"config.tel names both a join and a create session")
+
+      case (join: Text, _)   => SessionIntent.Join(join)
+      case (_, create: Text) => SessionIntent.Create(create)
+      case _                 => SessionIntent.Default
 
 // The names of every session on every live local REPL server: each per-process socket in the
 // socket directory is asked (with an empty `Session` request, which reports without switching —
@@ -252,7 +266,8 @@ private def sessionIntent
 private def liveSessionNames(): List[Text] =
   def ask(path: Text): List[Text] =
     connectDomain(DomainSocket(path)): duplex =>
-      duplex.send(zephyrine.Stream(LengthPrefix.encode(SocketEngine.encode(Repl.Request.SessionList(0)))))
+      val request = SocketEngine.encode(Repl.Request.SessionList(0))
+      duplex.send(zephyrine.Stream(LengthPrefix.encode(request)))
 
       safely:
         val frames = duplex.source.chunks.frames[LengthPrefix]
@@ -273,9 +288,10 @@ private def liveSessionNames(): List[Text] =
 val defaultPort: Int = 4319
 
 // The client's command dispatch. The `@main` entry point and burdock's `externalize` wrapper live
-// alone in the `launcher` module (`src/launcher/flame_launcher.scala`), which depends on this module
-// (and `core`/`web`) as PUBLISHED Maven artifacts — so `externalize` records their Central jar hashes
-// and the repackager turns them into on-demand `Burdock-Require` downloads instead of inlining them.
+// alone in the `launcher` module (`src/launcher/flame_launcher.scala`), which depends on this
+// module (and `core`/`web`) as PUBLISHED Maven artifacts — so `externalize` records their Central
+// jar hashes and the repackager turns them into on-demand `Burdock-Require` downloads instead of
+// inlining them.
 //
 // `Flame.standard` handles the standard subcommands (`about`, `install`, `quit`) and `--version`
 // first, launches the web front-end once per daemon if a `config.tel` asks for it, and falls
@@ -306,25 +322,28 @@ object Client uses parasite.threads, surveillance.Watcher:
 
         // This invocation's directory and environment, reported to the session (see `ReplContext`).
         val context: ClientContext =
-          ClientContext(summon[Cli].workingDirectory.directory(), environmentPairs(summon[Cli].environment))
+          ClientContext
+            ( summon[Cli].workingDirectory.directory(), environmentPairs(summon[Cli].environment) )
 
         arguments match
-          // `flame -<flag>…` — the terminal REPL with options: `-s NAME` joins a session, `--host HOST`
-          // (with optional `--port`) connects to a remote server (`flame listen`), and the settings flags
-          // enable settings on startup. This case fires only when the first token is a FLAG (`head` begins
-          // with `-`), which cannot be a subcommand.
+          // `flame -<flag>…` — the terminal REPL with options: `-s NAME` joins a session,
+          // `--host HOST` (with optional `--port`) connects to a remote server (`flame listen`),
+          // and the settings flags enable settings on startup. This case fires only when the first
+          // token is a FLAG (`head` begins with `-`), which cannot be a subcommand.
           //
-          // It is matched FIRST so that, when the word being completed is a flag, the subcommand patterns
-          // below are never evaluated. Matching a `Subcommand` also SUGGESTS it, and a suggestion at the
-          // cursor takes precedence over the flag list (`Completion`'s `cursorSuggestions` wins over
-          // `flagSuggestions`) — so trying the subcommands first left `flame --exp<TAB>` offering
-          // `serve`/`listen`/`install` and no flags at all. Ordering costs nothing at run time: a
-          // subcommand never begins with `-`, so no invocation changes meaning.
+          // It is matched FIRST so that, when the word being completed is a flag, the subcommand
+          // patterns below are never evaluated. Matching a `Subcommand` also SUGGESTS it, and a
+          // suggestion at the cursor takes precedence over the flag list (`Completion`'s
+          // `cursorSuggestions` wins over `flagSuggestions`) — so trying the subcommands first left
+          // `flame --exp<TAB>` offering `serve`/`listen`/`install` and no flags at all. Ordering
+          // costs nothing at run time: a subcommand never begins with `-`, so no invocation changes
+          // meaning.
           case Argument(head) :: _ if head.starts(t"-") =>
-            // EVERY flag this command accepts is read here, unconditionally and before any `command`,
-            // so that all of them register and are offered together for `flame --<TAB>`. Reading them
-            // lazily — at the point each is needed — would register only those on the branch actually
-            // taken, and reading them inside `command` would register none of them at all.
+            // EVERY flag this command accepts is read here, unconditionally and before any
+            // `command`, so that all of them register and are offered together for `flame --<TAB>`.
+            // Reading them lazily — at the point each is needed — would register only those on the
+            // branch actually taken, and reading them inside `command` would register none of them
+            // at all.
             val settings: List[Text]     = startupCommands(flaggedSettings, workspace)
             val basic:    Boolean        = Basic().present
             val host:     Optional[Text] = Host().value.or(workspace.host)
@@ -333,20 +352,24 @@ object Client uses parasite.threads, surveillance.Watcher:
             val intent:   SessionIntent  = sessionIntent(arguments, joinFlag(), Create(), workspace)
 
             // `flame --basic` — a minimal, self-contained, in-process synchronous REPL (no socket
-            // server, no TUI). Checked before `--host`, so it never falls through to a remote/socket
-            // connection; it still honours the startup settings. `--join`/`--create` do not apply to
-            // its single in-process session, so they are simply ignored here.
+            // server, no TUI). Checked before `--host`, so it never falls through to a
+            // remote/socket connection; it still honours the startup settings. `--join`/`--create`
+            // do not apply to its single in-process session, so they are simply ignored here.
             if basic then command(basicRepl(settings))
             else intent match
               case SessionIntent.Invalid(message) => command(sessionArgError(message))
+
               case intent => host match
-                case host: Text => command(connectRemote(host, port, intent, settings, history, context))
-                case _          => command(connectSocket(intent, settings, history, context))
+                case host: Text =>
+                  command(connectRemote(host, port, intent, settings, history, context))
+
+                case _ =>
+                  command(connectSocket(intent, settings, history, context))
 
           // `flame serve [--port N | -p N]` — the web front-end, interactively (default port
-          // `FlameWeb.port`). `Port()` registers the flag (so it is offered in tab-completion) and reads
-          // its value; the pure `Int` interpreter above yields `Unset` for an absent or non-numeric
-          // value, so `.or(FlameWeb.port)` falls back.
+          // `FlameWeb.port`). `Port()` registers the flag (so it is offered in tab-completion) and
+          // reads its value; the pure `Int` interpreter above yields `Unset` for an absent or
+          // non-numeric value, so `.or(FlameWeb.port)` falls back.
           //
           // The read is OUTSIDE `command`: in completion mode `execute` returns without running its
           // block at all, so a flag read within it would never register and never be suggested.
@@ -354,9 +377,9 @@ object Client uses parasite.threads, surveillance.Watcher:
             val port: Int = Port().value.or(workspace.port).or(FlameWeb.port)
             command(httpServe(port))
 
-          // `flame listen [--port N | -p N]` — a REPL server bound to a TCP port (not a per-process UNIX
-          // socket), so a `flame --host` client on another machine can reach its sessions. Defaults to
-          // `defaultPort`; a non-numeric `--port` also falls back to it.
+          // `flame listen [--port N | -p N]` — a REPL server bound to a TCP port (not a per-process
+          // UNIX socket), so a `flame --host` client on another machine can reach its sessions.
+          // Defaults to `defaultPort`; a non-numeric `--port` also falls back to it.
           case Listen() :: _ =>
             val port: Int = Port().value.or(workspace.port).or(defaultPort)
             command(serve(port))
@@ -367,12 +390,14 @@ object Client uses parasite.threads, surveillance.Watcher:
           case Argument("serve-socket") :: Nil =>
             command(serveSocket())
 
-          // `flame` — the terminal REPL (connects to, or starts, a background socket server). Bare `flame`
-          // starts a new session, with whatever the workspace's `config.tel` asks for.
+          // `flame` — the terminal REPL (connects to, or starts, a background socket server). Bare
+          // `flame` starts a new session, with whatever the workspace's `config.tel` asks for.
           case Nil =>
             sessionIntent(Nil, Join(), Create(), workspace) match
               case SessionIntent.Invalid(message) => command(sessionArgError(message))
-              case intent => command(connectSocket(intent, startupCommands(Nil, workspace), history, context))
+
+              case intent =>
+                command(connectSocket(intent, startupCommands(Nil, workspace), history, context))
 
           case _ =>
             command(Exit.Fail(1))
@@ -385,7 +410,7 @@ private def serve(portNumber: Int)(using Stdio, Monitor, Probate, System): Exit 
   safely(urticose.Port[Tcp](portNumber)).lay(invalidPort(portNumber)): port =>
     recover:
       case Bind.Error(_) => Out.println(t"Port $portNumber is unavailable"); Exit.Fail(5)
-      case error: Error => Out.println(t"${error.message}"); Exit.Fail(6)
+      case error: Error  => Out.println(t"${error.message}"); Exit.Fail(6)
 
     . protect:
         val sessions = Sessions(Repl.Rendering.Exhibit(ansi = true), frontend = true)
@@ -398,10 +423,10 @@ private def serve(portNumber: Int)(using Stdio, Monitor, Probate, System): Exit 
 // `flame --basic`: a minimal, self-contained, synchronous, line-based REPL — no socket server, no
 // line editor, no completion, no async. It reads one line at a time from the (daemon-forwarded)
 // stdin, accumulating lines while the buffer is still a syntactically-incomplete prefix (so a
-// multi-line definition can be entered — the `| ` continuation prompt), then evaluates each complete
-// submission in-process with `Repl.react` (which is inherently synchronous) and prints the same
-// plain-text block the terminal front-end shows below a line (`replyText`). The engine renders in
-// `Rendering.Inspect` (teletype/text) mode by default. `--set`/`--language` startup settings are
+// multi-line definition can be entered — the `| ` continuation prompt), then evaluates each
+// complete submission in-process with `Repl.react` (which is inherently synchronous) and prints the
+// same plain-text block the terminal front-end shows below a line (`replyText`). The engine renders
+// in `Rendering.Inspect` (teletype/text) mode by default. `--set`/`--language` startup settings are
 // applied first; `/quit` (or Ctrl+D / EOF) ends the session. `async` has no effect here (every
 // submission runs synchronously), so `/set async` is intercepted with a short notice.
 private def basicRepl(settings: List[Text])(using Stdio, Monitor, Probate, System, Resident): Exit =
@@ -417,8 +442,8 @@ private def basicRepl(settings: List[Text])(using Stdio, Monitor, Probate, Syste
   var id:     Int              = 0
   var buffer: Text             = t""
 
-  // `Out.print` writes through a non-auto-flushing `PrintStream`, so flush after a prompt to be sure
-  // it reaches the terminal before `readLine` blocks.
+  // `Out.print` writes through a non-auto-flushing `PrintStream`, so flush after a prompt to be
+  // sure it reaches the terminal before `readLine` blocks.
   def prompt(text: Text): Unit =
     Out.print(text)
     summon[Stdio].out.flush()
@@ -429,11 +454,12 @@ private def basicRepl(settings: List[Text])(using Stdio, Monitor, Probate, Syste
 
   // Ask the Ethereal launcher for a COOKED (canonical) terminal for the whole session, so the
   // terminal driver itself provides character echo and line editing (Backspace, kill-line, …) — the
-  // launcher otherwise raw-modes a terminal stdin to forward keypresses to an interactive TUI, which
-  // left `--basic` with no echo (Soundness #1648/#1651). A no-op for a pipe, and harmless against a
-  // launcher too old to offer the control channel (it just stays in raw mode as before).
+  // launcher otherwise raw-modes a terminal stdin to forward keypresses to an interactive TUI,
+  // which left `--basic` with no echo (Soundness #1648/#1651). A no-op for a pipe, and harmless
+  // against a launcher too old to offer the control channel (it just stays in raw mode as before).
   summon[Resident].cooked:
-    // Apply the `--set`/`--language` startup settings, so each confirmation prints before the first prompt.
+    // Apply the `--set`/`--language` startup settings, so each confirmation prints before the first
+    // prompt.
     settings.each(submit)
     Out.println(Repl.messages.session(t"basic"))
 
@@ -452,18 +478,20 @@ private def basicRepl(settings: List[Text])(using Stdio, Monitor, Probate, Syste
           else
             val code: Text = if buffer == t"" then text else t"$buffer\n$text"
 
-            // A `/`-command (at the start of a submission) is a REPL command, not Scala, so it always
-            // submits — never run it through the Scala-incompleteness check (which would treat e.g.
-            // `/classpath` as an incomplete prefix). Otherwise keep accumulating while the code is an
-            // incomplete prefix; a complete line runs, and a malformed one also submits (surfacing its
-            // compiler error), matching the terminal front-end's Enter semantics.
+            // A `/`-command (at the start of a submission) is a REPL command, not Scala, so it
+            // always submits — never run it through the Scala-incompleteness check (which would
+            // treat e.g. `/classpath` as an incomplete prefix). Otherwise keep accumulating while
+            // the code is an incomplete prefix; a complete line runs, and a malformed one also
+            // submits (surfacing its compiler error), matching the terminal front-end's Enter
+            // semantics.
             val command: Boolean = buffer == t"" && text.starts(t"/")
 
             if !command && Repl.incomplete(code) then buffer = code else
               buffer = t""
               submit(code)
 
-        // `readLine` answers `null` at EOF (Ctrl+D or a closed pipe): end the session on a fresh line.
+        // `readLine` answers `null` at EOF (Ctrl+D or a closed pipe): end the session on a fresh
+        // line.
         case _ =>
           Out.println()
           running = false
@@ -475,7 +503,7 @@ private def basicRepl(settings: List[Text])(using Stdio, Monitor, Probate, Syste
 // socket server uses — so the embedded engine finds the scala library under the
 // Burdock/Ethereal launcher, exactly as the terminal server does.
 private def httpServe(portNumber: Int)
-   (using Stdio, Monitor, Probate, System, Cli, Console, Environment)
+  ( using Stdio, Monitor, Probate, System, Cli, Console, Environment )
 :   Exit =
 
   given Classloader = serverClassloader
@@ -484,7 +512,7 @@ private def httpServe(portNumber: Int)
 
   // A real SIGINT (e.g. `kill -INT <pid>`) fulfils `quit` and stops the server cleanly.
   trap:
-    case Interrupt.Int => quit.offer(()) yet SignalResponse.Accept
+    case Signal(Interrupt.Int, _, _, _) => quit.offer(()) yet SignalResponse.Accept
 
   // Printed from the client (not the daemon) so it reaches the user's terminal; the URL is
   // on its own line so terminals render it as a clean, clickable link.
@@ -534,6 +562,7 @@ private def serveSocket()(using Stdio, Monitor, Probate, System): Exit =
   val removeSocket: Runnable = () =>
     recover:
       case _: Path.Error | _: Io.Error => ()
+
     . protect:
       socketPath.as[Path on Linux].wipe()
       ()
@@ -541,12 +570,13 @@ private def serveSocket()(using Stdio, Monitor, Probate, System): Exit =
   jl.Runtime.getRuntime.nn.addShutdownHook(jl.Thread(removeSocket))
 
   try
-    // Prepare the socket directory and clear any stale socket, ignoring filesystem errors (a failure
-    // here just surfaces as `serve` failing below). `create[Directory]` is not idempotent (it fails
-    // if the directory exists), unlike `Files.createDirectories`, so the directory (which persists
-    // across processes) is created only when absent.
+    // Prepare the socket directory and clear any stale socket, ignoring filesystem errors (a
+    // failure here just surfaces as `serve` failing below). `create[Directory]` is not idempotent
+    // (it fails if the directory exists), unlike `Files.createDirectories`, so the directory (which
+    // persists across processes) is created only when absent.
     recover:
       case _: Path.Error | _: Io.Error => ()
+
     . protect:
       val directory = socketDirectory.as[Path on Linux]
       if !directory.existent() then directory.create[Directory]()
@@ -569,6 +599,7 @@ private def serveSocket()(using Stdio, Monitor, Probate, System): Exit =
 
         recover:
           case _: Path.Error | _: Io.Error => ()
+
         . protect:
           socketPath.as[Path on Linux].wipe()
 
@@ -601,6 +632,7 @@ private def serverClassloader(using System): Classloader =
   try
     recover:
       case _: Path.Error | _: Io.Error => threadContextClassloader
+
     . protect:
       val executable: Text = unsafely(System.properties.ethereal.script[Text]())
       val tmpDir: Path on Linux = temporaryDirectory/Uuid()
@@ -613,16 +645,19 @@ private def serverClassloader(using System): Classloader =
       val url: jn.URL = ji.File(link.encode.s).toURI.nn.toURL.nn
 
       val executablePath: Text = ji.File(executable.s).getCanonicalPath.nn.tt
+
       val bootstrapUrls: List[jn.URL] = threadContextClassloader.java match
         case loader: jn.URLClassLoader =>
           val urls = loader.getURLs.nn.iterator.map(_.nn).filter: entry =>
             safely(ji.File(entry.toURI).getCanonicalPath.nn.tt) != executablePath
 
           List.from(urls)
+
         case _ =>
           Nil
 
-      new Classloader(jn.URLClassLoader((url :: bootstrapUrls).stdlib.toArray, threadContextClassloader.java))
+      val entries: scala.Array[jn.URL | Null] = (url :: bootstrapUrls).stdlib.toArray
+      new Classloader(jn.URLClassLoader(entries, threadContextClassloader.java))
   catch case _: Throwable => threadContextClassloader
 
 private def invalidPort(portNumber: Int)(using Stdio): Exit =
@@ -647,7 +682,9 @@ private def unreachableRemote(host: Text, portNumber: Int)(using Stdio): Exit =
 // `duplex` loan introduces. The loan confines the connection to `body`, so a pure connectable is
 // sound here: seal it for this call. (The domain-socket connectable carries no `caps.any`, so
 // `connectDomain` needs no such seal.)
-private def connect[result](endpoint: Endpoint[Tcp.Port])(body: Duplex => result): Optional[result] =
+private def connect[result](endpoint: Endpoint[Tcp.Port])(body: Duplex => result)
+:   Optional[result] =
+
   given (Endpoint[Tcp.Port] is Connectable) = caps.unsafe.unsafeAssumePure(Connectable.tcpEndpoint)
   try endpoint.duplex(body) catch case _: ji.IOException => Unset
 
@@ -674,7 +711,9 @@ private def sessionArgError(message: Text)(using Stdio): Exit =
 // the server is a separate process it outlives this client, so the same session can
 // be reconnected to later by running `flame` again. Returns the live connection,
 // or `Unset` if no server became reachable in time.
-private def launchServer[result]()(using Stdio, System, Monitor)(body: Duplex => result): Optional[result] =
+private def launchServer[result]()(using Stdio, System, Monitor)(body: Duplex => result)
+:   Optional[result] =
+
   safely(System.properties.ethereal.script[Text]()).lay(Unset): executable =>
     val before: List[Text] = socketPaths(socketDirectory)
 
@@ -707,6 +746,7 @@ private def launchServer[result]()(using Stdio, System, Monitor)(body: Duplex =>
 private def socketPaths(directory: Text): List[Text] =
   recover:
     case _: Path.Error => Nil
+
   . protect:
     directory.as[Path on Linux].children.map(_.encode).filter(_.ends(t".sock")).to[List]
 
@@ -738,22 +778,28 @@ private def environmentPairs(environment: Environment): List[Repl.Pair] =
       case _ => Nil
   catch case _: Exception => Nil
 
-private def connectSocket(intent: SessionIntent, initial: List[Text], history: Workspace.HistoryConfig, context: ClientContext)
-    (using Stdio, Monitor, Probate, Console, Environment, System)
+private def connectSocket
+  ( intent:  SessionIntent,
+    initial: List[Text],
+    history: Workspace.HistoryConfig,
+    context: ClientContext )
+  ( using Stdio, Monitor, Probate, Console, Environment, System )
 :   Exit =
+
   // Probe every socket file: a connectable one is live; one that refuses (a crashed or
   // killed server that never cleaned up) is a stale leftover, so delete it. Then attach
   // to the lone live server, list several, or — when none survive — start a fresh one.
   var live: List[Text] = Nil
 
   socketPaths(socketDirectory).each: path =>
-    if connectDomain(DomainSocket(path)) { _ => () }.absent
-    then
+    if connectDomain(DomainSocket(path)) { _ => () }.absent then
       recover:
         case _: Path.Error | _: Io.Error => ()
+
       . protect:
         path.as[Path on Linux].wipe()
-    else live = path :: live
+    else
+      live = path :: live
 
   live.reverse match
     case Nil =>
@@ -761,38 +807,54 @@ private def connectSocket(intent: SessionIntent, initial: List[Text], history: W
       launchServer()(converse(intent, initial, history, context)(_)).or(failedToLaunch)
 
     case path :: Nil =>
-      connectDomain(DomainSocket(path))(converse(intent, initial, history, context)(_)).or(unreachableSocket(path))
+      connectDomain(DomainSocket(path))(converse(intent, initial, history, context)(_))
+      . or(unreachableSocket(path))
 
     case paths =>
       Out.println(t"Several REPL servers are running:")
 
-      paths.each: (path: Text) =>
-        Out.println(t"  $path")
+      paths.each: (path: Text) => Out.println(t"  $path")
 
       Out.println(t"Stop all but one, or connect to a specific one with 'flame --host localhost'")
       Exit.Fail(7)
 
-// Connects the terminal REPL to a flame server on another host over TCP (`flame --host HOST
-// [--port N]`, reaching a server started with `flame listen`), optionally joining a named session
-// with `-s`/`--session`. The transport differs from `connectSocket` (a TCP endpoint rather than a
-// local UNIX domain socket), but the conversation — the `converse`/`runRepl` loop — is identical, so
-// a remote session behaves exactly like a local one.
-private def connectRemote(host: Optional[Text], portNumber: Int, intent: SessionIntent, initial: List[Text], history: Workspace.HistoryConfig, context: ClientContext)
-    (using Stdio, Monitor, Probate, Console, Environment, System)
+// Connects the terminal REPL to a flame server on another host over TCP (`flame --host HOST [--port
+// N]`, reaching a server started with `flame listen`), optionally joining a named session with
+// `-s`/`--session`. The transport differs from `connectSocket` (a TCP endpoint rather than a local
+// UNIX domain socket), but the conversation — the `converse`/`runRepl` loop — is identical, so a
+// remote session behaves exactly like a local one.
+private def connectRemote
+  ( host:       Optional[Text],
+    portNumber: Int,
+    intent:     SessionIntent,
+    initial:    List[Text],
+    history:    Workspace.HistoryConfig,
+    context:    ClientContext )
+  ( using Stdio, Monitor, Probate, Console, Environment, System )
 :   Exit =
+
   host.lay(missingHost): hostText =>
     safely(urticose.Port[Tcp](portNumber)).lay(invalidPort(portNumber)): port =>
       recover:
         case Hostname.Error(_, _) => invalidHost(hostText)
+
       . protect:
           val endpoint: Endpoint[Tcp.Port] = hostText.as[Hostname] on port
-          connect(endpoint)(converse(intent, initial, history, context)(_)).or(unreachableRemote(hostText, portNumber))
+
+          connect(endpoint)(converse(intent, initial, history, context)(_))
+          . or(unreachableRemote(hostText, portNumber))
 
 // The terminal conversation: the REPL interface on Pyrocosm's inline terminal frontend, driven
 // by a socket engine. Ctrl+C/Ctrl+D leave the session; `/quit` stops the server first.
-private def converse(intent: SessionIntent, initial: List[Text], historyConfig: Workspace.HistoryConfig, context: ClientContext)(duplex: Duplex)
-    (using Stdio, Monitor, Probate, Console, Environment)
+private def converse
+  ( intent:        SessionIntent,
+    initial:       List[Text],
+    historyConfig: Workspace.HistoryConfig,
+    context:       ClientContext )
+  ( duplex: Duplex )
+  ( using Stdio, Monitor, Probate, Console, Environment )
 :   Exit =
+
   // The kitty keyboard protocol makes the terminal report Shift+Enter distinctly, so the
   // editor can submit on it.
   import terminalFeatures.kittyKeyboardFeature
@@ -817,7 +879,9 @@ private def converse(intent: SessionIntent, initial: List[Text], historyConfig: 
       Exit.Fail(4)
 
   . protect:
-      val frontend: TerminalFrontend = caps.unsafe.unsafeAssumePure(TerminalFrontend(ultimatum.Occupancy.Inline, FlameTheme))
+      val frontend: TerminalFrontend =
+        caps.unsafe.unsafeAssumePure(TerminalFrontend(ultimatum.Occupancy.Inline, FlameTheme))
+
       val engine: SocketEngine = caps.unsafe.unsafeAssumePure(SocketEngine(duplex))
 
       val options: ReplInterface.Options =
@@ -830,16 +894,16 @@ private def converse(intent: SessionIntent, initial: List[Text], historyConfig: 
             commands = initial,
             history = loaded,
             historyLimit = historyConfig.limit,
-            persist = { (line: Text) => historyConfig.file.let { (file: Text) => flame.History.append(file, line) } },
+            persist = { (line: Text) => historyConfig.file.let(flame.History.append(_, line)) },
             leave = () => frontend.stop() )
 
       val interface: ReplInterface = caps.unsafe.unsafeAssumePure(ReplInterface(engine, options))
-      engine.start(() => frontend.stop())
+      engine.start: () => frontend.stop()
       interface.start()
       frontend.run(interface.interface)(interface.handle)
       engine.close()
 
-      interface.failure.lay(Exit.Ok) { (message: Text) => Exit.Fail(10) }
+      interface.failure.lay(Exit.Ok): (message: Text) => Exit.Fail(10)
 
 // The `--basic` mode's rendering of a reply: captured output, the `name = value : type` line and
 // the diagnostics, as text the terminal wraps itself.
@@ -850,9 +914,11 @@ private def replyText(reply: Repl.Reply): Text = reply match
     // punctuation, the type in the type colour, and a singleton's widening faint after `<:`.
     val valueLine: Text =
       val rendered: Text = value.or(t"")
+
       if rendered == t"" then t"" else
         val binding: Teletype =
-          name.lay(e"") { each => e"$Italic(${palette.scalaTerm}($each)) ${palette.scalaParenthesis}(=) " }
+          name.lay(e""): each =>
+            e"$Italic(${palette.scalaTerm}($each)) ${palette.scalaParenthesis}(=) "
 
         val typed: Teletype =
           tpe.lay(e""): each =>

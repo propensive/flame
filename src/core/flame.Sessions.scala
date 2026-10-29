@@ -34,40 +34,39 @@ package flame
 
 import scala.caps
 
-
 import ambience.*
 import anthology.*
 import anticipation.*
 import capricious.*
 import coaxial.*
 import contingency.*
+import denominative.*
+import denominative.dysasymptotics.linearSize
 import gossamer.*
 import hellenism.*
 import hieroglyph.*
+import obligatory.*
 import parasite.*
 import prepositional.*
 import rudiments.*
-import denominative.*
-import symbolism.*
-import denominative.dysasymptotics.linearSize
 import rudiments.sortingAlgorithms.timsort
-import stratiform.*
-import obligatory.*
 import socketBackends.javaBaseSockets
+import stratiform.*
+import symbolism.*
 import turbulence.*
-import zephyrine.*
 import urticose.*
 import vacuous.*
+import zephyrine.*
 
 import classloaders.threadContextClassloader
 import hieroglyph.charsets.utf8Charset
 import hieroglyph.textSanitizers.skipSanitizer
 
-// A named collection of independent REPL sessions served over one socket. Each connection is bound to
-// a "current" session (a `Repl`), auto-assigned a fresh randomly-named session on connect, and may
-// switch to any existing session with a `/session` command. This is the multi-session server that
-// wraps the per-session engine (`Repl`); the socket protocol (`serve`/`converse`/`respond`) used to
-// live on `Repl` itself, back when there was exactly one shared session.
+// A named collection of independent REPL sessions served over one socket. Each connection is bound
+// to a "current" session (a `Repl`), auto-assigned a fresh randomly-named session on connect, and
+// may switch to any existing session with a `/session` command. This is the multi-session server
+// that wraps the per-session engine (`Repl`); the socket protocol (`serve`/`converse`/`respond`)
+// used to live on `Repl` itself, back when there was exactly one shared session.
 object Sessions:
   // Vouches that `value`'s tracked captures do not outlive their scope, discarding its capture
   // set (Soundness's codec-thunk seal idiom, rep/DECISIONS.md). The explicitly
@@ -78,9 +77,11 @@ object Sessions:
   // The animal names sessions are drawn from — read from Nomenclature's classpath resource, with a
   // small hard-coded fallback should the resource be unreadable.
   private val fallback: List[Text] =
-    List(t"aardvark", t"badger", t"cheetah", t"dolphin", t"eagle", t"ferret", t"gazelle", t"heron",
-         t"ibis", t"jaguar", t"koala", t"lemur", t"marmot", t"newt", t"otter", t"penguin", t"quokka",
-         t"raccoon", t"salmon", t"tapir", t"urchin", t"vulture", t"walrus", t"yak", t"zebra")
+    List
+      ( t"aardvark", t"badger", t"cheetah", t"dolphin", t"eagle", t"ferret", t"gazelle",
+        t"heron", t"ibis", t"jaguar", t"koala", t"lemur", t"marmot", t"newt", t"otter",
+        t"penguin", t"quokka", t"raccoon", t"salmon", t"tapir", t"urchin", t"vulture",
+        t"walrus", t"yak", t"zebra" )
 
   lazy val animals: List[Text] =
     val loaded: Optional[List[Text]] =
@@ -95,8 +96,9 @@ object Sessions:
 // following as a `Reply.Advised` (see `Repl#react`) instead of holding the rejection up.
 class Sessions[version <: Scalac.Versions]
   ( render: Repl.Rendering = Repl.Rendering.Inspect, frontend: Boolean = false )
-  ( using scalac: Scalac[version, Universe.Classfile], classloader: Classloader,
-    temporary: TemporaryDirectory ):
+  ( using scalac:      Scalac[version, Universe.Classfile],
+          classloader: Classloader,
+          temporary:   TemporaryDirectory ):
 
   private var registry: Map[Text, Repl[version]] = Map()
   private val lock:     Mutex                    = Mutex()
@@ -112,10 +114,11 @@ class Sessions[version <: Scalac.Versions]
   def session(name: Text): Optional[Repl[version]] = lock(registry.at(name))
 
   // Registers a fresh session under a random animal name not already in use (falling back to a
-  // numbered suffix in the astronomically-unlikely event every animal is taken), and returns the name.
+  // numbered suffix in the astronomically-unlikely event every animal is taken), and returns the
+  // name.
   def create(): Text =
     lock:
-      val free: List[Text] = Sessions.animals.filter { animal => !registry.defines(animal) }
+      val free: List[Text] = Sessions.animals.filter: animal => !registry.defines(animal)
 
       val name: Text =
         Random.global.shuffle(free).head.or:
@@ -195,10 +198,12 @@ class Sessions[version <: Scalac.Versions]
 
   def serve(port: Port over Tcp)(using Monitor, System, Probate)
   :   Socket.Service logs CompileEvent raises Bind.Error =
+
     accept(port)
 
   def serve(socketPath: Text)(using Monitor, System, Probate)
   :   Socket.Service logs CompileEvent raises Bind.Error =
+
     accept(DomainSocket(socketPath))
 
   // One client's connection: its current session (created lazily, so a probe leaves none
@@ -239,8 +244,13 @@ class Sessions[version <: Scalac.Versions]
     def respond(request: Repl.Request): Optional[Repl.Reply] logs CompileEvent = request match
       case Repl.Request.Tokenize(id, code) =>
         val scope: List[Repl.ScopeBinding] = session(currentName).lay(Nil)(_.scopeAt(code))
-        Repl.Reply.Tokenized(id, Repl.tokenize(code), Repl.incomplete(code),
-            Repl.classify(code) == Repl.Verdict.Language, scope)
+
+        Repl.Reply.Tokenized
+          ( id,
+            Repl.tokenize(code),
+            Repl.incomplete(code),
+            Repl.classify(code) == Repl.Verdict.Language,
+            scope )
 
       case Repl.Request.Submit(id, code) =>
         session(currentName).lay(Repl.Reply.Failed(id, t"no active session")): repl =>
@@ -249,10 +259,13 @@ class Sessions[version <: Scalac.Versions]
             push(Repl.Reply.Pending(id))
 
             async:
+              val output: Text => Unit = chunk =>
+                Repl.streamChunks(chunk).each: (stream, text) =>
+                  push(Repl.Reply.Output(id, text, stream))
+
               val reply: Repl.Reply =
-                safely(repl.react(id, code, chunk => Repl.streamChunks(chunk).each { (stream, text) =>
-                  push(Repl.Reply.Output(id, text, stream)) }, advice)).or
-                 (Repl.Reply.Failed(id, t"the submission could not be processed"))
+                safely(repl.react(id, code, output, advice))
+                . or(Repl.Reply.Failed(id, t"the submission could not be processed"))
 
               push(reply)
 
@@ -277,7 +290,8 @@ class Sessions[version <: Scalac.Versions]
           current = name
           applyContext()
           Repl.Reply.Session(id, name, names, Repl.SessionOutcome.Joined)
-        else Repl.Reply.Session(id, current.or(t""), names, Repl.SessionOutcome.Missing)
+        else
+          Repl.Reply.Session(id, current.or(t""), names, Repl.SessionOutcome.Missing)
 
       case Repl.Request.Create(id, name) =>
         if open(name) then
@@ -285,7 +299,8 @@ class Sessions[version <: Scalac.Versions]
           prime(name)
           applyContext()
           Repl.Reply.Session(id, name, names, Repl.SessionOutcome.Created)
-        else Repl.Reply.Session(id, current.or(t""), names, Repl.SessionOutcome.Exists)
+        else
+          Repl.Reply.Session(id, current.or(t""), names, Repl.SessionOutcome.Exists)
 
       case Repl.Request.SessionList(id) =>
         Repl.Reply.SessionList(id, names)
@@ -317,7 +332,7 @@ class Sessions[version <: Scalac.Versions]
         try duplex.send(zephyrine.Stream(LengthPrefix.encode(payload)))
         catch case _: Throwable => ()
 
-    val connection: Connection = this.connection(reply => send(encode(reply)))
+    val connection: Connection = this.connection: reply => send(encode(reply))
 
     try
       // One record per request, framed by its four-byte big-endian length. A framing or truncation
@@ -331,13 +346,14 @@ class Sessions[version <: Scalac.Versions]
         async:
           val response: Optional[Repl.Reply] =
             try
-              safely(Bintel.read[Repl.Request](message)).lay(Repl.Reply.Failed(0, t"the request could not be parsed")): request =>
-                connection.respond(request)
+              safely(Bintel.read[Repl.Request](message))
+              . lay(Repl.Reply.Failed(0, t"the request could not be parsed")): request =>
+                  connection.respond(request)
             catch case error: Throwable => Repl.Reply.Failed(0, error.toString.tt)
 
-          response.let { reply => send(encode(reply)) }
+          response.let: reply => send(encode(reply))
     catch case _: Throwable => ()
 
-    // Decodes one request and dispatches on the CURRENT session: `tokenize` is stateless (the lexer);
-    // `submit`/`complete` run on `current`'s `Repl`; `session` switches/reports sessions; `quit`
-    // stops the whole server (all sessions). `Unset` means no reply is sent.
+    // Decodes one request and dispatches on the CURRENT session: `tokenize` is stateless (the
+    // lexer); `submit`/`complete` run on `current`'s `Repl`; `session` switches/reports sessions;
+    // `quit` stops the whole server (all sessions). `Unset` means no reply is sent.

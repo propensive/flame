@@ -32,11 +32,10 @@
                                                                                                   */
 package flame
 
-import scala.language.adhocExtensions
-
 // Like `ReplMacro`, this file drives the compiler API directly, which speaks stdlib lists, so
 // `List`/`Nil` here are the stdlib ones, shadowing the prelude's opaque collections.
 import scala.collection.immutable.{List, Nil}
+import scala.language.adhocExtensions
 
 import dotty.tools.dotc as dtd
 import dotty.tools.dotc.CompilationUnit
@@ -78,11 +77,11 @@ class ModuleUnit(val moduleName: String, val tasty: List[String])
 extends CompilationUnit(NoSource, null)
 
 object ReplModuleCompiler:
+  // The caller (`Repl.ensureSeeded`) works in the prelude's collections, so this entry point
+  // takes and returns those, and the compiler-facing body works in stdlib lists.
   def compile
     ( classpath: LocalClasspath )
     ( moduleName: Text, out: Text )
-    // The caller (`Repl.ensureSeeded`) works in the prelude's collections, so this entry point
-    // takes and returns those, and the compiler-facing body works in stdlib lists.
     ( pickled: proscenium.List[String] )
     ( using System )
   :   proscenium.List[Text] =
@@ -102,6 +101,7 @@ object ReplModuleCompiler:
         // seed compiler is given the same permission the trees were typed under.
         val arguments: List[Text] =
           List(t"-experimental", t"-d", out, t"-classpath", classpath(), t"")
+
         setup(arguments.map(_.s).toArray, context).map(_(1)).get
 
       def run(): List[Text] =
@@ -123,8 +123,8 @@ class ReplModuleCompiler extends dtd.Compiler:
     List(ModuleFrontend()) :: List(PostTyper()) :: List(SetRootTree()) :: Nil
 
   override protected def picklerPhases: List[List[Phase]] =
-    List(Pickler()) :: List(Inlining()) :: List(Staging()) :: List(Splicing())
-    :: List(PickleQuotes()) :: Nil
+    List(Pickler()) :: List(Inlining()) :: List(Staging()) :: List(Splicing()) ::
+      List(PickleQuotes()) :: Nil
 
   class ModuleFrontend extends Phase:
     import tpd.*
@@ -192,7 +192,7 @@ class ReplModuleCompiler extends dtd.Compiler:
 
           // `ModuleDef` builds the module value, its class and a constructor.
           val moduleDef = ModuleDef(module.asTerm, members)(using unitCtx)
-          val rootRef = ref(definitions.RootPackage)(using unitCtx).asInstanceOf[Ident]
+          val rootRef = Ident(definitions.RootPackage.termRef(using unitCtx))(using unitCtx)
           val packageTree = PackageDef(rootRef, moduleDef.trees).withSpan(span)
 
           val source = SourceFile.virtual("<repl-module>", "")

@@ -83,13 +83,10 @@ object settings:
     "-Ycheck-all-patmat",
     "-language:experimental.modularity",
     "-language:experimental.dependent",
-    "-language:experimental.relaxedLambdaSyntax",
     "-language:experimental.genericNumberLiterals",
-    "-language:experimental.into",
     "-language:experimental.erasedDefinitions",
     "-language:implicitConversions",
     "-language:experimental.saferExceptions",
-    "-language:experimental.strictEqualityPatternMatching",
     "-language:experimental.subCases",
     "-language:experimental.multiSpreads",
     // Capture checking, as enabled throughout Soundness: the language flag is equivalent to a

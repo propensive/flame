@@ -63,7 +63,7 @@ object TastyRender:
     def outline:        Color in Srgb = srgb(0x928374)
     def accented:       Color in Srgb = srgb(0xff6633)
 
-  // The tree's `Teletypeable` (hyperbole's top-level `tastyTreeTeletypeable` given) renders the escritoire
-  // table; `render(termcap)` flattens the styled `Teletype` to truecolor ANSI text — which the CLI
-  // prints verbatim through the REPL's `output` channel.
+  // The tree's `Teletypeable` (hyperbole's top-level `tastyTreeTeletypeable` given) renders the
+  // escritoire table; `render(termcap)` flattens the styled `Teletype` to truecolor ANSI text —
+  // which the CLI prints verbatim through the REPL's `output` channel.
   def render(tree: Tasty.Tree): Text = tree.teletype.render(xtermTrueColorTermcap)
