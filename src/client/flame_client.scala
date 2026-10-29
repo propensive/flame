@@ -97,11 +97,17 @@ val Flame: Tool =
       web   = FlameWeb )
 
 // The web REPL as the daemon serves it, at most once, when a `config.tel` in the cascade says
-// `serve` (on its `port`, or 8080): `serve` blocks in `serveHttp` until `stop` — from a later
+// `serve` — behind the machine's Pyrocosm hub, at `/flame/` on the hub's origin (8090), unless a
+// `port` gives it one of its own: `serve` blocks in `serveHttp` until `stop` — from a later
 // `flame quit` invocation, on another thread — fulfils the promise it waits on. This is the same
 // server `flame serve` runs interactively (`httpServe`), minus the terminal and its Ctrl+C.
 object FlameWeb extends Tool.Web:
-  def port: Int = 8080
+  def port: Int = 0
+
+  // Where the REPL on `port` is found: under the hub's origin for port 0, which the hub holds,
+  // and at the port itself otherwise.
+  def address(port: Int): Text =
+    if port == 0 then t"http://localhost:${pyrocosm.Hubs.port}/flame/" else t"http://localhost:$port/"
 
   // The promise a running server waits on, so that `stop` can reach it from another invocation.
   // A `Promise` holds no capability; vouched untracked so the field can be assigned from `serve`.
@@ -113,7 +119,7 @@ object FlameWeb extends Tool.Web:
     given Classloader = serverClassloader
     val quit: Promise[Unit] = Promise()
     quitting = quit
-    serveHttp(port, quit)
+    serveHttp(port, quit, address(port))
 
   def stop(): Unit = quitting.let(_.offer(()))
 
@@ -500,7 +506,7 @@ private def httpServe(portNumber: Int)
           case Keypress.Ctrl('C' | 'D') => quit.offer(()); reading = false
           case _                        => ()
 
-  serveHttp(portNumber, quit)
+  serveHttp(portNumber, quit, FlameWeb.address(portNumber))
   Exit.Ok
 
 // The directory holding per-process REPL sockets, and this process's socket file.
