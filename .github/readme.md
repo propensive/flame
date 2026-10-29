@@ -44,9 +44,10 @@ found by walking up from the working directory as `.git` is found, and the user'
 `~/.config/flame/config.tel` (under `$XDG_CONFIG_HOME` if set), the project's taking priority. Both
 accept the keywords documented in `src/client/flame.Workspace.scala` (`set`, `language`,
 `classpath`, `port`, `host`, `join`, `create`, `history`), and two more that Pyrocosm reads: a bare
-`serve` keeps the web REPL running in the daemon, on `port` (8080 by default), for as long as the
-daemon lives — so it is simply there, without a `flame serve` ever being run — and `flame quit`
-brings it down. A user file that does just that:
+`serve` keeps the web REPL running in the daemon, for as long as the daemon lives — so it is
+simply there, at `http://localhost:8090/flame/`, without a `flame serve` ever being run — and
+`flame quit` brings it down. That address is the machine's Pyrocosm hub, which serves every
+Pyrocosm tool's front-end under one origin; `port` serves the REPL on a port of its own as well. A user file that does just that:
 
 ```
 tel 1.0

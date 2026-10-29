@@ -229,7 +229,9 @@ private def restApi(apiSessions: Sessions[3.9])(request: Http.Request)(using Mon
 // Burdock/Ethereal launcher). Blocks until `quit` is fulfilled (the CLI completes it on Ctrl+C;
 // the standalone `web` main passes one that is never fulfilled and relies on the JVM's own
 // signal handling).
-def serveHttp(port: Int, quit: Promise[Unit])(using Monitor, System, Probate, Classloader): Unit =
+def serveHttp(port: Int, quit: Promise[Unit], address: Optional[Text] = Unset)
+  ( using Monitor, System, Probate, Classloader )
+:   Unit =
   given Scalac[3.9, Universe.Classfile] = Scalac(Nil)
 
   // Each page auto-starts a fresh randomly-named session and may `/session`-switch to any other.
@@ -252,9 +254,11 @@ def serveHttp(port: Int, quit: Promise[Unit])(using Monitor, System, Probate, Cl
       interface.start()
       (interface.interface, interface.handle)
 
+  // Where the REPL is found: the address the caller gives (behind the machine's Pyrocosm hub,
+  // for a port of 0), or its own port.
   import stdios.javaLangSystemStdio, termcapDefinitions.basicTermcap
   Out.println(t"Serving the web REPL (press Ctrl+C to stop):")
-  Out.println(t"  http://localhost:$port/")
+  Out.println(t"  ${address.or(t"http://localhost:$port/")}")
   quit.attend()
   frontend.stop()
 
