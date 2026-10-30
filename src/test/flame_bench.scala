@@ -35,8 +35,8 @@ package flame
 import soundness.*
 
 import classloaders.threadContextClassloader
-import probates.awaitProbate
 import logging.silentLogging
+import probates.awaitProbate
 import strategies.throwUnsafely
 import systems.javaBaseSystem
 import temporaryDirectories.systemTemporaryDirectory
@@ -65,7 +65,10 @@ def firstLine(args: String*): Unit =
   val viaSessions: Boolean = arguments.has(t"--sessions")
   val settle: Boolean = arguments.has(t"--settle")
   val began: Long = java.lang.System.nanoTime
-  val warming: java.util.concurrent.ConcurrentLinkedQueue[String] = java.util.concurrent.ConcurrentLinkedQueue()
+
+  val warming: java.util.concurrent.ConcurrentLinkedQueue[String] =
+    java.util.concurrent.ConcurrentLinkedQueue()
+
   val out = java.lang.System.out.nn
 
   val waitMillis: Long =
@@ -77,7 +80,9 @@ def firstLine(args: String*): Unit =
     if index < 0 || index + 1 >= args.length then Unset else args(index + 1)
 
   val inspect: Boolean = arguments.has(t"--inspect")
-  val rendering: Repl.Rendering = if inspect then Repl.Rendering.Inspect else Repl.Rendering.Exhibit(true)
+
+  val rendering: Repl.Rendering =
+    if inspect then Repl.Rendering.Inspect else Repl.Rendering.Exhibit(true)
 
   val builtin: List[Text] =
     List
@@ -103,9 +108,11 @@ def firstLine(args: String*): Unit =
     (java.lang.System.nanoTime - start)/1000000L
 
   def kind(reply: Optional[Repl.Reply]): Text = reply match
-    case _: Repl.Reply.Ran      => t"ran"
+    case _: Repl.Reply.Ran => t"ran"
+
     case Repl.Reply.Rejected(_, diagnostics, _, _) =>
       if inspect then t"rejected: ${diagnostics.keep(300).sub(t"\n", t" / ")}" else t"rejected"
+
     case _: Repl.Reply.Threw    => t"threw"
     case _: Repl.Reply.Crashed  => t"crashed"
     case _: Repl.Reply.Failed   => t"failed"
@@ -120,9 +127,11 @@ def firstLine(args: String*): Unit =
     def open(): Text => Optional[Repl.Reply] =
       if viaSessions then
         val sessions = Sessions(rendering, frontend = true)
+
         val connection = sessions.connection:
           case Repl.Reply.Warming(_, done, total) =>
-            warming.add(s"  warming $done/$total at ${(java.lang.System.nanoTime - began)/1000000L}ms")
+            val elapsed: Long = (java.lang.System.nanoTime - began)/1000000L
+            warming.add(s"  warming $done/$total at ${elapsed}ms")
             ()
 
           case _ => ()
@@ -139,7 +148,8 @@ def firstLine(args: String*): Unit =
         val repl = Repl.make[3.9](Repl.Prelude.empty, rendering)
         line => repl.react(1, line)
 
-    out.println(t"wait ${waitMillis}ms, ${if viaSessions then t"through Sessions" else t"bare Repl"}".s)
+    val via: Text = if viaSessions then t"through Sessions" else t"bare Repl"
+    out.println(t"wait ${waitMillis}ms, $via".s)
     out.println(String.format("%-64s %8s %8s  %s", "session A", "first", "repeat", ""))
 
     val opened: Long = java.lang.System.nanoTime

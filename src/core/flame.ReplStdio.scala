@@ -70,22 +70,26 @@ object ReplStdio:
   // capability the `OutputStream` would capture, which its pure declared type forbids.
   private object outStream extends ji.OutputStream:
     def write(byte: Int): Unit = jl.System.out.nn.write(byte)
+
     override def write(bytes: scala.Array[Byte] | Null, offset: Int, length: Int): Unit =
       jl.System.out.nn.write(bytes, offset, length)
+
     override def flush(): Unit = jl.System.out.nn.flush()
 
   private object errStream extends ji.OutputStream:
     def write(byte: Int): Unit = jl.System.err.nn.write(byte)
+
     override def write(bytes: scala.Array[Byte] | Null, offset: Int, length: Int): Unit =
       jl.System.err.nn.write(bytes, offset, length)
+
     override def flush(): Unit = jl.System.err.nn.flush()
 
   val stdio: Stdio =
     Stdio
-     ( ji.PrintStream(outStream, true, "UTF-8"),
-       ji.PrintStream(errStream, true, "UTF-8"),
-       jl.System.in.nn,
-       currentTermcap )
+      ( ji.PrintStream(outStream, true, "UTF-8"),
+        ji.PrintStream(errStream, true, "UTF-8"),
+        jl.System.in.nn,
+        currentTermcap )
 
   given provider: Stdio.Provider = new Stdio.Provider:
     val stdio: Stdio = ReplStdio.stdio

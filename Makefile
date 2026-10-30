@@ -93,8 +93,8 @@ bench:
 
 # Check every source against Consequent Style and the project's own rules with flare (the
 # release pinned in etc/tools; `make tools` installs it), as configured in
-# .pyrocosm/flare/config.tel. Findings are warnings and the count is not yet zero, so CI does
-# not run this; PATHS restricts the check to files beneath them.
+# .pyrocosm/flare/config.tel. Findings are warnings, and CI does not run this; PATHS restricts the
+# check to files beneath them.
 check:
 	flare check $(PATHS)
 

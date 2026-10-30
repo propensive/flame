@@ -42,7 +42,6 @@ import soundness.*
 // Loaded and prepended to the in-memory command history at startup, so the arrow keys walk up into
 // earlier sessions.
 object History:
-  import strategies.throwUnsafely
   import filesystemBackends.javaBaseFilesystem
 
   // Every entry in `file`, oldest first; empty when the file is absent or unreadable. A trailing
@@ -81,11 +80,11 @@ object History:
       val records: Chain[Data] = Chain(lines.map { line => frame(line) }*)
 
       // `Eof(path)` is galilei's append mode: the same file, opened positioned at its end.
-      // `Eof(path)` is galilei's append mode: the same file, opened positioned at its end.
       // `Create` as well, since the first line of a session appends to a file that does not exist
       // yet — without it the append is a no-op and no history is ever persisted.
-      if appending then Eof(path).open(Write, OpenFlag.Create) { handle ?=> handle.write(records) }
-      else path.open[File](Write, OpenFlag.Create, OpenFlag.Truncate) { handle ?=> handle.write(records) }
+      if appending then Eof(path).open(Write, OpenFlag.Create): handle ?=> handle.write(records)
+      else path.open[File](Write, OpenFlag.Create, OpenFlag.Truncate): handle ?=>
+        handle.write(records)
 
     ()
 

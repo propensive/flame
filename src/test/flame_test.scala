@@ -36,21 +36,29 @@ import scala.caps
 
 import soundness.*
 
-import pyrocosm.{Block, Control, Event, Inline, Token, Tone}
-
-
 import classloaders.threadContextClassloader
 import dysasymptotics.linearSize
-import internetAccess.online
-import socketBackends.javaBaseSockets
 import filesystemBackends.javaBaseFilesystem
+import internetAccess.online
+import logging.silentLogging
 import pathInterfaces.pathOnLinux
 import probates.awaitProbate
-import logging.silentLogging
+import pyrocosm.{Block, Control, Event, Inline, Token, Tone}
+import socketBackends.javaBaseSockets
 import strategies.throwUnsafely
 import systems.javaBaseSystem
 import temporaryDirectories.systemTemporaryDirectory
 import threads.platformThreads
+
+object Wire:
+  // The connection is made through the `Connectable` instance directly rather than the `duplex`
+  // loan, so it outlives a single block and the tests keep their `try`/`finally` shape.
+  def tcp(port: Port over Tcp)(using Online): Wire^ =
+    val endpoint: Endpoint[Tcp.Port] = t"localhost".as[Hostname] on port
+    Wire(caps.unsafe.unsafeAssumePure(Connectable.tcpEndpoint).connect(endpoint, Unset))
+
+  def domain(path: Text): Wire^ =
+    Wire(Connectable.domainSocket.connect(DomainSocket(path), Unset))
 
 // One framed connection to a REPL server, as the client speaks it: each request and reply is a
 // record framed by its four-byte big-endian length (`obligatory.LengthPrefix`) carrying a BinTEL
@@ -73,27 +81,17 @@ class Wire(duplex: Duplex) extends caps.ExclusiveCapability:
 
   def close(): Unit = safely(duplex.close())
 
-object Wire:
-  // The connection is made through the `Connectable` instance directly rather than the `duplex`
-  // loan, so it outlives a single block and the tests keep their `try`/`finally` shape.
-  def tcp(port: Port over Tcp)(using Online): Wire^ =
-    val endpoint: Endpoint[Tcp.Port] = t"localhost".as[Hostname] on port
-    Wire(caps.unsafe.unsafeAssumePure(Connectable.tcpEndpoint).connect(endpoint, Unset))
-
-  def domain(path: Text): Wire^ =
-    Wire(Connectable.domainSocket.connect(DomainSocket(path), Unset))
-
-// Every `Repl` and `Sessions` a test makes, registered as it is made (`Opened(Opened(Repl()))`) so that
-// `isolated` can close it when the test's block ends. Each keeps a warm compiler alive until it is
-// closed (see `Repl#close`), so a suite that merely dropped them would exhaust any heap.
+// Every `Repl` and `Sessions` a test makes, registered as it is made (`Opened(Opened(Repl()))`) so
+// that `isolated` can close it when the test's block ends. Each keeps a warm compiler alive until
+// it is closed (see `Repl#close`), so a suite that merely dropped them would exhaust any heap.
 //
 // Each block registers against a deque OF ITS OWN, not one global stack indexed by depth: test
 // blocks run on several threads at once (a `probably` worker, fume's event stream), so a
 // depth-based scheme let one block close a `Repl` another block was still using — closing it
 // retires its scope inspector (see `Repl#close`), whose executor then REJECTS the inspection
 // already on its way, which `ScopeInspector#inspect` reports as an empty scope. The deque is
-// inherited by the threads a block spawns, so a `Repl` opened off-thread still belongs to the
-// block that opened it.
+// inherited by the threads a block spawns, so a `Repl` opened off-thread still belongs to the block
+// that opened it.
 object Opened:
   private type Closeable = Repl[?] | Sessions[?]
 
@@ -139,10 +137,14 @@ def isolated[result](block: Monitor ?=> result)(using Threading, Codepoint): res
 object ReplFixture:
   var greeting: String = "hello"
 
-  def session(using Scalac[3.9, Universe.Classfile], Classloader, TemporaryDirectory, Monitor, System, Probate)
+  def session
+    ( using Scalac[3.9, Universe.Classfile], Classloader, TemporaryDirectory, Monitor, System,
+            Probate )
   :   (Repl.Outcome, Repl.Outcome) =
+
     val repl = Repl[3.9]:
       def size: Int = greeting.length
+
     Opened(repl)
 
     val before: Repl.Outcome = repl.interpret(t"size")
@@ -159,18 +161,20 @@ object Tests extends Suite(m"Flame Tests"):
           val repl = Opened(Repl())
           repl.interpret(t"val x = 40")
           repl.interpret(t"println(x + 2)")
+
       . assert:
           case Repl.Outcome.Ran(_, _, _, _, _) => true
-          case _                         => false
+          case _                               => false
 
       test(m"an import persists to a later line"):
         isolated:
           val repl = Opened(Repl())
           repl.interpret(t"import scala.collection.mutable.ListBuffer")
           repl.interpret(t"ListBuffer(1, 2, 3)")
+
       . assert:
           case Repl.Outcome.Ran(_, _, _, _, _) => true
-          case _                         => false
+          case _                               => false
 
       test(m"an import of a session definition persists to a later line"):
         isolated:
@@ -178,6 +182,7 @@ object Tests extends Suite(m"Flame Tests"):
           repl.interpret(t"object Foo { object Bar { def hi = 42 } }")
           repl.interpret(t"import Foo.Bar")
           repl.interpret(t"Bar.hi")
+
       . assert:
           case Repl.Outcome.Ran(_, _, _, _, _) => true
           case _                               => false
@@ -188,6 +193,7 @@ object Tests extends Suite(m"Flame Tests"):
           repl.interpret(t"object Foo { val n = 7 }")
           repl.interpret(t"import Foo.*")
           repl.interpret(t"n")
+
       . assert:
           case Repl.Outcome.Ran(_, _, _, _, _) => true
           case _                               => false
@@ -199,32 +205,39 @@ object Tests extends Suite(m"Flame Tests"):
           val before = repl.interpret(t"ListBuffer(1, 2, 3)")
           repl.interpret(t"/unimport scala.collection.mutable.ListBuffer")
           (before, repl.interpret(t"ListBuffer(1, 2, 3)"))
+
       . assert:
           case (Repl.Outcome.Ran(_, _, _, _, _), Repl.Outcome.Rejected(_)) => true
-          case _                                                     => false
+          case _                                                           => false
 
       test(m"/unimport with no argument lists the removable imports"):
         isolated:
           val repl = Opened(Repl())
           repl.interpret(t"import scala.collection.mutable.ListBuffer")
           repl.interpret(t"/unimport")
+
       . assert:
-          case Repl.Outcome.Ran(_, _, output, _, _) => output.contains(t"scala.collection.mutable.ListBuffer")
-          case _                              => false
+          case Repl.Outcome.Ran(_, _, output, _, _) =>
+            output.contains(t"scala.collection.mutable.ListBuffer")
+
+          case _ =>
+            false
 
       test(m"/unimport reports when no import matches the given tokens"):
         isolated:
           Opened(Repl()).interpret(t"/unimport nonsense.does.not.exist")
+
       . assert:
           case Repl.Outcome.Ran(_, _, output, _, _) => output.contains(t"No matching import")
-          case _                              => false
+          case _                                    => false
 
       test(m"/classpath lists the current classpath"):
         isolated:
           Opened(Repl()).interpret(t"/classpath")
+
       . assert:
           case Repl.Outcome.Ran(_, _, output, _, _) => output.contains(t"Classpath (")
-          case _                              => false
+          case _                                    => false
 
       // The scope an UNFINISHED line has opened (see `ScopeInspector`): what its next statement
       // would see. Rendered by name (where the user could write one) and type.
@@ -236,32 +249,39 @@ object Tests extends Suite(m"Flame Tests"):
           val repl = Opened(Repl())
           repl.react(0, t"import soundness.*")
           scopeText(repl.scopeAt(t"unsafely:\n  "))
-      . assert { scope => scope.contains(t"Unsafe") && scope.contains(t"CanThrow[Exception]") }
+
+      . assert: scope => scope.contains(t"Unsafe") && scope.contains(t"CanThrow[Exception]")
 
       test(m"an unfinished lambda reports its parameter by name and type"):
         isolated:
           Opened(Repl()).scopeAt(t"scala.List(1, 2).map { x =>\n  ")
+
       . assert:
           case Repl.ScopeBinding(name, tpe, false, _) :: Nil => name == t"x" && tpe == t"Int"
-          case _                                          => false
+          case _                                             => false
 
       test(m"nested scopes report the innermost block's contextual values first"):
         isolated:
           val repl = Opened(Repl())
           repl.react(0, t"import soundness.*")
           repl.scopeAt(t"unsafely:\n  safely:\n    ").map(_.tpe)
-      . assert { types => types.head.let(_.contains(t"Diagnostics")).or(false) && types.exists(_.contains(t"Unsafe")) }
+
+      . assert: types =>
+          types.head.let(_.contains(t"Diagnostics")).or(false) &&
+            types.exists(_.contains(t"Unsafe"))
 
       test(m"a block's own definitions are in scope for its next statement"):
         isolated:
           val repl = Opened(Repl())
           repl.react(0, t"import soundness.*")
           scopeText(repl.scopeAt(t"unsafely:\n  val n = 42\n  "))
-      . assert { scope => scope.contains(t"n: Int") && scope.contains(t"Unsafe") }
+
+      . assert: scope => scope.contains(t"n: Int") && scope.contains(t"Unsafe")
 
       test(m"a complete single line opens no scope"):
         isolated:
           Opened(Repl()).scopeAt(t"1 + 2")
+
       . assert(_ == Nil)
 
       // `Out.println` needs a `Stdio`; the REPL supplies one ambiently (see `ReplStdio`), writing
@@ -273,6 +293,7 @@ object Tests extends Suite(m"Flame Tests"):
           repl.react(0, t"/set experimental")
           repl.react(0, t"import soundness.*")
           repl.interpret(t"Out.println(t\"ambient stdio\")")
+
       . assert:
           case Repl.Outcome.Ran(_, _, output, _, _) => output.contains(t"ambient stdio")
           case _                                    => false
@@ -286,6 +307,7 @@ object Tests extends Suite(m"Flame Tests"):
           repl.react(0, t"import soundness.*")
           repl.react(1, t"import stdios.muteStdio")
           repl.interpret(t"Out.println(t\"silenced\")")
+
       . assert:
           case Repl.Outcome.Ran(_, _, output, _, _) => !output.contains(t"silenced")
           case _                                    => false
@@ -297,6 +319,7 @@ object Tests extends Suite(m"Flame Tests"):
           repl.react(0, t"import soundness.*")
           repl.react(1, t"given quiet: Stdio = stdios.muteStdio")
           repl.interpret(t"Out.println(t\"silenced\")")
+
       . assert:
           case Repl.Outcome.Ran(_, _, output, _, _) => !output.contains(t"silenced")
           case _                                    => false
@@ -317,6 +340,7 @@ object Tests extends Suite(m"Flame Tests"):
           repl.react(0, t"/set experimental")
           repl.react(0, t"import soundness.*")
           binding(repl.interpret(t"Foot*Foot"))
+
       . assert(_ == t"quantity: Quantity[Feet[2]]")
 
       test(m"a product of a number and two quantities shows its units"):
@@ -325,6 +349,7 @@ object Tests extends Suite(m"Flame Tests"):
           repl.react(0, t"/set experimental")
           repl.react(0, t"import soundness.*")
           binding(repl.interpret(t"8*Foot*Foot"))
+
       . assert(_ == t"quantity: Quantity[Feet[2]]")
 
       def diagnostics(reply: Repl.Reply): Text = reply match
@@ -334,23 +359,26 @@ object Tests extends Suite(m"Flame Tests"):
       test(m"a type-error diagnostic renders types via stenography, abbreviated to `Int`"):
         isolated:
           diagnostics(Opened(Repl()).react(0, t"val n: Int = \"hello\""))
-      . assert { diag => diag.contains(t"Int") && !diag.contains(t"scala.Int") }
+
+      . assert: diag => diag.contains(t"Int") && !diag.contains(t"scala.Int")
 
       test(m"a type-error diagnostic abbreviates a session-imported type to its simple name"):
         isolated:
           val repl = Opened(Repl())
           repl.react(0, t"import scala.collection.mutable.ListBuffer")
           diagnostics(repl.react(1, t"val b: ListBuffer[Int] = \"no\""))
-      . assert { diag => diag.contains(t"ListBuffer[Int]") && !diag.contains(t"mutable.ListBuffer") }
 
-      // `soundness.Json` is `export jacinta.Json`, so the compiler names the type `jacinta.Json`; the
-      // reifier resolves the prelude's exports so it abbreviates as the user wrote it.
+      . assert: diag => diag.contains(t"ListBuffer[Int]") && !diag.contains(t"mutable.ListBuffer")
+
+      // `soundness.Json` is `export jacinta.Json`, so the compiler names the type `jacinta.Json`;
+      // the reifier resolves the prelude's exports so it abbreviates as the user wrote it.
       test(m"a type reached through a prelude's export abbreviates to its leaf name"):
         isolated:
           val repl = Opened(Repl())
           repl.react(0, t"import soundness.*")
           diagnostics(repl.react(1, t"val j: Json = 1"))
-      . assert { diag => diag.contains(t"Json") && !diag.contains(t"jacinta.Json") }
+
+      . assert: diag => diag.contains(t"Json") && !diag.contains(t"jacinta.Json")
 
       // Soundness's missing-given advice (frontier's `explainMissingContext`, reached through
       // `import soundness.*`) replaces the compiler's own "no given instance" message only when
@@ -361,7 +389,8 @@ object Tests extends Suite(m"Flame Tests"):
           val repl = Opened(Repl())
           repl.react(0, t"import soundness.*")
           diagnostics(repl.react(1, t"summon[rudiments.DecimalConverter]"))
-      . assert { diag => diag.contains(t"decimalConverters.javaDecimalConverter") }
+
+      . assert: diag => diag.contains(t"decimalConverters.javaDecimalConverter")
 
       // With somewhere for the advice to go, the rejection does not wait for it: the plain
       // rejection is the reply, announced by an `Advising`, and the advice follows as an `Advised`.
@@ -373,32 +402,51 @@ object Tests extends Suite(m"Flame Tests"):
           repl.react(0, t"import soundness.*")
 
           val reply =
-            repl.react(1, t"summon[rudiments.DecimalConverter]", onAdvice = { reply => lock { pushed = reply :: pushed } })
+            repl.react
+              ( 1,
+                t"summon[rudiments.DecimalConverter]",
+                onAdvice = { reply => lock { pushed = reply :: pushed } } )
 
           var waited: Int = 0
 
-          while !lock(pushed.exists { case _: Repl.Reply.Advised => true; case _ => false }) && waited < 120000 do
+          def advised: Boolean =
+            lock(pushed.exists { case _: Repl.Reply.Advised => true; case _ => false })
+
+          while !advised && waited < 120000 do
             snooze(50*Milli(Second))
             waited += 50
 
           (diagnostics(reply), lock(pushed.reverse))
+
       . assert:
           case (plain, Repl.Reply.Advising(1) :: Repl.Reply.Advised(1, advice, _, _) :: Nil) =>
-            plain.contains(t"No given instance of type") && !plain.contains(t"resolving")
-            && SemanticRender.stripAnsi(advice).contains(t"resolving")
+            plain.contains(t"No given instance of type") && !plain.contains(t"resolving") &&
+              SemanticRender.stripAnsi(advice).contains(t"resolving")
 
           case _ =>
             false
 
-      test(m"a wildcard import of soundness is re-injected without the advice, and restored for it"):
-        List(t"import soundness.*", t"import soundness.{given, *}", t"import soundness.Json", t"import other.*")
-        . map { statement => (Repl.unadvised(statement), Repl.advised(Repl.unadvised(statement))) }
-      . assert:
-          _ == List
-                ( (t"import soundness.{explainMissingContext as _, *}", t"import soundness.{*}"),
-                  (t"import soundness.{explainMissingContext as _, given, *}", t"import soundness.{given, *}"),
-                  (t"import soundness.Json", t"import soundness.Json"),
-                  (t"import other.*", t"import other.*") )
+      val reinjections: List[(Text, Text)] =
+        List
+          ( (t"import soundness.{explainMissingContext as _, *}", t"import soundness.{*}"),
+            ( t"import soundness.{explainMissingContext as _, given, *}",
+              t"import soundness.{given, *}" ),
+            (t"import soundness.Json", t"import soundness.Json"),
+            (t"import other.*", t"import other.*") )
+
+      test
+        ( m"a wildcard import of soundness is re-injected without the advice, " +
+          m"and restored for it" ):
+
+        List
+          ( t"import soundness.*",
+            t"import soundness.{given, *}",
+            t"import soundness.Json",
+            t"import other.*" )
+
+        . map: statement => (Repl.unadvised(statement), Repl.advised(Repl.unadvised(statement)))
+
+      . assert(_ == reinjections)
 
       // The catch-all must not intrude on ordinary code: implicit searches the compiler retries
       // after inference (`join`'s element type, `flatMap`'s reshaping) must still resolve.
@@ -413,29 +461,35 @@ object Tests extends Suite(m"Flame Tests"):
             repl.react(0, t"/set experimental")
             repl.react(1, t"import soundness.*")
             repl.interpret(t"List(t\"a\", t\"b\").map(_.upper).join")
+
         . assert:
             case Repl.Outcome.Ran(_, value, _, _, _) => value.let(_.contains(t"AB")).or(false)
             case _                                   => false
 
+      // Through the umbrella, `List` is Soundness's own (since 0.74.0), which renders as `[…]`.
       test(m"flatMap still resolves with the advice in scope"):
         isolated:
           val repl = Opened(Repl())
           repl.react(0, t"/set experimental")
           repl.react(1, t"import soundness.*")
           repl.interpret(t"List(1, 2).flatMap { n => List(n, n) }")
-      . assert:
-          // Through the umbrella, `List` is Soundness's own (since 0.74.0), which renders as `[…]`.
-          case Repl.Outcome.Ran(_, value, _, _, _) => value.let(_.contains(t"[1, 1, 2, 2]")).or(false)
-          case _                                   => false
 
-      // The wrapper objects (`rs$line$N`, in the empty package) are session bookkeeping: no rendering
-      // the user sees may name them — not the result line's type, a `def`'s signature, a diagnostic,
-      // nor a completion signature.
+      . assert:
+          case Repl.Outcome.Ran(_, value, _, _, _) =>
+            value.let(_.contains(t"[1, 1, 2, 2]")).or(false)
+
+          case _ =>
+            false
+
+      // The wrapper objects (`rs$line$N`, in the empty package) are session bookkeeping: no
+      // rendering the user sees may name them — not the result line's type, a `def`'s signature, a
+      // diagnostic, nor a completion signature.
       test(m"a session-defined type renders as the user wrote it, without the wrapper object"):
         isolated:
           val repl = Opened(Repl())
           repl.interpret(t"object Foo { object Bar }")
           repl.interpret(t"Foo.Bar")
+
       . assert:
           case Repl.Outcome.Ran(_, _, _, _, tpe) => tpe.let(_.text) == t"Foo.Bar.type"
           case _                                 => false
@@ -445,6 +499,7 @@ object Tests extends Suite(m"Flame Tests"):
           val repl = Opened(Repl())
           repl.interpret(t"object Foo { object Bar }")
           repl.interpret(t"Foo.Bar")
+
       . assert:
           case Repl.Outcome.Ran(_, _, _, name, _) => name == t"bar"
           case _                                  => false
@@ -454,18 +509,20 @@ object Tests extends Suite(m"Flame Tests"):
       test(m"a refined type binds a name from the type it refines"):
         isolated:
           Opened(Repl()).interpret(t"\"\".asInstanceOf[String { type Foo = Any }]")
+
       . assert:
           case Repl.Outcome.Ran(_, _, _, name, _) => name == t"string"
           case _                                  => false
 
-      // An infix type ALIAS does not name a type — Soundness's `X is Y` expands to
-      // `Y { type Self = X }`, so the binding is named after the trait on the right, not after `is`.
+      // An infix type ALIAS does not name a type — Soundness's `X is Y` expands to `Y { type Self =
+      // X }`, so the binding is named after the trait on the right, not after `is`.
       test(m"an infix `is` type binds a name from the trait, not from the alias"):
         isolated:
           val repl = Opened(Repl())
           repl.interpret(t"infix type is[S, T] = T { type Self = S }")
           repl.interpret(t"trait Barable { type Self }")
           repl.interpret(t"null.asInstanceOf[Int is Barable]")
+
       . assert:
           case Repl.Outcome.Ran(_, _, _, name, _) => name == t"barable"
           case _                                  => false
@@ -478,6 +535,7 @@ object Tests extends Suite(m"Flame Tests"):
           repl.interpret(t"infix type by[T, R] = T { type Operand = R }")
           repl.interpret(t"trait Barable { type Self; type Operand }")
           repl.interpret(t"null.asInstanceOf[Int is Barable by String]")
+
       . assert:
           case Repl.Outcome.Ran(_, _, _, name, _) => name == t"barable"
           case _                                  => false
@@ -487,6 +545,7 @@ object Tests extends Suite(m"Flame Tests"):
       test(m"an integer literal reports its singleton type"):
         isolated:
           Opened(Repl()).interpret(t"42")
+
       . assert:
           case Repl.Outcome.Ran(_, _, _, _, tpe) => tpe.let(_.text) == t"42"
           case _                                 => false
@@ -494,6 +553,7 @@ object Tests extends Suite(m"Flame Tests"):
       test(m"a string literal reports its singleton type"):
         isolated:
           Opened(Repl()).interpret(t"\"hello\"")
+
       . assert:
           case Repl.Outcome.Ran(_, _, _, _, tpe) => tpe.let(_.text) == t"\"hello\""
           case _                                 => false
@@ -503,6 +563,7 @@ object Tests extends Suite(m"Flame Tests"):
       test(m"a singleton type carries the base type it widens to"):
         isolated:
           Opened(Repl()).interpret(t"42")
+
       . assert:
           case Repl.Outcome.Ran(_, _, _, _, tpe) => tpe.let(_.base) == t"Int"
           case _                                 => false
@@ -510,6 +571,7 @@ object Tests extends Suite(m"Flame Tests"):
       test(m"a non-singleton type carries no base type"):
         isolated:
           Opened(Repl()).interpret(t"List(1, 2)")
+
       . assert:
           case Repl.Outcome.Ran(_, _, _, _, tpe) => tpe.let(_.base).absent
           case _                                 => false
@@ -519,6 +581,7 @@ object Tests extends Suite(m"Flame Tests"):
       test(m"a singleton-typed result is still named from its widened base type"):
         isolated:
           Opened(Repl()).interpret(t"42")
+
       . assert:
           case Repl.Outcome.Ran(_, _, _, name, _) => name == t"int"
           case _                                  => false
@@ -528,6 +591,7 @@ object Tests extends Suite(m"Flame Tests"):
       test(m"a plain `val` of a constant still reports the widened type"):
         isolated:
           Opened(Repl()).interpret(t"val n = 40 + 2")
+
       . assert:
           case Repl.Outcome.Ran(_, _, _, _, tpe) => tpe.let(_.text) == t"Int"
           case _                                 => false
@@ -535,6 +599,7 @@ object Tests extends Suite(m"Flame Tests"):
       test(m"a `val` annotated with a singleton type reports that type"):
         isolated:
           Opened(Repl()).interpret(t"val n: 42 = 42")
+
       . assert:
           case Repl.Outcome.Ran(_, _, _, _, tpe) => tpe.let(_.text) == t"42"
           case _                                 => false
@@ -544,9 +609,11 @@ object Tests extends Suite(m"Flame Tests"):
           val repl = Opened(Repl())
           repl.interpret(t"object Foo { class Baz }")
           repl.interpret(t"def make = new Foo.Baz")
+
       . assert:
           case Repl.Outcome.Ran(_, _, output, _, _) =>
             output.contains(t"def make: Foo.Baz") && !output.contains(t"rs$$line$$")
+
           case _ => false
 
       test(m"a diagnostic naming a session-defined type shows no wrapper object"):
@@ -554,13 +621,15 @@ object Tests extends Suite(m"Flame Tests"):
           val repl = Opened(Repl())
           repl.react(0, t"object Foo { object Bar }")
           diagnostics(repl.react(1, t"val n: Int = Foo.Bar"))
-      . assert { diag => diag.contains(t"Foo.Bar.type") && !diag.contains(t"rs$$line$$") }
+
+      . assert: diag => diag.contains(t"Foo.Bar.type") && !diag.contains(t"rs$$line$$")
 
       test(m"a completion signature shows no wrapper object"):
         isolated:
           val repl = Opened(Repl())
           repl.interpret(t"object Foo { object Bar { def hi = 42 }; def make = Bar }")
           repl.completionsAt(t"Foo.mak", 7)
+
       . assert: items =>
           items.exists(_.name == t"make") && items.all(!_.signature.contains(t"rs$$line$$"))
 
@@ -575,9 +644,11 @@ object Tests extends Suite(m"Flame Tests"):
           val first = async(repl.completionsAt(t"Foo.m", 5))
           val second = repl.completionsAt(t"Foo.me", 6)
           (first.await(), second)
+
       . assert: (first, second) =>
-          (first.nil || first.exists(_.name == t"make")) && (second.nil || second.exists(_.name == t"mend"))
-            && !(first.nil && second.nil)
+          (first.nil || first.exists(_.name == t"make")) &&
+            (second.nil || second.exists(_.name == t"mend")) &&
+            !(first.nil && second.nil)
 
       test(m"a submission is not delayed by a stream of completions"):
         isolated:
@@ -589,38 +660,43 @@ object Tests extends Suite(m"Flame Tests"):
           val reply = repl.react(0, t"Foo.make + 1")
           probe1.await(); probe2.await(); probe3.await()
           reply
+
       . assert:
           case Repl.Reply.Ran(_, value, _, _, _, _, _, _, _) => value.or(t"").contains(t"2")
-          case _ => false
+          case _                                             => false
 
       test(m"/classload reports a nonexistent path"):
         isolated:
           Opened(Repl()).interpret(t"/classload /no/such/directory/lib.jar")
+
       . assert:
           case Repl.Outcome.Ran(_, _, output, _, _) => output.contains(t"No such file or directory")
-          case _                              => false
+          case _                                    => false
 
       test(m"/classload adds an entry that /classpath then shows"):
         isolated:
           val repl = Opened(Repl())
           repl.interpret(t"/classload /usr")
           repl.interpret(t"/classpath")
+
       . assert:
           case Repl.Outcome.Ran(_, _, output, _, _) => output.contains(t"/usr")
-          case _                              => false
+          case _                                    => false
 
+      // Whole-line `/classload <path>` candidates, at least one of them a directory (e.g. /usr/ or
+      // /bin/).
       test(m"/classload tab-completion lists filesystem entries as whole-line candidates"):
         isolated:
           val partial: Text = t"/classload /"
           Opened(Repl()).completionsAt(partial, partial.length)
+
       . assert: items =>
-          !items.nil
-          && items.all(_.name.starts(t"/classload /"))  // whole-line `/classload <path>` candidates
-          && items.exists(_.name.ends(t"/"))            // at least one directory (e.g. /usr/, /bin/)
+          !items.nil && items.all(_.name.starts(t"/classload /")) && items.exists(_.name.ends(t"/"))
 
       test(m"a keyword tab-completion ends with a space"):
         isolated:
           Opened(Repl()).completionsAt(t"va", 2)
+
       . assert: items =>
           val keywords = items.filter(_.kind == t"keyword")
           keywords.exists(_.name == t"val ") && keywords.all(_.name.ends(t" "))
@@ -630,9 +706,10 @@ object Tests extends Suite(m"Flame Tests"):
           val repl = Opened(Repl())
           repl.interpret(t"given Int = 42")
           repl.interpret(t"summon[Int]")
+
       . assert:
           case Repl.Outcome.Ran(_, value, _, _, _) => value == t"42"
-          case _                             => false
+          case _                                   => false
 
       test(m"a persisted given resolves a later `using` parameter"):
         isolated:
@@ -640,16 +717,19 @@ object Tests extends Suite(m"Flame Tests"):
           repl.interpret(t"given Int = 7")
           repl.interpret(t"def double(using n: Int) = n*2")
           repl.interpret(t"double")
+
       . assert:
           case Repl.Outcome.Ran(_, value, _, _, _) => value == t"14"
-          case _                             => false
+          case _                                   => false
 
       test(m"a `val` definition shows its name, value and type"):
         isolated:
           Opened(Repl()).interpret(t"val x = 40 + 2")
+
       . assert:
           case Repl.Outcome.Ran(_, value, _, name, tpe) =>
             value == t"42" && name == t"x" && tpe.let(_.text) == t"Int"
+
           case _ => false
 
       // `List(1, 2, 3)` in a REPL line is the STDLIB list (the REPL compiles user code with the
@@ -659,8 +739,9 @@ object Tests extends Suite(m"Flame Tests"):
       test(m"a `var` definition shows its name, value and type"):
         isolated:
           Opened(Repl()).interpret(t"var y = List(1, 2, 3)")
+
       . assert:
-          case Repl.Outcome.Ran(_, value, _, name, _) => value == t"List(1, 2, 3)" && name == t"y"
+          case Repl.Outcome.Ran(_, value, _, name, _)  => value == t"List(1, 2, 3)" && name == t"y"
           case _                                       => false
 
       test(m"a `val` definition still persists for later lines"):
@@ -668,8 +749,9 @@ object Tests extends Suite(m"Flame Tests"):
           val repl = Opened(Repl())
           repl.interpret(t"val x = 40 + 2")
           repl.interpret(t"x + 1")
+
       . assert:
-          case Repl.Outcome.Ran(_, value, _, _, _) => value == t"43"
+          case Repl.Outcome.Ran(_, value, _, _, _)  => value == t"43"
           case _                                    => false
 
       test(m"a `lazy val` shows its type without being forced"):
@@ -678,22 +760,28 @@ object Tests extends Suite(m"Flame Tests"):
           repl.interpret(t"var forced = false")
           repl.interpret(t"lazy val z = { forced = true; 99 }")
           repl.interpret(t"forced")
+
       . assert:
-          case Repl.Outcome.Ran(_, value, _, _, _) => value == t"false"
+          case Repl.Outcome.Ran(_, value, _, _, _)  => value == t"false"
           case _                                    => false
 
       test(m"a `def` shows its signature with the written return type, uninvoked"):
         isolated:
           Opened(Repl()).interpret(t"def f(a: Int, b: String): String = b*a")
+
       . assert:
-          case Repl.Outcome.Ran(_, _, output, _, _) => output.trim == t"def f(a: Int, b: String): String"
-          case _                                     => false
+          case Repl.Outcome.Ran(_, _, output, _, _) =>
+            output.trim == t"def f(a: Int, b: String): String"
+
+          case _ =>
+            false
 
       test(m"a `def` with an omitted return type shows the inferred one"):
         isolated:
           Opened(Repl()).interpret(t"def g(n: Int) = n + 1")
+
       . assert:
-          case Repl.Outcome.Ran(_, _, output, _, _) => output.trim == t"def g(n: Int): Int"
+          case Repl.Outcome.Ran(_, _, output, _, _)  => output.trim == t"def g(n: Int): Int"
           case _                                     => false
 
       test(m"/set experimental enables experimental definitions"):
@@ -703,26 +791,30 @@ object Tests extends Suite(m"Flame Tests"):
           val before = repl.interpret(t"ex")
           repl.interpret(t"/set experimental")
           (before, repl.interpret(t"ex"))
+
       . assert:
           case (Repl.Outcome.Rejected(_), Repl.Outcome.Ran(_, _, _, _, _)) => true
-          case _                                                     => false
+          case _                                                           => false
 
       test(m"completions are offered for a member prefix"):
         isolated:
           val code = t"List(1, 2, 3).ma"
           Opened(Repl()).completionsAt(code, code.length).map(_.name)
+
       . assert(_.has(t"map"))
 
       test(m"completions are offered inside a definition's right-hand side"):
         isolated:
           val code = t"def foo() = System.o"
           Opened(Repl()).completionsAt(code, code.length).map(_.name)
+
       . assert(_.has(t"out"))
 
       test(m"completions are offered inside a val's right-hand side"):
         isolated:
           val code = t"val xs = List(1, 2, 3).ma"
           Opened(Repl()).completionsAt(code, code.length).map(_.name)
+
       . assert(_.has(t"map"))
 
       test(m"completions see the session's imports for a first-token prefix"):
@@ -730,33 +822,38 @@ object Tests extends Suite(m"Flame Tests"):
           val repl = Opened(Repl())
           repl.interpret(t"import scala.collection.mutable.ListBuffer")
           repl.completionsAt(t"ListB", 5).map(_.name)
+
       . assert(_.has(t"ListBuffer"))
 
       test(m"completions work in import position"):
         isolated:
           val code = t"import sca"
           Opened(Repl()).completionsAt(code, code.length).map(_.name)
+
       . assert(_.has(t"scala"))
 
       test(m"slash-command lines complete against the engine's commands"):
         isolated:
           val code = t"/set ex"
           Opened(Repl()).completionsAt(code, code.length).map(_.name)
+
       . assert(_.has(t"/set experimental"))
 
       test(m"/s offers /set once, not one entry per setting"):
         isolated:
           val code = t"/s"
           Opened(Repl()).completionsAt(code, code.length).map(_.name)
-      . assert { names => names.has(t"/set ") && !names.has(t"/set async") }
+
+      . assert: names => names.has(t"/set ") && !names.has(t"/set async")
 
       test(m"/set followed by a space offers its subcommands as settings"):
         isolated:
           val code = t"/set "
           Opened(Repl()).completionsAt(code, code.length)
+
       . assert: items =>
-          items.map(_.name).has(t"/set async") && items.map(_.name).has(t"/set experimental")
-          && items.all(_.kind == t"setting")
+          items.map(_.name).has(t"/set async") && items.map(_.name).has(t"/set experimental") &&
+            items.all(_.kind == t"setting")
 
       test(m"a new definition invalidates the cached member completions"):
         isolated:
@@ -764,84 +861,105 @@ object Tests extends Suite(m"Flame Tests"):
           repl.completionsAt(t"z9.le", 5)        // z9 undefined: caches an empty member list
           repl.interpret(t"val z9 = \"hi\"")      // defining z9 must drop the stale cache
           repl.completionsAt(t"z9.le", 5).map(_.name)
+
       . assert(_.has(t"length"))
 
       // Keyword completion is position-classified by prophesy's corpus-derived pattern tree
       // (`Repl.keywordCompletions` via `Lexis.context`/`ScalaKeywords.pattern` — no compiler).
       test(m"`val`/`var` are keyword completions at a statement start"):
         Repl.keywordCompletions(t"va", 2)._1.map(_.name)
+
       . assert(_ == List(t"val", t"var"))
 
       test(m"`import` is a keyword completion at the start of a line"):
         Repl.keywordCompletions(t"imp", 3)._1.map(_.name)
+
       . assert(_.has(t"import"))
 
       test(m"`match` is offered after a member-selection dot (`expr.match` is valid Scala 3)"):
         Repl.keywordCompletions(t"List(1).ma", 10)._1.map(_.name)
+
       . assert(_ == List(t"match"))
 
       test(m"`match` is offered directly after a value (`List(1)match` tokenizes as a keyword)"):
         Repl.keywordCompletions(t"List(1)ma", 9)._1.map(_.name)
+
       . assert(_ == List(t"match"))
 
       test(m"a value followed by a space is an infix receiver"):
         harlequin.Fragment.infixBase(t"List(1) ma", 10)._1
+
       . assert(_ == t"List(1).")
 
       test(m"a value with no trailing space is not an infix receiver"):
         harlequin.Fragment.infixBase(t"List(1)ma", 9)._1
+
       . assert(_ == Unset)
 
       test(m"a name after `val` is not an infix receiver"):
         harlequin.Fragment.infixBase(t"val x ", 6)._1
+
       . assert(_ == Unset)
 
       test(m"a soft modifier offers a follow-set, not the whole definition list"):
         Repl.keywordCompletions(t"transparent ", 12)._1.map(_.name)
-      . assert { names => names.has(t"inline") && names.has(t"trait") && !names.has(t"import") }
+
+      . assert: names => names.has(t"inline") && names.has(t"trait") && !names.has(t"import")
 
       test(m"`inline` offers def/given/val (and inline-if/match)"):
         Repl.keywordCompletions(t"inline ", 7)._1.map(_.name)
-      . assert { names => List(t"def", t"given", t"val", t"if", t"match").all { (word: Text) => names.has(word) } }
+
+      . assert: names =>
+          List(t"def", t"given", t"val", t"if", t"match").all: (word: Text) => names.has(word)
 
       test(m"`with` is not offered after a type ascription `:`"):
         Repl.keywordCompletions(t"val x: w", 8)._1
+
       . assert(_ == Nil)
 
       test(m"`with` is offered in a template header after the parent type"):
         Repl.keywordCompletions(t"class A extends B w", 19)._1.map(_.name)
+
       . assert(_ == List(t"with"))
 
       test(m"definition keywords are not offered in expression position"):
         Repl.keywordCompletions(t"1 + va", 6)._1
+
       . assert(_ == Nil)
 
       test(m"`new` is offered at a statement start"):
         Repl.keywordCompletions(t"n", 1)._1.map(_.name)
+
       . assert(_.has(t"new"))
 
       test(m"`using` is offered inside a parameter list"):
         Repl.keywordCompletions(t"def f(u", 7)._1.map(_.name)
+
       . assert(_ == List(t"using"))
 
       test(m"a parameter list expects a fresh name, suppressing member completions"):
         Repl.keywordCompletions(t"def f(u", 7)._2
+
       . assert(_ == true)
 
       test(m"a binding position (`val x`) expects a fresh name"):
         Repl.keywordCompletions(t"val x", 5)._2
+
       . assert(_ == true)
 
       test(m"a method-call argument is not a parameter position"):
         Repl.keywordCompletions(t"foo(v", 5)._1
+
       . assert(_ == Nil)
 
       test(m"the Scala 2 `implicit` keyword is not offered"):
         Repl.keywordCompletions(t"impl", 4)._1
+
       . assert(_ == Nil)
 
       test(m"`do` is offered after a `while` condition (Scala 3 while-do)"):
         Repl.keywordCompletions(t"while true d", 12)._1.map(_.name)
+
       . assert(_ == List(t"do"))
 
       // `incomplete` decides whether Enter continues onto a new line or submits. The
@@ -849,52 +967,62 @@ object Tests extends Suite(m"Flame Tests"):
       // input may go either way (Shift+Enter always submits).
       test(m"a trailing operator is an incomplete continuation"):
         Repl.incomplete(t"1 +")
+
       . assert(_ == true)
 
       test(m"an unclosed brace is an incomplete continuation"):
         Repl.incomplete(t"List(1).map { x =>")
+
       . assert(_ == true)
 
       test(m"a binding with no right-hand side is an incomplete continuation"):
         Repl.incomplete(t"val x =")
+
       . assert(_ == true)
 
       test(m"a complete expression is ready to submit"):
         Repl.incomplete(t"List(1).map(_ + 1)")
+
       . assert(_ == false)
 
       test(m"a complete definition is ready to submit"):
         Repl.incomplete(t"val x = 40")
+
       . assert(_ == false)
 
       test(m"blank input is not a continuation"):
         Repl.incomplete(t"   ")
+
       . assert(_ == false)
 
       test(m"an expression result carries its value and type"):
         isolated:
           Opened(Repl()).react(0, t"1 + 1")
+
       . assert:
           case Repl.Reply.Ran(_, value, _, tpe, _, _, _, _, _) => value == t"2" && tpe.present
-          case _                                       => false
+          case _                                               => false
 
       test(m"a Unit result shows neither a value nor a type"):
         isolated:
           Opened(Repl()).react(0, t"println(\"hi\")")
+
       . assert:
           case Repl.Reply.Ran(_, value, _, tpe, _, _, _, _, _) => value.absent && tpe.absent
-          case _                                       => false
+          case _                                               => false
 
       test(m"an import produces no result value"):
         isolated:
           Opened(Repl()).react(0, t"import scala.collection.mutable.*")
+
       . assert:
           case Repl.Reply.Ran(_, value, _, tpe, _, _, _, _, _) => value.absent && tpe.absent
-          case _                                       => false
+          case _                                               => false
 
       test(m"a type error is reported as Rejected with notices"):
         isolated:
           Opened(Repl()).interpret(t"val n: Int = \"forty\"")
+
       . assert:
           case Repl.Outcome.Rejected(notices) => !notices.nil
           case _                              => false
@@ -902,6 +1030,7 @@ object Tests extends Suite(m"Flame Tests"):
       test(m"a runtime exception is reported as Threw"):
         isolated:
           Opened(Repl()).interpret(t"throw new RuntimeException(\"boom\")")
+
       . assert:
           case Repl.Outcome.Threw(_, _, _) => true
           case _                           => false
@@ -909,10 +1038,12 @@ object Tests extends Suite(m"Flame Tests"):
       test(m"a thrown exception's reply renders its stack trace"):
         isolated:
           Opened(Repl()).react(0, t"throw new RuntimeException(\"boom\")")
+
       . assert:
           case Repl.Reply.Threw(_, _, diagnostics, _, _, _) =>
-            diagnostics.contains(t"RuntimeException") && diagnostics.contains(t"boom")
-            && diagnostics.contains(t".scala")
+            diagnostics.contains(t"RuntimeException") && diagnostics.contains(t"boom") &&
+              diagnostics.contains(t".scala")
+
           case _ => false
 
     suite(m"REPL binding tests"):
@@ -927,24 +1058,28 @@ object Tests extends Suite(m"Flame Tests"):
             val text  = greeting
             val count = counter
             def total: Int = text.length + count
+
           Opened(repl)
 
           repl.interpret(t"println(total)")     // "hello".length + 5
+
       . assert:
           case Repl.Outcome.Ran(_, _, _, _, _) => true
-          case _                         => false
+          case _                               => false
 
       test(m"a lifted import is in scope for REPL lines"):
         isolated:
           // the lifted import is consumed by the macro, so it reads as unused here
           @scala.annotation.nowarn val repl = Repl[3.9]:
             import scala.collection.mutable.ListBuffer
+
           Opened(repl)
 
           repl.interpret(t"println(ListBuffer(1, 2, 3).sum)")
+
       . assert:
           case Repl.Outcome.Ran(_, _, _, _, _) => true
-          case _                         => false
+          case _                               => false
 
       test(m"a captured value persists across several lines"):
         isolated:
@@ -952,13 +1087,15 @@ object Tests extends Suite(m"Flame Tests"):
 
           val repl = Repl[3.9]:
             val seed = secret
+
           Opened(repl)
 
           repl.interpret(t"val doubled = seed*2")
           repl.interpret(t"println(doubled + seed)")
+
       . assert:
           case Repl.Outcome.Ran(_, _, _, _, _) => true
-          case _                         => false
+          case _                               => false
 
     suite(m"REPL result rendering"):
       given Scalac[3.9, Universe.Classfile] = Scalac(Nil)
@@ -966,25 +1103,29 @@ object Tests extends Suite(m"Flame Tests"):
       test(m"an expression's value is rendered via Inspectable"):
         isolated:
           Opened(Repl()).interpret(t"21 * 2")
+
       . assert:
           case Repl.Outcome.Ran(_, value, _, _, _) => value.let(_ == t"42").or(false)
-          case _                             => false
+          case _                                   => false
 
       test(m"a type/class definition renders no value"):
         isolated:
           Opened(Repl()).interpret(t"class C(n: Int)")
+
       . assert:
           case Repl.Outcome.Ran(_, value, _, _, _) => value.absent
-          case _                             => false
+          case _                                   => false
 
       test(m"a result is bound to a type-derived name, usable on a later line"):
         isolated:
           val repl = Opened(Repl())
           val first = repl.interpret(t"List(1, 2, 3)")
           (first, repl.interpret(t"list.size"))
+
       . assert:
           case (Repl.Outcome.Ran(_, _, _, name, _), Repl.Outcome.Ran(_, value, _, _, _)) =>
             name == t"list" && value.let(_ == t"3").or(false)
+
           case _ => false
 
       test(m"a repeated result type gets a numbered name to avoid a collision"):
@@ -992,6 +1133,7 @@ object Tests extends Suite(m"Flame Tests"):
           val repl = Opened(Repl())
           repl.interpret(t"List(1)")
           repl.interpret(t"List(2)")
+
       . assert:
           case Repl.Outcome.Ran(_, _, _, name, _) => name == t"list2"
           case _                                  => false
@@ -999,12 +1141,14 @@ object Tests extends Suite(m"Flame Tests"):
       test(m"stdout printed while a line runs is captured"):
         isolated:
           Opened(Repl()).interpret(t"println(7)")
+
       . assert:
           case Repl.Outcome.Ran(_, _, output, _, _) => output.contains(t"7")
-          case _                              => false
+          case _                                    => false
 
       test(m"multi-line code keeps its newlines when tokenized"):
         Repl.tokenize(t"val x = 1\nval y = 2").map(_.text).join
+
       . assert(_.contains(t"\n"))
 
     // `classify` decides whether a line is handed to the compiler or (in a front-end) to an
@@ -1014,7 +1158,7 @@ object Tests extends Suite(m"Flame Tests"):
     // classification uses only the parser.
     suite(m"code/language classification"):
       def misclassified(expected: Repl.Verdict, samples: List[Text]): List[Text] =
-        samples.filter { code => Repl.classify(code) != expected }
+        samples.filter: code => Repl.classify(code) != expected
 
       test(m"well-formed Scala classifies as code"):
         misclassified(Repl.Verdict.Code, List
@@ -1040,6 +1184,7 @@ object Tests extends Suite(m"Flame Tests"):
             t"while x < 10 do x += 1",
             t"count += 1",
             t"x match { case Some(y) => y; case None => 0 }" ))
+
       . assert(_ == List())
 
       test(m"Soundness infix idioms classify as code"):
@@ -1051,6 +1196,7 @@ object Tests extends Suite(m"Flame Tests"):
             t"value or default",
             t"input as Text",
             t"x max y min z" ))
+
       . assert(_ == List())
 
       test(m"typo'd or malformed Scala still classifies as code"):
@@ -1063,6 +1209,7 @@ object Tests extends Suite(m"Flame Tests"):
             t"val n: Int = \"forty\"",
             t"impotr scala.collection",
             t"List(1, 2, 3) foldLeft 0 (_ + _)" ))
+
       . assert(_ == List())
 
       test(m"natural-language input classifies as language"):
@@ -1087,6 +1234,7 @@ object Tests extends Suite(m"Flame Tests"):
             t"why is x not defined",
             t"what does the compiler mean by this",
             t"how much memory does this session use" ))
+
       . assert(_ == List())
 
       test(m"short or ambiguous input defaults to code"):
@@ -1101,46 +1249,57 @@ object Tests extends Suite(m"Flame Tests"):
             t"why?",
             t"1 + 1",
             t"val x =" ))
+
       . assert(_ == List())
 
       test(m"a leading space forces a prose-shaped line to classify as code"):
         Repl.classify(t" what is the type of x")
+
       . assert(_ == Repl.Verdict.Code)
 
       test(m"a slash-command line classifies as code"):
         Repl.classify(t"/set experimental")
+
       . assert(_ == Repl.Verdict.Code)
 
-    // The client derives one `--flag` per setting from `Repl.settings`, so the two cannot drift; the
-    // flags the user asked for by name are the ones this list must keep providing.
+    // The client derives one `--flag` per setting from `Repl.settings`, so the two cannot drift;
+    // the flags the user asked for by name are the ones this list must keep providing.
     suite(m"settings flags"):
-      // Asserted as a SUPERSET, so that adding a setting is not a test failure — only LOSING one is.
-      // (Written the other way round, this failed the moment `jsr45` was added, which is exactly the
-      // change it should have been indifferent to.)
+      // Asserted as a SUPERSET, so that adding a setting is not a test failure — only LOSING one
+      // is. (Written the other way round, this failed the moment `jsr45` was added, which is
+      // exactly the change it should have been indifferent to.)
       test(m"the documented settings are all addressable by name"):
         Repl.settings.map(_.name).to[Set]
+
       . assert: (names: Set[Text]) =>
-          List(t"experimental", t"explain", t"explicit-nulls", t"deprecation", t"feature",
+          List
+            ( t"experimental", t"explain", t"explicit-nulls", t"deprecation", t"feature",
               t"new-syntax", t"postfixOps", t"implicitConversions", t"reflectiveCalls", t"dynamics",
               t"existentials", t"strictEquality", t"adhocExtensions", t"unsafeNulls",
-              t"captureChecking", t"saferExceptions", t"pureFunctions", t"namedTuples", t"modularity",
-              t"betterFors", t"erasedDefinitions", t"genericNumberLiterals")
-          . all { (name: Text) => names.has(name) }
+              t"captureChecking", t"saferExceptions", t"pureFunctions", t"namedTuples",
+              t"modularity", t"betterFors", t"erasedDefinitions", t"genericNumberLiterals" )
 
-      test(m"`experimental` and `feature` are compiler settings, so `--experimental`/`--feature` map to /set"):
-        Repl.settings.filter { s => s.name == t"experimental" || s.name == t"feature" }
-         . map(_.kind)
+          . all: (name: Text) => names.has(name)
+
+      test
+        ( m"`experimental` and `feature` are compiler settings, so " +
+          m"`--experimental`/`--feature` map to /set" ):
+
+        Repl.settings.filter { s => s.name == t"experimental" || s.name == t"feature" }.map(_.kind)
+
       . assert(_ == List(Repl.Kind.Set, Repl.Kind.Set))
 
       test(m"a setting name is always a usable flag name"):
         Repl.settings.map(_.name).filter: name =>
-          name == t"" || name.s.exists { char => char.isWhitespace || char == '=' }
+          name == t"" || name.s.exists: char => char.isWhitespace || char == '='
+
       . assert(_ == List())
 
       // `-Xjsr45` is what lets `StackTraceRender`'s resolver expand a REPL line's inline chain, and
       // it is a compiler option, so it must be a `/set` (not a `/language`) setting.
       test(m"`jsr45` is a compiler setting"):
         Repl.settings.filter(_.name == t"jsr45").map(_.kind)
+
       . assert(_ == List(Repl.Kind.Set))
 
       // `version` and `force` are the standard flags `Flame.standard` (pyrocosm-cli) reads ahead of
@@ -1149,6 +1308,7 @@ object Tests extends Suite(m"Flame Tests"):
         Repl.settings.map(_.name).filter: name =>
           Set(t"port", t"host", t"session", t"set", t"language", t"basic", t"version", t"force")
           . has(name)
+
       . assert(_ == List())
 
     suite(m"Exhibiting replies"):
@@ -1166,50 +1326,83 @@ object Tests extends Suite(m"Flame Tests"):
           case _                         => t""
 
         def block(node: Block): Text = node match
-          case Block.Paragraph(content)    => content.map(inline).join
-          case Block.Group(content)        => texts(content)
-          case Block.Notice(_, _, content) => texts(content)
+          case Block.Paragraph(content)                         => content.map(inline).join
+          case Block.Group(content)                             => texts(content)
+          case Block.Notice(_, _, content)                      => texts(content)
           case Block.Diagnostic(_, _, message, excerpt, detail) => texts(message + excerpt + detail)
-          case Block.Output(text, _)       => text
-          case Block.Code(_, lines, _, _, _, _)  => lines.map(_.tokens.map(_.text).join).join(t"\n")
-          case Block.Table(_, rows, _)     => rows.map(_.cells.map(_.content.map(inline).join).join(t" ")).join(t"\n")
-          case Block.Trace(stacks)         => stacks.map { stack => t"${stack.className}: ${stack.message.map(inline).join}" }.join(t"\n")
-          case _                           => t""
+          case Block.Output(text, _)                            => text
+
+          case Block.Code(_, lines, _, _, _, _) =>
+            lines.map(_.tokens.map(_.text).join).join(t"\n")
+
+          case Block.Table(_, rows, _) =>
+            rows.map(_.cells.map(_.content.map(inline).join).join(t" ")).join(t"\n")
+
+          case Block.Trace(stacks) =>
+            def describe(stack: Block.Trace.Stack): Text =
+              t"${stack.className}: ${stack.message.map(inline).join}"
+
+            stacks.map(describe).join(t"\n")
+
+          case _ =>
+            t""
 
         blocks.map(block).join(t"\n")
+
+      // The blocks inside every group of an encoded run of blocks.
+      def grouped(blocks: Text): List[Block] =
+        Blocks.decode(blocks).sweep { case Block.Group(content) => content }
+        . bind: (content: List[Block]) => content
 
       def exhibiting(using Monitor, System, Probate): Repl[3.9] =
         Opened(Repl.make[3.9](Repl.Prelude.empty, Repl.Rendering.Exhibit(false)))
 
       test(m"a result is exhibited as blocks, with no text rendering"):
         isolated(exhibiting.react(0, t"val n = 1 + 1"))
+
       . assert:
           case Repl.Reply.Ran(_, value, _, _, _, diagnostics, _, _, blocks) =>
             val text = texts(Blocks.decode(blocks))
-            value.absent && diagnostics == t"" && text.contains(t"n") && text.contains(t"2") && text.contains(t"Int")
+            value.absent && diagnostics == t"" && text.contains(t"n") && text.contains(t"2") &&
+              text.contains(t"Int")
+
           case _ => false
 
       test(m"captured output becomes output blocks by stream"):
-        isolated(exhibiting.react(0, t"java.lang.System.out.println(\"hi\"); java.lang.System.err.println(\"oh\")"))
+        isolated:
+          exhibiting.react
+            ( 0, t"java.lang.System.out.println(\"hi\"); java.lang.System.err.println(\"oh\")" )
+
       . assert:
           case Repl.Reply.Ran(_, _, _, _, _, _, _, _, blocks) =>
-            Blocks.decode(blocks).sweep { case Block.Output(text, error) => (text.trim, error) } == List((t"hi", false), (t"oh", true))
+            Blocks.decode(blocks).sweep { case Block.Output(text, error) => (text.trim, error) } ==
+              List((t"hi", false), (t"oh", true))
+
           case _ => false
 
       test(m"a rejection's diagnostics are diagnostics of failure"):
         isolated(exhibiting.react(0, t"val n: Int = \"hello\""))
+
       . assert:
           case Repl.Reply.Rejected(_, diagnostics, tokens, blocks) =>
             val decoded = Blocks.decode(blocks)
-            diagnostics == t"" && decoded.exists { case Block.Diagnostic(Tone.Failure, _, _, _, _) => true; case _ => false }
-              && texts(decoded).contains(t"Int") && tokens.exists(_.mark.present)
+
+            def failure(block: Block): Boolean = block match
+              case Block.Diagnostic(Tone.Failure, _, _, _, _) => true
+              case _                                          => false
+
+            diagnostics == t"" && decoded.exists(failure) && texts(decoded).contains(t"Int") &&
+              tokens.exists(_.mark.present)
+
           case _ => false
 
       test(m"a thrown exception is exhibited as a stack trace"):
         isolated(exhibiting.react(0, t"throw new java.lang.RuntimeException(\"boom\")"))
+
       . assert:
           case Repl.Reply.Threw(_, _, diagnostics, _, _, blocks) =>
             diagnostics == t"" && texts(Blocks.decode(blocks)).contains(t"boom")
+
           case _ => false
 
       test(m"a diagnostic with a blank line inside survives the wire"):
@@ -1218,10 +1411,12 @@ object Tests extends Suite(m"Flame Tests"):
           repl.react(0, t"/set experimental")
           repl.react(0, t"import soundness.*")
           repl.react(0, t"sleep(3*Second) yet println(\"hello\")")
+
       . assert:
           case Repl.Reply.Rejected(_, _, _, blocks) =>
             val decoded = Blocks.decode(blocks)
             !decoded.nil && texts(decoded).contains(t"Monitor")
+
           case _ => false
 
       test(m"a raster image is exhibited as an image carried in a data: URI"):
@@ -1230,11 +1425,16 @@ object Tests extends Suite(m"Flame Tests"):
           repl.react(0, t"/set experimental")
           repl.react(0, t"import soundness.*")
           repl.react(0, t"Raster(2, 2) { (x, y) => Chroma(255, 0, 0) }")
+
       . assert:
           case Repl.Reply.Ran(_, _, _, _, _, _, _, _, blocks) =>
-            Blocks.decode(blocks).sweep { case Block.Group(content) => content }.bind { (content: List[Block]) => content }.exists:
-              case Block.Image(source, alt) => source.starts(t"data:image/png;base64,") && alt == t"2×2 PNG"
-              case _                        => false
+            grouped(blocks).exists:
+              case Block.Image(source, alt) =>
+                source.starts(t"data:image/png;base64,") && alt == t"2×2 PNG"
+
+              case _ =>
+                false
+
           case _ => false
 
       test(m"a raster image in a format is exhibited in that format"):
@@ -1243,11 +1443,16 @@ object Tests extends Suite(m"Flame Tests"):
           repl.react(0, t"/set experimental")
           repl.react(0, t"import soundness.*")
           repl.react(0, t"Raster(2, 2) { (x, y) => Chroma(255, 0, 0) }.to[Gif]")
+
       . assert:
           case Repl.Reply.Ran(_, _, _, _, _, _, _, _, blocks) =>
-            Blocks.decode(blocks).sweep { case Block.Group(content) => content }.bind { (content: List[Block]) => content }.exists:
-              case Block.Image(source, alt) => source.starts(t"data:image/gif;base64,") && alt == t"2×2 GIF"
-              case _                        => false
+            grouped(blocks).exists:
+              case Block.Image(source, alt) =>
+                source.starts(t"data:image/gif;base64,") && alt == t"2×2 GIF"
+
+              case _ =>
+                false
+
           case _ => false
 
       test(m"an SVG drawing is exhibited as a figure carrying its markup"):
@@ -1256,11 +1461,13 @@ object Tests extends Suite(m"Flame Tests"):
           repl.react(0, t"/set experimental")
           repl.react(0, t"import soundness.*")
           repl.react(0, t"Svg(10, 5)")
+
       . assert:
           case Repl.Reply.Ran(_, _, _, _, _, _, _, _, blocks) =>
-            Blocks.decode(blocks).sweep { case Block.Group(content) => content }.bind { (content: List[Block]) => content }.exists:
+            grouped(blocks).exists:
               case Block.Figure(figure) => figure.svg.starts(t"<svg")
               case _                    => false
+
           case _ => false
 
       test(m"a connection answers a submission and pushes an asynchronous one"):
@@ -1268,7 +1475,7 @@ object Tests extends Suite(m"Flame Tests"):
           val sessions = Sessions(Repl.Rendering.Exhibit(true))
           val lock = Mutex()
           var sent: List[Repl.Reply] = Nil
-          val connection = sessions.connection { reply => lock { sent = reply :: sent } }
+          val connection = sessions.connection: reply => lock { sent = reply :: sent }
           val first = connection.respond(Repl.Request.Submit(1, t"1 + 1"))
           connection.respond(Repl.Request.Submit(2, t"/set async"))
           val third = connection.respond(Repl.Request.Submit(3, t"6 * 7"))
@@ -1282,10 +1489,17 @@ object Tests extends Suite(m"Flame Tests"):
             waited += 50
 
           (first, third, lock(sent.reverse))
+
       . assert:
           case (Repl.Reply.Ran(1, _, _, _, _, _, _, _, _), Unset, replies) =>
-            replies.exists { case Repl.Reply.Pending(3) => true; case _ => false }
-              && replies.exists { case Repl.Reply.Ran(3, _, _, _, _, _, _, _, blocks) => texts(Blocks.decode(blocks)).contains(t"42"); case _ => false }
+            replies.exists { case Repl.Reply.Pending(3) => true; case _ => false } &&
+              replies.exists:
+                case Repl.Reply.Ran(3, _, _, _, _, _, _, _, blocks) =>
+                  texts(Blocks.decode(blocks)).contains(t"42")
+
+                case _ =>
+                  false
+
           case _ => false
 
     suite(m"REPL interface"):
@@ -1309,7 +1523,9 @@ object Tests extends Suite(m"Flame Tests"):
           next += 1
           recorded = request(next) :: recorded
 
-        def pushed(sink: Repl.Reply => Unit): Unit = this.sink = scala.caps.unsafe.unsafeAssumePure(sink)
+        def pushed(sink: Repl.Reply => Unit): Unit =
+          this.sink = scala.caps.unsafe.unsafeAssumePure(sink)
+
         def close(): Unit = closed = true
         def answer(id: Int, reply: Repl.Reply): Unit = callbacks.at(id).let(_(reply))
         def push(reply: Repl.Reply): Unit = sink(reply)
@@ -1320,8 +1536,11 @@ object Tests extends Suite(m"Flame Tests"):
       def blocksOf(text: Text): Text = Blocks.encode(List(Block.paragraph(text)))
 
       def pendingEntry(block: Block): Boolean = block match
-        case Block.Group(content) => content.last.lay(false) { case Block.Gauge(_, _) => true; case _ => false }
-        case _                    => false
+        case Block.Group(content) =>
+          content.last.lay(false) { case Block.Gauge(_, _) => true; case _ => false }
+
+        case _ =>
+          false
 
       def texts(blocks: List[Block]): Text =
         def inline(node: Inline): Text = node match
@@ -1334,17 +1553,26 @@ object Tests extends Suite(m"Flame Tests"):
           case _                         => t""
 
         def block(node: Block): Text = node match
-          case Block.Paragraph(content)    => content.map(inline).join
-          case Block.Group(content)        => texts(content)
-          case Block.Notice(_, _, content) => texts(content)
+          case Block.Paragraph(content)                         => content.map(inline).join
+          case Block.Group(content)                             => texts(content)
+          case Block.Notice(_, _, content)                      => texts(content)
           case Block.Diagnostic(_, _, message, excerpt, detail) => texts(message + excerpt + detail)
-          case Block.Output(text, _)       => text
-          case Block.Trace(stacks)         => stacks.map { stack => t"${stack.className}: ${stack.message.map(inline).join}" }.join(t"\n")
-          case _                           => t""
+          case Block.Output(text, _)                            => text
+
+          case Block.Trace(stacks) =>
+            def describe(stack: Block.Trace.Stack): Text =
+              t"${stack.className}: ${stack.message.map(inline).join}"
+
+            stacks.map(describe).join(t"\n")
+
+          case _ =>
+            t""
 
         blocks.map(block).join(t"\n")
 
-      def fresh(options: ReplInterface.Options = ReplInterface.Options())(using Monitor, Probate): (FakeEngine, ReplInterface) =
+      def fresh(options: ReplInterface.Options = ReplInterface.Options())(using Monitor, Probate)
+      :   (FakeEngine, ReplInterface) =
+
         val engine = FakeEngine()
         (engine, scala.caps.unsafe.unsafeAssumePure(ReplInterface(engine, options)))
 
@@ -1353,9 +1581,10 @@ object Tests extends Suite(m"Flame Tests"):
           val (engine, interface) = fresh()
           interface.handle(Event.Submitted(interface.field.input, t"1 + 1"))
           (engine.submissions, interface.transcript())
+
       . assert: (submissions, entries) =>
-          submissions.head.lay(false)(_.code == t"1 + 1") && submissions.size == 1
-          && entries.size == 1 && entries.head.lay(false)(pendingEntry)
+          submissions.head.lay(false)(_.code == t"1 + 1") && submissions.size == 1 &&
+            entries.size == 1 && entries.head.lay(false)(pendingEntry)
 
       test(m"the server's warm-up shows as a gauge above the prompt until it is over"):
         isolated:
@@ -1364,6 +1593,7 @@ object Tests extends Suite(m"Flame Tests"):
           val during = interface.status()
           engine.push(Repl.Reply.Warming(0, 100, 100))
           (during, interface.status(), interface.transcript())
+
       . assert:
           case (Block.Gauge(_, _) :: Nil, Nil, Nil) => true
           case _                                    => false
@@ -1377,45 +1607,63 @@ object Tests extends Suite(m"Flame Tests"):
           val during = interface.transcript()
           engine.push(Repl.Reply.Advised(1, t"", Nil, blocksOf(t"try this given")))
           (during, interface.transcript())
+
       . assert: (during, after) =>
-          during.head.lay(false)(pendingEntry) && texts(during).contains(t"no given")
-          && !after.head.lay(true)(pendingEntry) && texts(after).contains(t"try this given")
-          && !texts(after).contains(t"no given")
+          during.head.lay(false)(pendingEntry) && texts(during).contains(t"no given") &&
+            !after.head.lay(true)(pendingEntry) && texts(after).contains(t"try this given") &&
+            !texts(after).contains(t"no given")
 
       test(m"a trailing blank line is stripped from a submission"):
         isolated:
           val (engine, interface) = fresh()
           interface.handle(Event.Submitted(interface.field.input, t"val x = 1\n  x\n"))
           engine.submissions.map(_.code)
+
       . assert(_ == List(t"val x = 1\n  x"))
 
       test(m"an engine answering before the request returns still settles the entry"):
         isolated:
           val engine = FakeEngine()
-          val interface: ReplInterface = scala.caps.unsafe.unsafeAssumePure(ReplInterface(engine, ReplInterface.Options()))
+
+          val interface: ReplInterface =
+            scala.caps.unsafe.unsafeAssumePure(ReplInterface(engine, ReplInterface.Options()))
+
           val immediate: Engine = new Engine:
             def request(request: Int => Repl.Request)(reply: Repl.Reply => Unit): Unit =
               request(7) match
-                case Repl.Request.Submit(id, _) => reply(Repl.Reply.Ran(id, Unset, t"", Unset, Unset, t"", Nil, Nil, blocksOf(t"at once")))
-                case _                          => ()
+                case Repl.Request.Submit(id, _) =>
+                  val blocks = blocksOf(t"at once")
+                  reply(Repl.Reply.Ran(id, Unset, t"", Unset, Unset, t"", Nil, Nil, blocks))
+
+                case _ =>
+                  ()
+
             def send(request: Int => Repl.Request): Unit = ()
             def pushed(sink: Repl.Reply => Unit): Unit = ()
             def close(): Unit = ()
-          val prompt: ReplInterface = scala.caps.unsafe.unsafeAssumePure(ReplInterface(immediate, ReplInterface.Options()))
+
+          val prompt: ReplInterface =
+            scala.caps.unsafe.unsafeAssumePure(ReplInterface(immediate, ReplInterface.Options()))
+
           prompt.handle(Event.Submitted(prompt.field.input, t"1 + 1"))
           prompt.transcript()
+
       . assert: entries =>
-          entries.size == 1 && !entries.head.lay(false)(pendingEntry) && texts(entries).contains(t"at once")
+          entries.size == 1 && !entries.head.lay(false)(pendingEntry) &&
+            texts(entries).contains(t"at once")
 
       test(m"the reply settles the entry in place"):
         isolated:
           val (engine, interface) = fresh()
           interface.handle(Event.Submitted(interface.field.input, t"1 + 1"))
           val id = engine.submissions.head.let(_.id).or(0)
-          engine.answer(id, Repl.Reply.Ran(id, Unset, t"", Unset, Unset, t"", Nil, Nil, blocksOf(t"res0: Int = 2")))
+          val blocks = blocksOf(t"res0: Int = 2")
+          engine.answer(id, Repl.Reply.Ran(id, Unset, t"", Unset, Unset, t"", Nil, Nil, blocks))
           interface.transcript()
+
       . assert: entries =>
-          entries.size == 1 && !entries.head.lay(false)(pendingEntry) && texts(entries).contains(t"res0: Int = 2")
+          entries.size == 1 && !entries.head.lay(false)(pendingEntry) &&
+            texts(entries).contains(t"res0: Int = 2")
 
       test(m"an asynchronous run streams its output before its reply fills the entry"):
         isolated:
@@ -1425,24 +1673,30 @@ object Tests extends Suite(m"Flame Tests"):
           engine.answer(id, Repl.Reply.Pending(id))
           engine.push(Repl.Reply.Output(id, t"hi\n", Repl.stdoutStream))
           val streaming = interface.transcript()
-          engine.push(Repl.Reply.Ran(id, Unset, t"hi\n", Unset, Unset, t"", Nil, List(Repl.OutputSpan(Repl.stdoutStream, 0, 3)), t""))
+          val spans = List(Repl.OutputSpan(Repl.stdoutStream, 0, 3))
+          engine.push(Repl.Reply.Ran(id, Unset, t"hi\n", Unset, Unset, t"", Nil, spans, t""))
           (streaming, interface.transcript())
+
       . assert:
           case (streaming, settled) =>
             // The streamed chunk shows while the run is pending; the reply then carries the whole
             // output itself, shown once.
-            streaming.head.lay(false)(pendingEntry) && texts(streaming).contains(t"hi")
-              && !settled.head.lay(false)(pendingEntry) && texts(settled).cut(t"hi").size == 2
+            streaming.head.lay(false)(pendingEntry) && texts(streaming).contains(t"hi") &&
+              !settled.head.lay(false)(pendingEntry) && texts(settled).cut(t"hi").size == 2
 
       test(m"editing decorates the prompt at once and asks the engine for the scope"):
         isolated:
           val (engine, interface) = fresh()
           interface.handle(Event.Edited(interface.field.input, t"val x = (", 9))
           (engine.requests, interface.field.decoration())
+
       . assert: (requests, decoration) =>
-          requests.size == 1
-          && requests.head.lay(false) { case Repl.Request.Tokenize(_, t"val x = (") => true; case _ => false }
-          && decoration.incomplete && decoration.tokens.exists(_.text == t"val")
+          def tokenized(request: Repl.Request): Boolean = request match
+            case Repl.Request.Tokenize(_, t"val x = (") => true
+            case _                                      => false
+
+          requests.size == 1 && requests.head.lay(false)(tokenized) && decoration.incomplete &&
+            decoration.tokens.exists(_.text == t"val")
 
       // Whether the prompt marker is shown in the tone.
       def toned(prompt: List[Inline], tone: Tone): Boolean =
@@ -1459,15 +1713,19 @@ object Tests extends Suite(m"Flame Tests"):
 
       . assert: entries =>
           def indented(block: Block): Boolean = block match
-            case Block.Code(_, lines, _, _, _, _) => lines.head.lay(false)(_.tokens.head.lay(false)(_.text == t"  "))
-            case _                          => false
+            case Block.Code(_, lines, _, _, _, _) =>
+              lines.head.lay(false)(_.tokens.head.lay(false)(_.text == t"  "))
+
+            case _ =>
+              false
 
           entries.exists { case Block.Group(content) => content.exists(indented); case _ => false }
 
       test(m"an import's confirmation is a notice of the clause"):
         isolated:
           val (engine, interface) = fresh()
-          interface.handle(Event.Submitted(interface.field.input, t"import scala.collection.mutable.*"))
+          val input = t"import scala.collection.mutable.*"
+          interface.handle(Event.Submitted(interface.field.input, input))
           val id = engine.submissions.head.let(_.id).or(0)
           val output = Repl.messages.imported(t"scala.collection.mutable.*")
           engine.answer(id, Repl.Reply.Ran(id, Unset, t"$output\n", Unset, Unset, t"", Nil, Nil))
@@ -1475,8 +1733,11 @@ object Tests extends Suite(m"Flame Tests"):
 
       . assert: entries =>
           val notices: List[Block] = entries.bind:
-            case Block.Group(content) => content.filter { case Block.Notice(Tone.Muted, _, _) => true; case _ => false }
-            case _                    => Nil
+            case Block.Group(content) =>
+              content.filter { case Block.Notice(Tone.Muted, _, _) => true; case _ => false }
+
+            case _ =>
+              Nil
 
           notices.size == 1 && texts(notices) == t"imported scala.collection.mutable.*"
 
@@ -1487,8 +1748,7 @@ object Tests extends Suite(m"Flame Tests"):
           interface.handle(Event.Edited(interface.field.input, t"val x = 1", 9))
           (initial, interface.field.decoration().prompt)
 
-      . assert: (initial, edited) =>
-          initial == edited && toned(initial, Tone.Accent)
+      . assert: (initial, edited) => initial == edited && toned(initial, Tone.Accent)
 
       test(m"the prompt marker takes the info tone once the line reads as natural language"):
         isolated:
@@ -1516,6 +1776,7 @@ object Tests extends Suite(m"Flame Tests"):
           val open = interface.field.decoration().incomplete
           interface.handle(Event.Edited(interface.field.input, t"val x = 1\nx\n", 12))
           (open, interface.field.decoration().incomplete)
+
       . assert(_ == (true, false))
 
       test(m"a command is never incomplete"):
@@ -1523,8 +1784,10 @@ object Tests extends Suite(m"Flame Tests"):
           val (engine, interface) = fresh()
           interface.handle(Event.Edited(interface.field.input, t"/set async", 10))
           interface.field.decoration()
+
       . assert: decoration =>
-          !decoration.incomplete && decoration.tokens.head.lay(false)(_.accent == Token.Accent.Command)
+          !decoration.incomplete &&
+            decoration.tokens.head.lay(false)(_.accent == Token.Accent.Command)
 
       def scope(id: Int): Repl.Reply =
         Repl.Reply.Tokenized(id, Nil, true, false, List(Repl.ScopeBinding(t"x", t"Int", false)))
@@ -1534,6 +1797,7 @@ object Tests extends Suite(m"Flame Tests"):
           val (engine, interface) = fresh()
           interface.handle(Event.Edited(interface.field.input, t"val x", 5, 3))
           interface.field.decoration().version
+
       . assert(_ == 3)
 
       test(m"a scope computed for an older version of the text is dropped, a current one shown"):
@@ -1545,6 +1809,7 @@ object Tests extends Suite(m"Flame Tests"):
           val stale = interface.field.decoration().detail
           engine.answer(2, scope(2))
           (stale.nil, interface.field.decoration().detail.nil)
+
       . assert(_ == (true, false))
 
       test(m"a lone completion is proposed as a revision of the version it was asked for"):
@@ -1554,8 +1819,10 @@ object Tests extends Suite(m"Flame Tests"):
           interface.handle(Event.Edited(interface.field.input, t"1.toLo", 6, 4))
           interface.handle(Event.Key(Keypress.Tab))
           val id = engine.requests.size
-          engine.answer(id, Repl.Reply.Completed(id, List(Repl.CompletionItem(t"toLong", t"method", t"Long"))))
+          val item = Repl.CompletionItem(t"toLong", t"method", t"Long")
+          engine.answer(id, Repl.Reply.Completed(id, List(item)))
           (interface.field.value(), interface.field.revision())
+
       . assert(_ == (t"1.toLo", Control.Field.Revision(4, t"1.toLong", 8)))
 
       test(m"a completion for an older version of the text is dropped"):
@@ -1566,8 +1833,10 @@ object Tests extends Suite(m"Flame Tests"):
           interface.handle(Event.Key(Keypress.Tab))
           val id = engine.requests.size
           interface.handle(Event.Edited(interface.field.input, t"1.toLon", 7, 5))
-          engine.answer(id, Repl.Reply.Completed(id, List(Repl.CompletionItem(t"toLong", t"method", t"Long"))))
+          val item = Repl.CompletionItem(t"toLong", t"method", t"Long")
+          engine.answer(id, Repl.Reply.Completed(id, List(item)))
           (interface.field.revision(), interface.field.decoration().completions.nil)
+
       . assert(_ == (Unset, true))
 
       test(m"the clearing on submit overtakes a completion still in flight"):
@@ -1579,8 +1848,16 @@ object Tests extends Suite(m"Flame Tests"):
           val id = engine.requests.size
           interface.handle(Event.Edited(interface.field.input, t"", 0, 5))
           interface.handle(Event.Submitted(interface.field.input, t"1.toLo"))
-          engine.answer(id, Repl.Reply.Completed(id, List(Repl.CompletionItem(t"toLong", t"method", t"Long"), Repl.CompletionItem(t"toLower", t"method", t"String"))))
-          (interface.field.revision(), interface.field.decoration().completions.nil, interface.field.decoration().version)
+
+          val items =
+            List
+              ( Repl.CompletionItem(t"toLong", t"method", t"Long"),
+                Repl.CompletionItem(t"toLower", t"method", t"String") )
+
+          engine.answer(id, Repl.Reply.Completed(id, items))
+          val decoration = interface.field.decoration()
+          (interface.field.revision(), decoration.completions.nil, decoration.version)
+
       . assert(_ == (Unset, true, 5))
 
       test(m"/clear empties the transcript"):
@@ -1589,25 +1866,34 @@ object Tests extends Suite(m"Flame Tests"):
           interface.handle(Event.Submitted(interface.field.input, t"1 + 1"))
           interface.handle(Event.Submitted(interface.field.input, t"/clear"))
           (interface.transcript(), engine.submissions.size)
+
       . assert(_ == (Nil, 1))
 
       test(m"/session asks the engine and notes the answer"):
         isolated:
           val (engine, interface) = fresh()
           interface.handle(Event.Submitted(interface.field.input, t"/session other"))
-          val id = engine.requests.sweep { case Repl.Request.Session(id, t"other") => id }.head.or(0)
-          engine.answer(id, Repl.Reply.Session(id, t"other", List(t"default", t"other"), Repl.SessionOutcome.Joined))
+
+          val id =
+            engine.requests.sweep { case Repl.Request.Session(id, t"other") => id }.head.or(0)
+
+          val sessions = List(t"default", t"other")
+          engine.answer(id, Repl.Reply.Session(id, t"other", sessions, Repl.SessionOutcome.Joined))
           texts(interface.transcript())
+
       . assert(_.contains(Repl.messages.switched(t"other")))
 
       test(m"submissions join the history and are persisted"):
         isolated:
           // Recorded newest-first, as elsewhere in this harness, and reversed when read.
           var persisted: List[Text] = Nil
-          val (engine, interface) = fresh(ReplInterface.Options(history = List(t"earlier"), persist = line => persisted = line :: persisted))
+          def persist(line: Text): Unit = persisted = line :: persisted
+          val options = ReplInterface.Options(history = List(t"earlier"), persist = persist)
+          val (engine, interface) = fresh(options)
           interface.handle(Event.Submitted(interface.field.input, t"1 + 1"))
           interface.handle(Event.Submitted(interface.field.input, t"1 + 1"))
           (interface.field.history(), persisted.reverse)
+
       . assert(_ == (List(t"earlier", t"1 + 1"), List(t"1 + 1")))
 
       test(m"an unknown command is refused without troubling the engine"):
@@ -1615,20 +1901,25 @@ object Tests extends Suite(m"Flame Tests"):
           val (engine, interface) = fresh()
           interface.handle(Event.Submitted(interface.field.input, t"/nonsense"))
           (engine.submissions.size, texts(interface.transcript()))
+
       . assert:
           case (0, text) => text.contains(Repl.messages.unknownCommand(t"/nonsense"))
-          case _ => false
+          case _         => false
 
       test(m"closing the interface closes the engine"):
         isolated:
           val (engine, interface) = fresh()
           interface.handle(Event.Closed)
           engine.closed
+
       . assert(_ == true)
 
     suite(m"REPL TCP server"):
       given Scalac[3.9, Universe.Classfile] = Scalac(Nil)
 
+      // The type is the SINGLETON `2`, not `Int`: an expression line is bound as a `final val`, so
+      // a constant expression keeps the constant type the compiler folds it to (see
+      // `Repl.resultType`).
       test(m"a reply carries the value, type and highlighting"):
         isolated:
           val tcpPort = Port[Tcp]()
@@ -1639,8 +1930,7 @@ object Tests extends Suite(m"Flame Tests"):
           finally
             socket.close()
             service.stop()
-      // The type is the SINGLETON `2`, not `Int`: an expression line is bound as a `final val`, so a
-      // constant expression keeps the constant type the compiler folds it to (see `Repl.resultType`).
+
       . assert:
           case Repl.Reply.Ran(_, value, _, tpe, _, _, _, _, _) =>
             value.let(_ == t"2").or(false) && tpe.let(_.text == t"2").or(false)
@@ -1665,6 +1955,7 @@ object Tests extends Suite(m"Flame Tests"):
           finally
             socket.close()
             service.stop()
+
       . assert(_ == true)
 
       test(m"a message sent over a UNIX domain socket is answered"):
@@ -1679,24 +1970,28 @@ object Tests extends Suite(m"Flame Tests"):
           finally
             socket.close()
             service.stop()
+
       . assert:
           case Repl.Reply.Ran(_, value, _, _, _, _, _, _, _) => value.let(_ == t"42").or(false)
-          case _                                    => false
+          case _                                             => false
 
       test(m"sessions are independent and each has a distinct name"):
         isolated:
           val sessions = Opened(Sessions())
           val a = sessions.create()
           val b = sessions.create()
+
           def session(name: Text) =
             sessions.session(name).or(panic(m"the session just created is missing"))
 
           session(a).interpret(t"val marker = 111")
+
           ( a != b && sessions.names.has(a) && sessions.names.has(b),
             session(a).interpret(t"marker"),
             session(b).interpret(t"marker") )
+
       . assert:
-          case (true, Repl.Outcome.Ran(_, _, _, _, _), Repl.Outcome.Rejected(_)) => true
+          case (true, Repl.Outcome.Ran(_, _, _, _, _), Repl.Outcome.Rejected(_))  => true
           case _                                                                  => false
 
       test(m"a Session request switches the connection and lists sessions"):
@@ -1714,6 +2009,7 @@ object Tests extends Suite(m"Flame Tests"):
           finally
             socket.close()
             service.stop()
+
       . assert:
           case Repl.Reply.Session(_, name, names, Repl.SessionOutcome.Created) =>
             name != t"" && names.has(name)
@@ -1736,6 +2032,7 @@ object Tests extends Suite(m"Flame Tests"):
           finally
             socket.close()
             service.stop()
+
       . assert:
           case ( Repl.Reply.Session(1, t"work", names, Repl.SessionOutcome.Created),
                  Repl.Reply.Session(2, t"work", _, Repl.SessionOutcome.Joined) ) =>
@@ -1759,6 +2056,7 @@ object Tests extends Suite(m"Flame Tests"):
           finally
             socket.close()
             service.stop()
+
       . assert:
           case ( Repl.Reply.Session(1, t"work", _, Repl.SessionOutcome.Created),
                  Repl.Reply.Session(2, _, _, Repl.SessionOutcome.Exists) ) =>
@@ -1784,6 +2082,7 @@ object Tests extends Suite(m"Flame Tests"):
           finally
             socket.close()
             service.stop()
+
       . assert:
           case ( Repl.Reply.Session(1, _, _, Repl.SessionOutcome.Missing),
                  Repl.Reply.Session(3, t"work", _, Repl.SessionOutcome.Joined),
@@ -1804,8 +2103,14 @@ object Tests extends Suite(m"Flame Tests"):
           var stuck: Boolean = false
 
           (1 to 3).each: round =>
-            val complete: Runnable = caps.unsafe.unsafeAssumePure(() => { repl.completionsAt(t"List(1, 2, 3).m", 14); () })
-            val submit:   Runnable = caps.unsafe.unsafeAssumePure(() => { repl.react(round, t"val n: Int = \"hello\""); () })
+            val complete: Runnable = caps.unsafe.unsafeAssumePure: () =>
+              repl.completionsAt(t"List(1, 2, 3).m", 14)
+              ()
+
+            val submit: Runnable = caps.unsafe.unsafeAssumePure: () =>
+              repl.react(round, t"val n: Int = \"hello\"")
+              ()
+
             val completing = new Thread(complete)
             val submitting = new Thread(submit)
             completing.setDaemon(true); submitting.setDaemon(true)
@@ -1814,21 +2119,33 @@ object Tests extends Suite(m"Flame Tests"):
             if completing.isAlive || submitting.isAlive then stuck = true
 
           !stuck
+
       . assert(_ == true)
 
-      // A session's ambient `WorkingDirectory`/`Environment`/`System` (see `ReplContext`) reflect the
-      // values filed for it — the client's — and `System`'s `user.dir` follows the working directory.
+      // A session's ambient `WorkingDirectory`/`Environment`/`System` (see `ReplContext`) reflect
+      // the values filed for it — the client's — and `System`'s `user.dir` follows the working
+      // directory.
       test(m"the ambient WorkingDirectory, Environment and System are the client's"):
         isolated:
           val repl = Opened(Repl())
-          ReplContext.set(repl.session, ReplContext.Values(t"/tmp/flame-client",
-            Map(t"FLAME_TEST_VARIABLE" -> t"present")))
+
+          val values =
+            ReplContext.Values(t"/tmp/flame-client", Map(t"FLAME_TEST_VARIABLE" -> t"present"))
+
+          ReplContext.set(repl.session, values)
+
           repl.react(0, t"/set experimental")
           repl.react(0, t"import soundness.*")
-          repl.interpret(t"(summon[WorkingDirectory].directory(), summon[Environment].variable(t\"FLAME_TEST_VARIABLE\"), summon[System](t\"user.dir\"))")
+
+          repl.interpret
+            ( t"(summon[WorkingDirectory].directory(), " +
+              t"summon[Environment].variable(t\"FLAME_TEST_VARIABLE\"), " +
+              t"summon[System](t\"user.dir\"))" )
+
       . assert:
           case Repl.Outcome.Ran(_, value, _, _, _) =>
-            value.let(_.contains(t"/tmp/flame-client")).or(false) && value.let(_.contains(t"present")).or(false)
+            value.let(_.contains(t"/tmp/flame-client")).or(false) &&
+              value.let(_.contains(t"present")).or(false)
 
           case _ =>
             false
@@ -1843,10 +2160,13 @@ object Tests extends Suite(m"Flame Tests"):
           repl.react(0, t"import soundness.*")
           repl.react(1, t"given mine: WorkingDirectory = () => t\"/mine\"")
           repl.interpret(t"summon[WorkingDirectory].directory()")
+
       . assert:
           case Repl.Outcome.Ran(_, value, _, _, _) => value.let(_.contains(t"/mine")).or(false)
           case _                                   => false
 
+      // `emptyEnvironment` answers `Unset` (rendered `○`) where the ambient one would give a path;
+      // and the line ran — no ambiguity between the two givens.
       test(m"an imported Soundness Environment given overrides the ambient one without ambiguity"):
         isolated:
           val repl = Opened(Repl())
@@ -1854,8 +2174,7 @@ object Tests extends Suite(m"Flame Tests"):
           repl.react(0, t"import soundness.*")
           repl.react(1, t"import environments.emptyEnvironment")
           repl.interpret(t"summon[Environment].variable(t\"HOME\")")
-      // `emptyEnvironment` answers `Unset` (rendered `○`) where the ambient one would give a path;
-      // and the line ran — no ambiguity between the two givens.
+
       . assert:
           case Repl.Outcome.Ran(_, value, _, _, _) => value.let(_.contains(t"○")).or(false)
           case _                                   => false
@@ -1869,26 +2188,38 @@ object Tests extends Suite(m"Flame Tests"):
 
           try
             socket.exchange(Repl.Request.Session(1, t""))
-            socket.send(Repl.Request.Context(2, t"/tmp/flame-over-the-wire", List(Repl.Pair(t"K", t"v"))))
+            val pairs = List(Repl.Pair(t"K", t"v"))
+            socket.send(Repl.Request.Context(2, t"/tmp/flame-over-the-wire", pairs))
             socket.exchange(Repl.Request.Submit(3, t"/set experimental"))
             socket.exchange(Repl.Request.Submit(4, t"import soundness.*"))
             socket.exchange(Repl.Request.Submit(5, t"summon[WorkingDirectory].directory()"))
           finally
             socket.close()
             service.stop()
-      . assert:
-          case Repl.Reply.Ran(_, value, _, _, _, _, _, _, _) => value.let(_.contains(t"/tmp/flame-over-the-wire")).or(false)
-          case _                                          => false
 
-      // stdout and stderr are both captured, in the order they interleaved, and a reply locates each
-      // run by stream (`spans`) within the plain `output`, so the front-ends can shade them apart.
+      . assert:
+          case Repl.Reply.Ran(_, value, _, _, _, _, _, _, _) =>
+            value.let(_.contains(t"/tmp/flame-over-the-wire")).or(false)
+
+          case _ =>
+            false
+
+      // stdout and stderr are both captured, in the order they interleaved, and a reply locates
+      // each run by stream (`spans`) within the plain `output`, so the front-ends can shade them
+      // apart.
       test(m"stdout and stderr are captured in order, as separate spans"):
         isolated:
           Opened(Repl()).react(0, t"println(\"a\"); System.err.println(\"b\"); println(\"c\")")
+
       . assert:
           case Repl.Reply.Ran(_, _, output, _, _, _, _, spans, _) =>
-            output == t"a\nb\nc\n"
-            && spans == List(Repl.OutputSpan(t"out", 0, 2), Repl.OutputSpan(t"err", 2, 2), Repl.OutputSpan(t"out", 4, 2))
+            val expected =
+              List
+                ( Repl.OutputSpan(t"out", 0, 2),
+                  Repl.OutputSpan(t"err", 2, 2),
+                  Repl.OutputSpan(t"out", 4, 2) )
+
+            output == t"a\nb\nc\n" && spans == expected
 
           case _ =>
             false
@@ -1900,9 +2231,11 @@ object Tests extends Suite(m"Flame Tests"):
           repl.react(0, t"/set experimental")
           repl.react(0, t"import soundness.*")
           repl.react(1, t"Err.println(t\"oops\")")
+
       . assert:
           case Repl.Reply.Ran(_, _, output, _, _, _, _, spans, _) =>
-            output.contains(t"oops") && spans.exists(_.stream == t"err") && !spans.exists(_.stream == t"out")
+            output.contains(t"oops") && spans.exists(_.stream == t"err") &&
+              !spans.exists(_.stream == t"out")
 
           case _ =>
             false
@@ -1913,6 +2246,7 @@ object Tests extends Suite(m"Flame Tests"):
       test(m"a type error's span is marked on the rejected line's tokens"):
         isolated:
           Opened(Repl()).react(0, t"val n: Int = \"hello\"")
+
       . assert:
           case Repl.Reply.Rejected(_, _, tokens, _) =>
             val marked = tokens.filter(_.mark.present)
@@ -1925,6 +2259,7 @@ object Tests extends Suite(m"Flame Tests"):
       test(m"a span on a later line of a multi-line submission is marked there"):
         isolated:
           Opened(Repl()).react(0, t"def f: Int =\n  1 + \"x\"")
+
       . assert:
           case Repl.Reply.Rejected(_, _, tokens, _) =>
             val marked = tokens.filter(_.mark.present).map(_.text).join
@@ -1937,13 +2272,22 @@ object Tests extends Suite(m"Flame Tests"):
       // later lines by the indent alone; a span before the body, or past it, is dropped.
       test(m"userSpan maps wrapped coordinates back to the user's line"):
         val body = 5
-        val onFirst  = Repl.userSpan(Span.area(Ordinal.zerary(5), Ordinal.zerary(2 + 8 + 3), Ordinal.zerary(5), Ordinal.zerary(2 + 8 + 7)), body, 2, 8, 2)
-        val onSecond = Repl.userSpan(Span.area(Ordinal.zerary(6), Ordinal.zerary(4), Ordinal.zerary(6), Ordinal.zerary(6)), body, 2, 8, 2)
-        val before   = Repl.userSpan(Span.area(Ordinal.zerary(1), Ordinal.zerary(0), Ordinal.zerary(1), Ordinal.zerary(3)), body, 2, 8, 2)
-        val after    = Repl.userSpan(Span.area(Ordinal.zerary(9), Ordinal.zerary(0), Ordinal.zerary(9), Ordinal.zerary(3)), body, 2, 8, 2)
-        ( onFirst.let(s => (s.startLine.let(_.n0), s.startColumn.let(_.n0), s.endColumn.let(_.n0))),
-          onSecond.let(s => (s.startLine.let(_.n0), s.startColumn.let(_.n0), s.endColumn.let(_.n0))),
-          before.present, after.present )
+
+        // A span on one wrapped line, from column `start` to column `end`.
+        def area(line: Int, start: Int, end: Int): Span =
+          val first = Ordinal.zerary(line)
+          Span.area(first, Ordinal.zerary(start), first, Ordinal.zerary(end))
+
+        def coordinates(span: Span): (Optional[Int], Optional[Int], Optional[Int]) =
+          (span.startLine.let(_.n0), span.startColumn.let(_.n0), span.endColumn.let(_.n0))
+
+        val onFirst  = Repl.userSpan(area(5, 2 + 8 + 3, 2 + 8 + 7), body, 2, 8, 2)
+        val onSecond = Repl.userSpan(area(6, 4, 6), body, 2, 8, 2)
+        val before   = Repl.userSpan(area(1, 0, 3), body, 2, 8, 2)
+        val after    = Repl.userSpan(area(9, 0, 3), body, 2, 8, 2)
+
+        (onFirst.let(coordinates), onSecond.let(coordinates), before.present, after.present)
+
       . assert(_ == ((0, 3, 7), (1, 2, 4), false, false))
 
       // A `HistoryEntry` — the record the client appends to `.pyrocosm/flame/history` for each
@@ -1953,6 +2297,7 @@ object Tests extends Suite(m"Flame Tests"):
         isolated:
           val data: Data = Repl.HistoryEntry(t"import soundness.*").bintel
           Bintel.read[Repl.HistoryEntry](data)
+
       . assert:
           case Repl.HistoryEntry(t"import soundness.*") => true
           case _                                        => false
@@ -1975,6 +2320,7 @@ object Tests extends Suite(m"Flame Tests"):
           finally
             socket.close()
             service.stop()
+
       . assert:
           case ( Repl.Reply.SessionList(1, Nil),
                  Repl.Reply.SessionList(2, Nil),
@@ -1994,6 +2340,7 @@ object Tests extends Suite(m"Flame Tests"):
           finally
             socket.close()
             service.stop()
+
       . assert:
           case Repl.Reply.Completed(_, items) => items.exists(_.name.contains(t"map"))
           case _                              => false
@@ -2012,9 +2359,11 @@ object Tests extends Suite(m"Flame Tests"):
           finally
             socket.close()
             service.stop()
+
       . assert:
-          case Repl.Reply.Tokenized(2, _, true, false, Repl.ScopeBinding(name, tpe, false, _) :: Nil) =>
-            name == t"y" && tpe == t"Int"
+          case Repl.Reply.Tokenized(2, _, true, false, binding :: Nil) => binding match
+            case Repl.ScopeBinding(name, tpe, false, _) => name == t"y" && tpe == t"Int"
+            case _                                      => false
 
           case _ =>
             false
@@ -2024,11 +2373,13 @@ object Tests extends Suite(m"Flame Tests"):
 
       // A connection to a session of its own, in sessions that are warmed up, and what the
       // connection has been sent so far, oldest first.
-      def primed()(using Monitor, System, Probate): (Sessions[3.9]#Connection, () => List[Repl.Reply]) =
+      def primed()(using Monitor, System, Probate)
+      :   (Sessions[3.9]#Connection, () => List[Repl.Reply]) =
+
         val sessions = Opened(Sessions[3.9](Repl.Rendering.Inspect, frontend = true))
         val lock = Mutex()
         var sent: List[Repl.Reply] = Nil
-        val connection = sessions.connection { reply => lock { sent = reply :: sent } }
+        val connection = sessions.connection: reply => lock { sent = reply :: sent }
         connection.respond(Repl.Request.Session(1, t""))
         (connection, () => lock(sent.reverse))
 
@@ -2053,10 +2404,11 @@ object Tests extends Suite(m"Flame Tests"):
         isolated:
           val (_, sent) = primed()
           settled(sent).sweep { case Repl.Reply.Warming(_, done, total) => (done, total) }
+
       . assert: steps =>
-          steps.head.lay(false) { (done, total) => done == 0 && total > 0 }
-          && steps.last.lay(false) { (done, total) => done == total }
-          && rising(steps.map(_(0)))
+          steps.head.lay(false) { (done, total) => done == 0 && total > 0 } &&
+            steps.last.lay(false) { (done, total) => done == total } &&
+            rising(steps.map(_(0)))
 
       test(m"priming leaves no trace in the session"):
         isolated:
@@ -2064,8 +2416,10 @@ object Tests extends Suite(m"Flame Tests"):
           settled(sent)
           val plain = Opened(Repl.make[3.9](Repl.Prelude.empty))
           (connection.respond(Repl.Request.Submit(2, t"1 + 1")), plain.react(2, t"1 + 1"))
+
       . assert:
-          case (Repl.Reply.Ran(_, value, _, tpe, name, _, _, _, _), Repl.Reply.Ran(_, value2, _, tpe2, name2, _, _, _, _)) =>
+          case ( Repl.Reply.Ran(_, value, _, tpe, name, _, _, _, _),
+                 Repl.Reply.Ran(_, value2, _, tpe2, name2, _, _, _, _) ) =>
             value == value2 && tpe == tpe2 && name == name2 && name.present
 
           case _ =>
@@ -2075,6 +2429,7 @@ object Tests extends Suite(m"Flame Tests"):
         isolated:
           val (connection, _) = primed()
           connection.respond(Repl.Request.Submit(2, t"40 + 2"))
+
       . assert:
           case Repl.Reply.Ran(_, value, _, _, _, _, _, _, _) => value.lay(false)(_.contains(t"42"))
           case _                                             => false
@@ -2085,6 +2440,7 @@ object Tests extends Suite(m"Flame Tests"):
           settled(sent)
           connection.respond(Repl.Request.Submit(2, t"/set experimental"))
           connection.respond(Repl.Request.Submit(3, t"40 + 2"))
+
       . assert:
           case Repl.Reply.Ran(_, value, _, _, _, _, _, _, _) => value.lay(false)(_.contains(t"42"))
           case _                                             => false
@@ -2098,25 +2454,29 @@ object Tests extends Suite(m"Flame Tests"):
 
           val repl = Repl[3.9]:
             def shifted(n: Int): Int = n + base
+
           Opened(repl)
 
           repl.interpret(t"shifted(5)")
+
       . assert:
           case Repl.Outcome.Ran(_, value, _, _, _) => value.let(_ == t"105").or(false)
-          case _                             => false
+          case _                                   => false
 
       test(m"a lifted def captures an enclosing method parameter"):
         def session(base: Int): Repl.Outcome = isolated:
           val repl = Repl[3.9]:
             def plus(n: Int): Int = n + base
+
           Opened(repl)
 
           repl.interpret(t"plus(2)")
 
         session(40)
+
       . assert:
           case Repl.Outcome.Ran(_, value, _, _, _) => value.let(_ == t"42").or(false)
-          case _                             => false
+          case _                                   => false
 
       test(m"a lifted def can reference both a block binding and an outside value"):
         isolated:
@@ -2125,20 +2485,24 @@ object Tests extends Suite(m"Flame Tests"):
           val repl = Repl[3.9]:
             val offset = 5
             def total: Int = offset + base
+
           Opened(repl)
 
           repl.interpret(t"total")
+
       . assert:
           case Repl.Outcome.Ran(_, value, _, _, _) => value.let(_ == t"105").or(false)
-          case _                             => false
+          case _                                   => false
 
       test(m"a lifted def references a field of an enclosing object, tracking changes"):
         isolated:
           ReplFixture.greeting = "hi"     // length 2; then mutated to "changed" (7)
           ReplFixture.session
+
       . assert:
           case (Repl.Outcome.Ran(_, before, _, _, _), Repl.Outcome.Ran(_, after, _, _, _)) =>
             before.let(_ == t"2").or(false) && after.let(_ == t"7").or(false)
+
           case _ =>
             false
 
@@ -2148,11 +2512,13 @@ object Tests extends Suite(m"Flame Tests"):
 
           val repl = Repl[3.9]:
             def bump(): Unit = tally = tally + 10
+
           Opened(repl)
 
           repl.interpret(t"bump()")
           repl.interpret(t"bump()")
           tally
+
       . assert(_ == 21)
 
       test(m"a lifted import is in scope for a lifted def and for later lines"):
@@ -2160,22 +2526,26 @@ object Tests extends Suite(m"Flame Tests"):
           val repl = Repl[3.9]:
             import scala.collection.mutable.ListBuffer
             def make: ListBuffer[Int] = ListBuffer(1, 2, 3)
+
           Opened(repl)
 
           repl.interpret(t"make.sum")               // lifted def uses the import
           repl.interpret(t"ListBuffer(9, 9).sum")   // a later line uses it directly
+
       . assert:
           case Repl.Outcome.Ran(_, value, _, _, _) => value.let(_ == t"18").or(false)
-          case _                             => false
+          case _                                   => false
 
       test(m"a block-local var can be reassigned from a REPL line"):
         isolated:
           val repl = Repl[3.9]:
             var counter = 10
+
           Opened(repl)
 
           repl.interpret(t"counter = counter + 5")
           repl.interpret(t"counter")
+
       . assert:
           case Repl.Outcome.Ran(_, value, _, _, _) => value.let(_ == t"15").or(false)
-          case _                             => false
+          case _                                   => false

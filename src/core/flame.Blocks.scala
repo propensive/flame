@@ -38,17 +38,15 @@ import denominative.*
 import denominative.dysasymptotics.linearSize
 import digression.*
 import gossamer.*
+import hieroglyph.codepages.utf8Codepage
+import pyrocosm.exhibit
+import pyrocosm.{Block, Inline, Language, Token, Tone}
 import rudiments.*
 import spectacular.*
 import stratiform.*
 import symbolism.*
 import turbulence.*
 import vacuous.*
-
-import hieroglyph.codepages.utf8Codepage
-
-import pyrocosm.{Block, Inline, Language, Token, Tone}
-import pyrocosm.exhibit
 
 // The REPL's replies as Pyrocosm's semantic blocks: tokens with their marks as code with
 // notes, captured output by stream, the result line, a stack trace. What a reply *is*; how it
@@ -107,7 +105,10 @@ object Blocks:
             current = Blocks.token(token.copy(text = part)) :: current
 
             token.mark.let: (mark: Text) =>
-              val style = if mark == Repl.warningMark then Block.Note.Style.Caution else Block.Note.Style.Erroneous
+              val style =
+                if mark == Repl.warningMark then Block.Note.Style.Caution
+                else Block.Note.Style.Erroneous
+
               notes = Block.Note(line, column, column + part.length, style) :: notes
 
             column += part.length
@@ -119,7 +120,9 @@ object Blocks:
   // with it. A transcript entry keeps the column its line was typed at, past the prompt marker.
   def indented(code: Block.Code, columns: Int): Block.Code =
     val space: Token = Token.plain(t" "*columns)
-    val lines: List[Block.Line] = code.lines.map { (line: Block.Line) => Block.Line(space :: line.tokens) }
+
+    val lines: List[Block.Line] = code.lines.map: (line: Block.Line) =>
+      Block.Line(space :: line.tokens)
 
     val notes: List[Block.Note] = code.notes.map: (note: Block.Note) =>
       note.copy(start = note.start + columns, end = note.end + columns)
@@ -178,6 +181,7 @@ object Blocks:
 
         lines match
           case List(line) => blocks = message(line) :: blocks
+
           case _ =>
             lines.each: (line: Text) =>
               val clause: Optional[Text] = Repl.messages.importedClause(line)
@@ -190,7 +194,8 @@ object Blocks:
 
     spans.each: (span: Repl.OutputSpan) =>
       if span.start > at then gap(plain.segment(at.z till span.start.z))
-      blocks = Block.Output(plain.segment(span.start.z till (span.start + span.length).z), error = span.stream == Repl.stderrStream) :: blocks
+      val segment = plain.segment(span.start.z till (span.start + span.length).z)
+      blocks = Block.Output(segment, error = span.stream == Repl.stderrStream) :: blocks
       at = span.start + span.length
 
     if at < plain.length then gap(plain.skip(at))
@@ -198,18 +203,34 @@ object Blocks:
 
   // The result line, `name = value : Type <: base`, as code around the value's exhibit: one
   // paragraph when the value is phrasing, a group around it when it is flow.
-  def result(name: Optional[Text], value: Optional[Inline | Block], tpe: Optional[Repl.TypeText]): List[Block] =
+  def result(name: Optional[Text], value: Optional[Inline | Block], tpe: Optional[Repl.TypeText])
+  :   List[Block] =
+
     if value.absent && tpe.absent then Nil else
       val binding: List[Inline] = name.lay(Nil: List[Inline]): (name: Text) =>
-        List(Inline.Snippet(Language.Scala, List(Token(name, Token.Accent.Term, Token.Role.Binding), Token(t" ", Token.Accent.Unparsed), Token(t"=", Token.Accent.Parens), Token(t" ", Token.Accent.Unparsed))))
+        val tokens: List[Token] =
+          List
+            ( Token(name, Token.Accent.Term, Token.Role.Binding),
+              Token(t" ", Token.Accent.Unparsed),
+              Token(t"=", Token.Accent.Parens),
+              Token(t" ", Token.Accent.Unparsed) )
+
+        List(Inline.Snippet(Language.Scala, tokens))
 
       val typed: List[Inline] = tpe.lay(Nil: List[Inline]): (tpe: Repl.TypeText) =>
-        val widened: List[Token] = tpe.base.lay(Nil: List[Token]) { (base: Text) => List(Token(t" <: ", Token.Accent.Symbol), Token(base, Token.Accent.Typal)) }
-        List(Inline.Snippet(Language.Scala, List(Token(t": ", Token.Accent.Symbol), Token(tpe.text, Token.Accent.Typal)) + widened))
+        val widened: List[Token] = tpe.base.lay(Nil: List[Token]): (base: Text) =>
+          List(Token(t" <: ", Token.Accent.Symbol), Token(base, Token.Accent.Typal))
+
+        val tokens: List[Token] =
+          List(Token(t": ", Token.Accent.Symbol), Token(tpe.text, Token.Accent.Typal)) + widened
+
+        List(Inline.Snippet(Language.Scala, tokens))
 
       value match
         case block: Block =>
-          List(Block.Group((if binding.nil then Nil else List(Block.Paragraph(binding))) + List(block) + (if typed.nil then Nil else List(Block.Paragraph(typed)))))
+          val before: List[Block] = if binding.nil then Nil else List(Block.Paragraph(binding))
+          val after: List[Block] = if typed.nil then Nil else List(Block.Paragraph(typed))
+          List(Block.Group(before + List(block) + after))
 
         case inline: Inline =>
           List(Block.Paragraph(binding + List(inline) + typed))
@@ -226,6 +247,7 @@ object Blocks:
   object Payload:
     import contingency.strategies.throwUnsafely
     given telEncodable: Payload is Tel.Encodable = Tel.EncodableDerivation.derived[Payload]
+
     given telDecodable: Payload is Tel.Decodable =
       scala.caps.unsafe.unsafeAssumePure(Tel.DecodableDerivation.derived[Payload])
 

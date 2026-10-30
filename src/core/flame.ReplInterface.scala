@@ -32,13 +32,11 @@
                                                                                                   */
 package flame
 
+import pyrocosm.{Action, Block, Control, Event, Hints, Inline, Input, Interface, Language}
+import pyrocosm.{Panel, Token, Tone, hints}
 import soundness.*
-
-import dysasymptotics.linearSize
-import sortingAlgorithms.timsort
-
-import pyrocosm.{Action, Block, Control, Event, Hints, Inline, Input, Interface, Language, Panel, Token, Tone, hints}
-import pyrocosm.Status as Gauge
+import soundness.dysasymptotics.linearSize
+import soundness.sortingAlgorithms.timsort
 
 // The REPL as a Pyrocosm interface: a transcript of submissions and their results, a prompt,
 // and, for the web, the sessions to choose from. One of these per session, driven by an
@@ -51,17 +49,23 @@ object ReplInterface:
     case Join(name: Text)
     case Create(name: Text)
 
+  // `navigation` puts a panel of sessions beside the transcript (the web); `quitAllowed` lets
+  // `/quit` stop the server (not from a page); `context` is the working directory and
+  // environment; `commands` are submitted first (`/set …`, `/language …`, `/classload …`);
+  // `history` holds the earlier submissions, oldest first; `persist` is given a submission worth
+  // remembering; and `leave` is called on `/quit` and `/disconnect`, when the frontend should
+  // stop.
   case class Options
-    ( title:       Text       = t"Flame",
-      navigation:  Boolean    = false,             // a panel of sessions (the web)
-      quitAllowed: Boolean    = true,              // `/quit` stops the server; not from a page
-      session:     Session    = Session.Default,
-      context:     Optional[(Text, List[Repl.Pair])] = Unset,   // the working directory and environment
-      commands:    List[Text] = Nil,               // submitted first: `/set …`, `/language …`, `/classload …`
-      history:     List[Text] = Nil,               // earlier submissions, oldest first
-      historyLimit: Int       = 100,
-      persist:     Text => Unit = _ => (),         // a submission worth remembering
-      leave:       () => Unit = () => () )         // `/quit` and `/disconnect`: the frontend should stop
+    ( title:        Text                              = t"Flame",
+      navigation:   Boolean                           = false,
+      quitAllowed:  Boolean                           = true,
+      session:      Session                           = Session.Default,
+      context:      Optional[(Text, List[Repl.Pair])] = Unset,
+      commands:     List[Text]                        = Nil,
+      history:      List[Text]                        = Nil,
+      historyLimit: Int                               = 100,
+      persist:      Text => Unit                      = _ => (),
+      leave:        () => Unit                        = () => () )
 
   // The delay before a completion is asked for after a keystroke, so typing is not a query
   // per character.
@@ -80,10 +84,18 @@ object ReplInterface:
   private def lastBreak(text: Text): Optional[Ordinal] = text.pinpoint(_ == '\n', bidi = Rtl)
 
   private def blankLastLine(text: Text): Boolean =
-    lastBreak(text).lay(false) { newline => text.skip(newline.n0 + 1).blank }
+    lastBreak(text).lay(false): newline => text.skip(newline.n0 + 1).blank
 
   private def stripTrailingBlank(text: Text): Text =
-    if blankLastLine(text) then lastBreak(text).lay(text)(newline => text.keep(newline.n0)) else text
+    if !blankLastLine(text) then text
+    else lastBreak(text).lay(text): newline => text.keep(newline.n0)
+
+  // A character that may continue an identifier.
+  private def identifying(char: Char): Boolean = char.alphanumeric || char == '_'
+
+  // A notice of the compiler's text, with its ANSI styling removed.
+  private def plainNotice(tone: Tone, text: Text): Block =
+    Block.Notice(tone, Unset, List(Block.paragraph(SemanticRender.stripAnsi(text))))
 
 class ReplInterface(engine: Engine, options: ReplInterface.Options)(using Monitor, Probate):
   import ReplInterface.*
@@ -105,15 +117,52 @@ class ReplInterface(engine: Engine, options: ReplInterface.Options)(using Monito
 
   val interface: Interface =
     val navigation: List[Panel] =
-      if options.navigation then List(Panel(Panel.Id(t"sessions"), Panel.Role.Navigation, Inline.text(t"Sessions"), sessions, Panel.Priority.Important)) else Nil
+      if !options.navigation then Nil
+      else
+        val panel: Panel =
+          Panel
+            ( Panel.Id(t"sessions"),
+              Panel.Role.Navigation,
+              Inline.text(t"Sessions"),
+              sessions,
+              Panel.Priority.Important )
 
-    val main: List[Panel] =
-      List
-        ( Panel(Panel.Id(t"transcript"), Panel.Role.Transcript, Unset, transcript, Panel.Priority.Essential, hints = Hints(hints.Follow, hints.terminal.Border.None)),
-          Panel(Panel.Id(t"status"), Panel.Role.Prompt, Unset, status, Panel.Priority.Essential, hints = Hints(hints.terminal.Border.None)),
-          Panel(Panel.Id(t"prompt"), Panel.Role.Prompt, Unset, pyrocosm.Live(Nil), Panel.Priority.Essential, controls = List(field), hints = Hints(hints.terminal.Border.Rules)) )
+        List(panel)
 
-    Interface(Inline.text(options.title), navigation + main, hints = Hints(hints.terminal.Occupancy.Inline))
+    val transcriptPanel: Panel =
+      Panel
+        ( Panel.Id(t"transcript"),
+          Panel.Role.Transcript,
+          Unset,
+          transcript,
+          Panel.Priority.Essential,
+          hints = Hints(hints.Follow, hints.terminal.Border.None) )
+
+    val statusPanel: Panel =
+      Panel
+        ( Panel.Id(t"status"),
+          Panel.Role.Prompt,
+          Unset,
+          status,
+          Panel.Priority.Essential,
+          hints = Hints(hints.terminal.Border.None) )
+
+    val promptPanel: Panel =
+      Panel
+        ( Panel.Id(t"prompt"),
+          Panel.Role.Prompt,
+          Unset,
+          pyrocosm.Live(Nil),
+          Panel.Priority.Essential,
+          controls = List(field),
+          hints = Hints(hints.terminal.Border.Rules) )
+
+    val main: List[Panel] = List(transcriptPanel, statusPanel, promptPanel)
+
+    Interface
+      ( Inline.text(options.title),
+        navigation + main,
+        hints = Hints(hints.terminal.Occupancy.Inline) )
 
   // The entries whose reply is still to come, by request id, with the output streamed so far.
   // Atomic cells holding immutable maps: every update installs a whole new map, so a reader sees
@@ -152,7 +201,7 @@ class ReplInterface(engine: Engine, options: ReplInterface.Options)(using Monito
   @volatile private var scopeRow: List[Block] = Nil
   private var count: Int = 0
 
-  engine.pushed(reply => lock(pushed(reply)))
+  engine.pushed: reply => lock(pushed(reply))
 
   // ── Startup ────────────────────────────────────────────────────────────────────────────
 
@@ -193,12 +242,13 @@ class ReplInterface(engine: Engine, options: ReplInterface.Options)(using Monito
   // The context, then the startup commands one after another, each awaited so its effect
   // (`/set experimental` before a feature) precedes the next.
   private def begin(): Unit =
-    options.context.let { (directory, environment) => engine.send(Repl.Request.Context(_, directory, environment)) }
+    options.context.let: (directory, environment) =>
+      engine.send(Repl.Request.Context(_, directory, environment))
 
     def run(commands: List[Text]): Unit = commands match
-      case Nil            => ()
+      case Nil             => ()
       case command :: rest => submit(command, () => lock(run(rest)))
-      case _              => ()
+      case _               => ()
 
     run(options.commands)
 
@@ -208,18 +258,23 @@ class ReplInterface(engine: Engine, options: ReplInterface.Options)(using Monito
 
   private def note(text: Text): Unit = append(Block.Paragraph(List(muted(text))))
 
-  private def notice(tone: Tone, text: Text): Unit = append(Block.Notice(tone, Unset, List(Block.paragraph(text))))
+  private def notice(tone: Tone, text: Text): Unit =
+    append(Block.Notice(tone, Unset, List(Block.paragraph(text))))
 
   // An entry keeps the frame its line was entered at: a rule above and below the code.
-  private def framed(code: Block): List[Block] = List(Block.Rule(Block.Side.Above), code, Block.Rule(Block.Side.Below))
+  private def framed(code: Block): List[Block] =
+    List(Block.Rule(Block.Side.Above), code, Block.Rule(Block.Side.Below))
 
   private def entry(id: Int): Block =
     val code: Block = codes().at(id).or(Block.Code(Language.Scala, Nil))
-    Block.Group(framed(code) + outputs().at(id).or(Nil) + List(Block.Gauge(Gauge.Indeterminate(), Inline.text(t"evaluating"))))
+    val gauge: Block = Block.Gauge(pyrocosm.Status.Indeterminate(), Inline.text(t"evaluating"))
+    Block.Group(framed(code) + outputs().at(id).or(Nil) + List(gauge))
 
   private def replace(id: Int, settled: Block): Unit =
     pending().at(id).let: current =>
-      transcript.amend { entries => entries.map { (block: Block) => if block eq current then settled else block } }
+      transcript.amend: entries =>
+        entries.map: (block: Block) => if block eq current then settled else block
+
       pending.revise(_.define(id, settled))
 
   // The reply carries the whole of the run's output itself, so the chunks streamed while it
@@ -234,28 +289,33 @@ class ReplInterface(engine: Engine, options: ReplInterface.Options)(using Monito
     case Repl.Reply.Ran(_, value, output, tpe, name, diagnostics, _, spans, blocks) =>
       if blocks != t"" then Blocks.decode(blocks)
       else
-        val shown: List[Inline] = value.lay(Nil: List[Inline]) { (value: Text) => Inline.text(SemanticRender.stripAnsi(value)) }
-        val result: List[Block] = if shown.nil && tpe.absent then Nil else Blocks.result(name, if shown.nil then Unset else Inline.Phrase(shown), tpe)
-        val warnings: List[Block] = if diagnostics == t"" then Nil else List(Block.Notice(Tone.Warning, Unset, List(Block.paragraph(SemanticRender.stripAnsi(diagnostics)))))
+        val shown: List[Inline] = value.lay(Nil: List[Inline]): (value: Text) =>
+          Inline.text(SemanticRender.stripAnsi(value))
+
+        val phrase: Optional[Inline] = if shown.nil then Unset else Inline.Phrase(shown)
+
+        val result: List[Block] =
+          if shown.nil && tpe.absent then Nil else Blocks.result(name, phrase, tpe)
+
+        val warnings: List[Block] =
+          if diagnostics == t"" then Nil else List(plainNotice(Tone.Warning, diagnostics))
+
         Blocks.output(output, spans, ansi = false) + result + warnings
 
     case Repl.Reply.Rejected(_, diagnostics, _, blocks) =>
-      if blocks != t"" then Blocks.decode(blocks)
-      else List(Block.Notice(Tone.Failure, Unset, List(Block.paragraph(SemanticRender.stripAnsi(diagnostics)))))
+      if blocks != t"" then Blocks.decode(blocks) else List(plainNotice(Tone.Failure, diagnostics))
 
     case Repl.Reply.Advised(_, diagnostics, _, blocks) =>
-      if blocks != t"" then Blocks.decode(blocks)
-      else List(Block.Notice(Tone.Failure, Unset, List(Block.paragraph(SemanticRender.stripAnsi(diagnostics)))))
+      if blocks != t"" then Blocks.decode(blocks) else List(plainNotice(Tone.Failure, diagnostics))
 
     case Repl.Reply.Threw(_, output, diagnostics, _, spans, blocks) =>
       if blocks != t"" then Blocks.decode(blocks)
       else
-        val failure: List[Block] = List(Block.Notice(Tone.Failure, Unset, List(Block.paragraph(SemanticRender.stripAnsi(diagnostics)))))
+        val failure: List[Block] = List(plainNotice(Tone.Failure, diagnostics))
         Blocks.output(output, spans, ansi = false) + failure
 
     case Repl.Reply.Crashed(_, diagnostics, _, blocks) =>
-      if blocks != t"" then Blocks.decode(blocks)
-      else List(Block.Notice(Tone.Failure, Unset, List(Block.paragraph(SemanticRender.stripAnsi(diagnostics)))))
+      if blocks != t"" then Blocks.decode(blocks) else List(plainNotice(Tone.Failure, diagnostics))
 
     case Repl.Reply.Failed(_, message) =>
       List(Block.Notice(Tone.Failure, Unset, List(Block.paragraph(message))))
@@ -293,7 +353,8 @@ class ReplInterface(engine: Engine, options: ReplInterface.Options)(using Monito
     engine.request(build): reply =>
       lock:
         reply match
-          case Repl.Reply.Pending(_) => ()                                    // the fill comes later, pushed
+          case Repl.Reply.Pending(_) => () // the fill comes later, pushed
+
           case other =>
             val id = Repl.replyId(other)
             codes.revise(_.define(id, code(text, other)))
@@ -301,17 +362,22 @@ class ReplInterface(engine: Engine, options: ReplInterface.Options)(using Monito
             // A rejection with advice to come keeps its entry pending, under a gauge: an entry
             // that has settled is history, which the terminal has put beyond amending.
             if advising().has(id) then
-              val seeking: Block = Block.Gauge(Gauge.Indeterminate(), Inline.text(t"seeking advice"))
+              val seeking: Block =
+                Block.Gauge(pyrocosm.Status.Indeterminate(), Inline.text(t"seeking advice"))
+
               val shown: Block = codes().at(id).or(Block.Code(Language.Scala, Nil))
               replace(id, Block.Group(framed(shown) + content(other) + List(seeking)))
-            else settle(id, content(other))
+            else
+              settle(id, content(other))
 
             done()
 
   private def pushed(reply: Repl.Reply): Unit = reply match
     case Repl.Reply.Output(id, chunk, stream) =>
       outputs.revise: outputs =>
-        outputs.define(id, outputs.at(id).or(Nil) + List(Block.Output(chunk, error = stream == Repl.stderrStream)))
+        val block: Block = Block.Output(chunk, error = stream == Repl.stderrStream)
+        outputs.define(id, outputs.at(id).or(Nil) + List(block))
+
       replace(id, entry(id))
 
     case Repl.Reply.Pending(_) => ()
@@ -325,7 +391,11 @@ class ReplInterface(engine: Engine, options: ReplInterface.Options)(using Monito
 
     case Repl.Reply.Warming(_, done, total) =>
       if done >= total then status.amend(_ => Nil)
-      else status.amend(_ => List(Block.Gauge(Gauge.Fraction(done.toDouble/total), Inline.text(t"warming up"))))
+      else
+        val gauge: Block =
+          Block.Gauge(pyrocosm.Status.Fraction(done.toDouble/total), Inline.text(t"warming up"))
+
+        status.amend(_ => List(gauge))
 
     case other =>
       val id = Repl.replyId(other)
@@ -342,9 +412,16 @@ class ReplInterface(engine: Engine, options: ReplInterface.Options)(using Monito
           val fresh = Action(name)
           choices.revise(_.define(name, fresh))
           fresh
+
         val label: List[Inline] =
-          if name == current then List(Inline.Toned(Tone.Accent, List(Inline.Symbol(pyrocosm.Glyph.ArrowRight))), Inline.Textual(t" "), Inline.Emphasis(Inline.text(name)))
-          else Inline.text(name)
+          if name == current then
+            val arrow: Inline =
+              Inline.Toned(Tone.Accent, List(Inline.Symbol(pyrocosm.Glyph.ArrowRight)))
+
+            List(arrow, Inline.Textual(t" "), Inline.Emphasis(Inline.text(name)))
+          else
+            Inline.text(name)
+
         Block.Item(List(Block.Paragraph(label)), action)
 
       sessions() = if items.nil then Nil else List(Block.Listing(false, items))
@@ -357,6 +434,7 @@ class ReplInterface(engine: Engine, options: ReplInterface.Options)(using Monito
             if name == t"" then note(Repl.messages.sessionList(current, names))
             else if outcome == Repl.SessionOutcome.Created then note(Repl.messages.started(current))
             else note(Repl.messages.switched(current))
+
             listSessions(names, current)
 
           case _ =>
@@ -365,8 +443,8 @@ class ReplInterface(engine: Engine, options: ReplInterface.Options)(using Monito
   // ── The prompt ─────────────────────────────────────────────────────────────────────────
 
   private def naturalLanguage(text: Text): Boolean =
-    !text.starts(t"/") && !text.starts(t" ") && !text.starts(t"\t") && text.trim != t""
-      && Repl.classify(text) == Repl.Verdict.Language
+    !text.starts(t"/") && !text.starts(t" ") && !text.starts(t"\t") && text.trim != t"" &&
+      Repl.classify(text) == Repl.Verdict.Language
 
   private def decorate(text: Text, caret: Int, current: Int): Unit =
     version = current
@@ -374,18 +452,21 @@ class ReplInterface(engine: Engine, options: ReplInterface.Options)(using Monito
     val prose = !command && naturalLanguage(text)
     language = prose
     val multiline = text.contains(t"\n")
-    val incomplete = !command && !prose && (Repl.incomplete(text) || (multiline && !blankLastLine(text)))
 
-    val detail: List[Block] =
-      if prose then List(Block.Paragraph(List(muted(t"reads as natural language; a space before it makes it Scala")))) else Nil
+    val incomplete =
+      !command && !prose && (Repl.incomplete(text) || (multiline && !blankLastLine(text)))
+
+    val hint: Text = t"reads as natural language; a space before it makes it Scala"
+    val detail: List[Block] = if prose then List(Block.Paragraph(List(muted(hint)))) else Nil
 
     if text == t"" then scopeRow = Nil
 
     val extending: Boolean =
-      caret == text.length && text.starts(completedFor)
-        && text.skip(completedFor.length).all { c => c.alphanumeric || c == '_' }
+      caret == text.length && text.starts(completedFor) &&
+        text.skip(completedFor.length).all(identifying)
 
-    val kept: List[Control.Field.Completion] = if extending then field.decoration().completions else Nil
+    val kept: List[Control.Field.Completion] =
+      if extending then field.decoration().completions else Nil
 
     field.decoration() =
       Control.Field.Decoration
@@ -416,14 +497,18 @@ class ReplInterface(engine: Engine, options: ReplInterface.Options)(using Monito
 
                   val context: List[Token] =
                     val clauses: List[List[Token]] =
-                      contextual.group(_.level).to[List].order(-_(0)).indexed.map: (entry, ordinal) =>
+                      contextual.group(_.level).to[List].order(-_(0)).indexed
+                      . map: (entry, ordinal) =>
                         val (_, group) = entry
-                        val types = commas(group.map { binding => List(Token(binding.tpe, Token.Accent.Typal)) })
+
+                        val types: List[Token] = commas:
+                          group.map: binding => List(Token(binding.tpe, Token.Accent.Typal))
+
+                        val open: Token = Token(t"(", Token.Accent.Parens)
+                        val close: Token = Token(t")", Token.Accent.Parens)
 
                         val grouped: List[Token] =
-                          if group.size > 1
-                          then (Token(t"(", Token.Accent.Parens) :: types) + List(Token(t")", Token.Accent.Parens))
-                          else types
+                          if group.size > 1 then (open :: types) + List(close) else types
 
                         val separator: List[Token] =
                           if ordinal == Prim then Nil else List(Token(t" ", Token.Accent.Unparsed))
@@ -432,8 +517,12 @@ class ReplInterface(engine: Engine, options: ReplInterface.Options)(using Monito
 
                     clauses.flat
 
-                  val values: List[Token] =
-                    commas(named.map { binding => List(Token(binding.name.or(t"_"), Token.Accent.Term, Token.Role.Binding), Token(t": ", Token.Accent.Symbol), Token(binding.tpe, Token.Accent.Typal)) })
+                  val values: List[Token] = commas:
+                    named.map: binding =>
+                      List
+                        ( Token(binding.name.or(t"_"), Token.Accent.Term, Token.Role.Binding),
+                          Token(t": ", Token.Accent.Symbol),
+                          Token(binding.tpe, Token.Accent.Typal) )
 
                   // Two lines of one paragraph: the contextual values, then the named ones.
                   val contextLine: List[List[Token]] = if context.nil then Nil else List(context)
@@ -442,7 +531,9 @@ class ReplInterface(engine: Engine, options: ReplInterface.Options)(using Monito
 
                   val content: List[Inline] =
                     val pieces: List[List[Inline]] = lines.indexed.map: (tokens, ordinal) =>
-                      val break: List[Inline] = if ordinal == Prim then Nil else List(Inline.Break())
+                      val break: List[Inline] =
+                        if ordinal == Prim then Nil else List(Inline.Break())
+
                       break :+ Inline.Snippet(Language.Scala, tokens)
 
                     pieces.flat
@@ -455,8 +546,7 @@ class ReplInterface(engine: Engine, options: ReplInterface.Options)(using Monito
             case _ => ()
 
       // Completions, a moment after the last keystroke, when the caret ends an identifier.
-      if !prose && caret == text.length
-         && text.last.lay(false) { c => c.alphanumeric || c == '_' || c == '/' }
+      if !prose && caret == text.length && (text.last.lay(false)(identifying) || text.ends(t"/"))
       then
         async:
           snooze(ghostDelay.toDouble*Milli(Second))
@@ -484,8 +574,7 @@ class ReplInterface(engine: Engine, options: ReplInterface.Options)(using Monito
                 else
                   var start = caret
 
-                  while start > 0
-                        && text.at(Ordinal.zerary(start - 1)).lay(false) { c => c.alphanumeric || c == '_' }
+                  while start > 0 && text.at(Ordinal.zerary(start - 1)).lay(false)(identifying)
                   do start -= 1
 
                   t"${text.keep(start)}$name${text.skip(caret)}"
@@ -496,7 +585,8 @@ class ReplInterface(engine: Engine, options: ReplInterface.Options)(using Monito
 
             if lone.absent then
               val completions: List[Control.Field.Completion] =
-                items.map { (item: Repl.CompletionItem) => Control.Field.Completion(item.name, item.kind, item.signature, whole(item.name)) }
+                items.map: (item: Repl.CompletionItem) =>
+                  Control.Field.Completion(item.name, item.kind, item.signature, whole(item.name))
 
               completedFor = text
               field.decoration.amend(_.copy(completions = completions))
@@ -520,7 +610,7 @@ class ReplInterface(engine: Engine, options: ReplInterface.Options)(using Monito
     Block.Group(List(echo, Block.Paragraph(List(muted(explanation)))))
 
   private def remember(text: Text): Unit =
-    field.history.amend { history => (history :+ text).keep(options.historyLimit, Rtl) }
+    field.history.amend: history => (history :+ text).keep(options.historyLimit, Rtl)
     options.persist(text)
 
   def handle(event: Event): Unit = lock:
@@ -547,14 +637,19 @@ class ReplInterface(engine: Engine, options: ReplInterface.Options)(using Monito
             if options.quitAllowed then
               engine.send(Repl.Request.Quit(_))
               options.leave()
-            else note(t"A page cannot stop the server; close the tab to leave the session")
-          else if text == t"/session" || text.starts(t"/session ") then switchTo(text.chomp(t"/session").trim)
-          else if text.starts(t"/") && !Repl.isCommand(text) then append(unknownCommand(text))
-          else if naturalLanguage(text) then append(naturalLanguageEntry(text))
-          else submit(text)
+            else
+              note(t"A page cannot stop the server; close the tab to leave the session")
+          else if text == t"/session" || text.starts(t"/session ") then
+            switchTo(text.chomp(t"/session").trim)
+          else if text.starts(t"/") && !Repl.isCommand(text) then
+            append(unknownCommand(text))
+          else if naturalLanguage(text) then
+            append(naturalLanguageEntry(text))
+          else
+            submit(text)
 
       case Event.Pressed(action) =>
-        choices().to[List].seek(_(1) == action).let { (name, _) => switchTo(name) }
+        choices().to[List].seek(_(1) == action).let: (name, _) => switchTo(name)
 
       case Event.Closed => engine.close()
       case _            => ()

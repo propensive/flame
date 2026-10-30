@@ -35,7 +35,6 @@ package flame
 import soundness.*
 
 import filesystemBackends.javaBaseFilesystem
-// The `Tool` extensions that find and parse `.pyrocosm/flame/config.tel` (see `Flame`).
 
 // The per-project configuration: a `.pyrocosm/flame/config.tel` file in the invocation's working
 // directory or the nearest ancestor holding one — resolved upwards exactly like `.git` (and exactly
@@ -94,10 +93,10 @@ object Workspace:
       val start: Path on Linux = directory.as[Path on Linux]
 
       (start :: start.ancestors)
-      . map { dir => dir / Name[Linux](t".pyrocosm") / Name[Linux](t"flame") }
+      . map: dir => dir / Name[Linux](t".pyrocosm") / Name[Linux](t"flame")
       . filter(_.existent())
       . head
-      . let { dir => (dir / Name[Linux](t"history")).encode }
+      . let: dir => (dir / Name[Linux](t"history")).encode
 
   // The history configuration for `directory`, combining the resolved file path with the config's
   // entry limit (default 100).
@@ -120,11 +119,11 @@ object Workspace:
           if entry.starts(t"/") then entry else t"$root/$entry"
 
         Config
-         ( sets      = atoms(t"set"),
-           languages = atoms(t"language"),
-           classpath = atoms(t"classpath").map(absolute),
-           port      = atoms(t"port").head.let { (text: Text) => safely(text.as[Int]) },
-           host      = atoms(t"host").head,
-           join      = atoms(t"join").head,
-           create    = atoms(t"create").head,
-           history   = atoms(t"history").head.let { (text: Text) => safely(text.as[Int]) } )
+          ( sets      = atoms(t"set"),
+            languages = atoms(t"language"),
+            classpath = atoms(t"classpath").map(absolute),
+            port      = atoms(t"port").head.let { (text: Text) => safely(text.as[Int]) },
+            host      = atoms(t"host").head,
+            join      = atoms(t"join").head,
+            create    = atoms(t"create").head,
+            history   = atoms(t"history").head.let { (text: Text) => safely(text.as[Int]) } )
