@@ -1,8 +1,8 @@
 tel 1.0
 
 # Flare checks Flame: every source, against Consequent Style, with the licence header every
-# file begins with. The rules below are measured by `flare metrics` commit by commit; `cast` is
-# enforced too. `make check` runs the profile; CI runs the same command.
+# file begins with. The rules below are measured by `flare metrics` commit by commit. `make check`
+# runs the profile.
 
 rule cast
   invokes asInstanceOf
@@ -23,12 +23,14 @@ profile default
   language implicitConversions
   language experimental.modularity
   language experimental.dependent
+
+  # Kept, though the build no longer passes it: the build enables relaxed lambda syntax with
+  # `-preview`, which flare cannot yet be given, so without this line flare would not parse a
+  # one-line lambda such as `f: x => g(x)`.
   language experimental.relaxedLambdaSyntax
   language experimental.genericNumberLiterals
-  language experimental.into
   language experimental.erasedDefinitions
   language experimental.saferExceptions
-  language experimental.strictEqualityPatternMatching
   language experimental.subCases
   language experimental.multiSpreads
   language experimental.captureChecking
@@ -39,4 +41,8 @@ profile default
     interpolator m
     interpolator e
 
-  enforce cast
+  # `cast` is measured but not enforced. Every cast left is in the REPL's macros
+  # (`flame.ReplMacro`, `flame.ScopeInspector`), where a value crosses between the compiler's own
+  # trees and types and the Quotes API's abstract ones, or is boxed to `Object` or unboxed to a
+  # spliced type in generated code: there is no runtime test a pattern match could make, and
+  # every other cast has been replaced by one.

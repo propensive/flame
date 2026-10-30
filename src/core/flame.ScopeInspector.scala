@@ -50,10 +50,10 @@ import dotty.tools.dotc.util.SourcePosition
 import dotty.tools.dotc.util.Spans
 
 import anticipation.*
-import symbolism.*
 import gossamer.*
 import rudiments.*
 import stenography.Syntax
+import symbolism.*
 import vacuous.*
 
 // Answers "what has the line introduced into scope so far?" for an UNFINISHED line: the bindings
@@ -102,6 +102,7 @@ class ScopeInspector(arguments: List[Text]):
       val thread = Thread(null, runnable, "flame-scope", ScopeInspector.stackSize)
       thread.setDaemon(true)
       thread
+
     . nn
 
   // Created on first use, ON the executor thread (only `run` touches it), so its context base is
@@ -113,14 +114,16 @@ class ScopeInspector(arguments: List[Text]):
   // rendered against `imports`. Empty on any failure or timeout.
   def inspect(source: Text, offset: Int, imports: stenography.Imports): List[Repl.ScopeBinding] =
     val task: juc.Callable[List[Repl.ScopeBinding]] =
-      caps.unsafe.unsafeAssumePure(() => run(source, offset, imports))
+      caps.unsafe.unsafeAssumePure: () => run(source, offset, imports)
 
     try executor.submit(task).nn.get(ScopeInspector.timeout, juc.TimeUnit.MILLISECONDS).nn
     catch case _: Throwable => Nil
 
   def retire(): Unit = executor.shutdownNow()
 
-  private def run(source: Text, offset: Int, imports: stenography.Imports): List[Repl.ScopeBinding] =
+  private def run(source: Text, offset: Int, imports: stenography.Imports)
+  :   List[Repl.ScopeBinding] =
+
     val uri = jn.URI("file:///flame-scope.scala")
     driver.run(uri, source.s)
     val unit = driver.compilationUnits(uri)
@@ -145,6 +148,7 @@ class ScopeInspector(arguments: List[Text]):
         if relevant(symbol) then
           val binding = render(symbol, imports).copy(level = depth)
           val key = t"${binding.name.or(t"")}:${binding.tpe}"
+
           if !seen.has(key) then
             seen = seen + Set(key)
             bindings = binding :: bindings
@@ -163,7 +167,7 @@ class ScopeInspector(arguments: List[Text]):
   // A context function's parameters are synthetic (`x$1`, `contextual$1`, `evidence$1`): only a
   // name the user could write is reported; the rest are shown by type alone, as a `given` would be.
   private def render(symbol: Symbol, imports: stenography.Imports)
-      (using context: Context, quotes: scala.quoted.Quotes)
+    ( using context: Context, quotes: scala.quoted.Quotes )
   :   Repl.ScopeBinding =
 
     val raw: String = symbol.name.toString

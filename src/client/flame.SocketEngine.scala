@@ -60,8 +60,7 @@ class SocketEngine(duplex: Duplex)(using Monitor, Probate) extends Engine:
   @volatile private var live: Boolean = true
 
   private def transmit(request: Repl.Request): Unit = writes:
-    if live then
-      duplex.send(zephyrine.Stream(LengthPrefix.encode(SocketEngine.encode(request))))
+    if live then duplex.send(zephyrine.Stream(LengthPrefix.encode(SocketEngine.encode(request))))
 
   def request(request: Int => Repl.Request)(reply: Repl.Reply => Unit): Unit =
     val id = nextId.ere(_ + 1)
@@ -77,7 +76,6 @@ class SocketEngine(duplex: Duplex)(using Monitor, Probate) extends Engine:
   // first read, and the server sends nothing before it is asked.
   def start(ended: () -> Unit): Unit =
     async:
-      import strategies.throwUnsafely
 
       // One record per reply, framed by its four-byte big-endian length; the iterator ends when
       // the server closes the stream.
@@ -88,9 +86,9 @@ class SocketEngine(duplex: Duplex)(using Monitor, Probate) extends Engine:
           val id = Repl.replyId(reply)
 
           reply match
-            case Repl.Reply.Output(_, _, _)  => sink(reply)
-            case Repl.Reply.Warming(_, _, _) => sink(reply)
-            case Repl.Reply.Advising(_)      => sink(reply)
+            case Repl.Reply.Output(_, _, _)     => sink(reply)
+            case Repl.Reply.Warming(_, _, _)    => sink(reply)
+            case Repl.Reply.Advising(_)         => sink(reply)
             case Repl.Reply.Advised(_, _, _, _) => sink(reply)
             case _ =>
               // Claimed atomically: the callback is removed and read in one transition, so a

@@ -145,8 +145,8 @@ object ReplMacro:
             val mutable:   Boolean = symbol.flags.is(Flags.Mutable)
 
             val predefined =
-              ownerName == "scala" || ownerName.startsWith("scala.")
-              || ownerName == "java" || ownerName.startsWith("java.")
+              ownerName == "scala" || ownerName.startsWith("scala.") ||
+                ownerName == "java" || ownerName.startsWith("java.")
 
             if !predefined && !blockSymbols.contains(symbol) && !bound.contains(ident.name)
             then free.getOrElseUpdate(ident.name, (ident.tpe.widen, mutable, symbol))
@@ -158,8 +158,7 @@ object ReplMacro:
 
     lifted.foreach(freeReferences.foldTree((), _)(owner))
 
-    free.foreach: (name, info) =>
-      binds += Bind(name, info(0), info(1), Ref(info(2)), info(2), true)
+    free.foreach: (name, info) => binds += Bind(name, info(0), info(1), Ref(info(2)), info(2), true)
 
     // Build accessors and the maps that redirect captured references to them.
     val getters: scm.Map[Symbol, Symbol] = scm.Map()
@@ -181,9 +180,10 @@ object ReplMacro:
         setters(bind.symbol) = setterSymbol
 
         val setter = DefDef(setterSymbol, params =>
-          val value: Term = params.head.head.asInstanceOf[Term]
-          val boxed: Expr[Object] = '{${value.asExprOf[Any]}.asInstanceOf[Object]}
-          Some('{ReplBridge.updateLive(${Expr(bind.name)}, $boxed)}.asTerm))
+          (params.head.head: @unchecked) match
+            case value: Term =>
+              val boxed: Expr[Object] = '{${value.asExprOf[Any]}.asInstanceOf[Object]}
+              Some('{ReplBridge.updateLive(${Expr(bind.name)}, $boxed)}.asTerm))
 
         List(getter, setter)
 
@@ -222,7 +222,11 @@ object ReplMacro:
         val block = Block(seedStatements, '{()}.asTerm).changeOwner(owner)
         val stripped = stripper.transformTerm(block)(owner)
         val tree = Inlined(None, Nil, stripped).asInstanceOf[tpd.Tree]
-        PickledQuotes.pickleQuote(tree)(using quotes.asInstanceOf[QuotesImpl].ctx)
+
+        val context = (quotes: @unchecked) match
+          case quotes: QuotesImpl => quotes.ctx
+
+        PickledQuotes.pickleQuote(tree)(using context)
 
     val importsExpr: Expr[List[String]] = Expr(imports.to(List))
 
@@ -271,12 +275,12 @@ object ReplMacro:
 
                 val assign: Expr[Object => Unit] =
                   Lambda(Symbol.spliceOwner, methodType, (_, params) =>
-                    val value: Term = params.head.asInstanceOf[Term]
-
-                    (bind.symbol.info.widen.asType: @unchecked) match
-                      case '[t] =>
-                        val cast = '{${value.asExprOf[Object]}.asInstanceOf[t]}.asTerm
-                        Assign(Ref(bind.symbol), cast)
+                    (params.head: @unchecked) match
+                      case value: Term =>
+                        (bind.symbol.info.widen.asType: @unchecked) match
+                          case '[t] =>
+                            val cast = '{${value.asExprOf[Object]}.asInstanceOf[t]}.asTerm
+                            Assign(Ref(bind.symbol), cast)
                   ).asExprOf[Object => Unit]
 
                 val putSetter: Expr[Unit] =
@@ -299,7 +303,7 @@ object ReplMacro:
                       ReplBridge.putSupplier(repl.session, ${Expr(bind.name)}, supply)
 
                       ReplBridge.putSetter(repl.session, ${Expr(bind.name)},
-                        ${consumer('{ (value: Object) => cell(0) = value })})
+                        ${consumer('{(value: Object) => cell(0) = value})})
                     }
 
                 List(cellPut)

@@ -34,17 +34,15 @@ package flame
 
 import anticipation.*
 import contingency.*
+import contingency.strategies.throwUnsafely
 import gossamer.*
+import hieroglyph.codepages.utf8Codepage
+import pyrocosm.{Block, Inline, Presentable}
 import rudiments.*
 import spectacular.*
 import stratiform.*
 import turbulence.*
 import vacuous.*
-
-import pyrocosm.{Block, Inline, Presentable}
-
-import contingency.strategies.throwUnsafely
-import hieroglyph.codepages.utf8Codepage
 
 // The rendering of a result value under `Repl.Rendering.Exhibit`, expanded INSIDE the compiled
 // wrapper where the value's static type is known: Pyrocosm's `Presentable`, whose own cascade
@@ -70,6 +68,7 @@ object ExhibitRender:
   private def unquoted(inline: Inline): Inline = inline match
     case Inline.Textual(text0) =>
       val text = text0.trim
+
       if text.length > 1 && text.starts(t"\u201c") && text.ends(t"\u201d")
       then Inline.Textual(text.chomp(t"\u201c").chomp(t"\u201d", Rtl))
       else Inline.Textual(text0)

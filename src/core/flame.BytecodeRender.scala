@@ -43,10 +43,11 @@ import rudiments.*
 import vacuous.*
 import FlameColours.srgb
 
-// Renders the JVM bytecode of a compiled class to a coloured, truecolor-ANSI listing, for the REPL's
-// `/bytecode` command. Uses Soundness `mandible`: `Classfile(resource)` reads the class BYTES through
-// a `Classloader` (it does not load or initialise the class), and each `Method`'s disassembled
-// `Bytecode` renders as an escritoire table (Source | Offset | Opcode | Stack) via its `Teletypeable`.
+// Renders the JVM bytecode of a compiled class to a coloured, truecolor-ANSI listing, for the
+// REPL's `/bytecode` command. Uses Soundness `mandible`: `Classfile(resource)` reads the class
+// BYTES through a `Classloader` (it does not load or initialise the class), and each `Method`'s
+// disassembled `Bytecode` renders as an escritoire table (Source | Offset | Opcode | Stack) via its
+// `Teletypeable`.
 object BytecodeRender:
   // Zed-palette colours (see `flame_client.scala`): opcodes peach like a term, the source column
   // subdued like a comment, and the stack-frame outline in the faint gutter grey.
@@ -59,8 +60,8 @@ object BytecodeRender:
     def outline:    Color in Srgb = srgb(0x5a524c)
 
   // Method names that are compiler scaffolding, never the user's code: the constructors and the
-  // `writeReplace` the wrapper object gets for serialization. Filtered out so the listing shows only
-  // the disassembled user methods.
+  // `writeReplace` the wrapper object gets for serialization. Filtered out so the listing shows
+  // only the disassembled user methods.
   private val synthetic: Set[Text] = Set(t"<init>", t"<clinit>", t"writeReplace")
 
   // Renders every non-synthetic method of `resource` (a `<class>.class` resource name loadable by
@@ -69,8 +70,8 @@ object BytecodeRender:
   def render(resource: Text)(using Classloader): Optional[Text] =
     Classfile(resource).let: classfile =>
       classfile.methods
-        .filter { method => !synthetic.has(method.name) }
-        .map { method => (method.name, method.bytecode) }
+        .filter: method => !synthetic.has(method.name)
+        .map: method => (method.name, method.bytecode)
         .sweep { case (name, code: Bytecode) => e"$Bold($name)\n${code.teletype}" }
         .join(e"\n\n")
         .render(xtermTrueColorTermcap)

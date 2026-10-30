@@ -32,40 +32,35 @@
                                                                                                   */
 package flame
 
-import anticipation.*
-import denominative.*
-import denominative.dysasymptotics.linearSize
-import symbolism.*
 import anthology.*
+import anticipation.*
+import delicious.*  // Markup, SemanticMessage, Reifier, `semantic` on Notice and `teletype`
+import denominative.*
 import escapade.*, termcapDefinitions.xtermTrueColorTermcap
 import gossamer.*
 import harlequin.*
 import iridescence.*
-import kaleidoscope.*
 import prepositional.*
+import pyrocosm.{Block, Notices}
 import rudiments.*
 import stenography.*
 import tessellate.Flow
 import vacuous.*
-
-import delicious.*  // Markup, SemanticMessage, Reifier, `semantic` on Notice, `teletype` on SemanticMessage
-import pyrocosm.{Block, Notices}
-import pyrocosm.{exhibit, sourceCodePresentable, flattened}
 import FlameColours.srgb
 
 // Renders compiler notices for a REPL reply, re-rendering the TYPES embedded in each error message
-// through stenography and syntax-highlighting both them and any embedded CODE SAMPLES with harlequin.
-// Under `-Zsemantic-diagnostics` the compiler wraps every interpolated type of a message in in-band
-// markers carrying its pickled TASTy, and interpolated trees as `code` nodes; `delicious` parses that
-// into a `Markup` tree and its `Reifier` turns each type marker's TASTy back into a
-// `stenography.Syntax`. For `Inspect` the rendering is `delicious.ansi`'s `teletype`, harlequin-
-// highlighted code and types as coloured ANSI; for `Exhibit` the same tree becomes Pyrocosm
-// blocks (`blocks`). Both fall back to the compiler's own printed text for anything that cannot
-// be reified, and to the plain message when there is no semantic markup at all.
+// through stenography and syntax-highlighting both them and any embedded CODE SAMPLES with
+// harlequin. Under `-Zsemantic-diagnostics` the compiler wraps every interpolated type of a message
+// in in-band markers carrying its pickled TASTy, and interpolated trees as `code` nodes;
+// `delicious` parses that into a `Markup` tree and its `Reifier` turns each type marker's TASTy
+// back into a `stenography.Syntax`. For `Inspect` the rendering is `delicious.ansi`'s `teletype`,
+// harlequin- highlighted code and types as coloured ANSI; for `Exhibit` the same tree becomes
+// Pyrocosm blocks (`blocks`). Both fall back to the compiler's own printed text for anything that
+// cannot be reified, and to the plain message when there is no semantic markup at all.
 object SemanticRender:
   // The syntax palette, matched to the user's Zed theme "Propensive" — the single source of truth,
-  // shared with the CLI front-end (whose editor `given` delegates here), so a type or code sample in
-  // an error message is coloured exactly as it would be in the editor. (See the palette notes in
+  // shared with the CLI front-end (whose editor `given` delegates here), so a type or code sample
+  // in an error message is coloured exactly as it would be in the editor. (See the palette notes in
   // `flame_client.scala`: an accent is a colour category; `scalaSymbol`/`scalaParenthesis` map to
   // Zed's punctuation.bracket/operator respectively.)
   val palette: ScalaSyntaxPalette = new Palette:
@@ -86,16 +81,15 @@ object SemanticRender:
     def accented:         Color in Srgb = srgb(FlameColours.foreground)
     def margin:           Color in Srgb = srgb(FlameColours.margin)
 
-
   // Renders `notices` to the diagnostics string. `reifier` reifies the TASTy of each type marker
   // (`Unset` — no marker present, or the reifier could not be built — falls back to compiler text).
   def render(notices: List[Notice], reifier: Optional[Reifier])(using Imports): Text =
     notices.map { (notice: Notice) => renderNotice(notice, reifier) }.join(t"; ")
 
-  // The column at which a diagnostic's PROSE word-wraps in the terminal rendering. Neither the daemon
-  // nor basic mode knows the client terminal's true width, so this follows the compiler's own
-  // page-width convention. Embedded code samples are never wrapped; a single word (or type) longer
-  // than the width is emitted whole on its own line.
+  // The column at which a diagnostic's PROSE word-wraps in the terminal rendering. Neither the
+  // daemon nor basic mode knows the client terminal's true width, so this follows the compiler's
+  // own page-width convention. Embedded code samples are never wrapped; a single word (or type)
+  // longer than the width is emitted whole on its own line.
   private val wrapWidth: Int = 80
 
   private def renderNotice(notice: Notice, reifier: Optional[Reifier])(using Imports): Text =
@@ -119,6 +113,7 @@ object SemanticRender:
 
   private def ansiMessage(message: SemanticMessage, reifier: Optional[Reifier])(using Imports)
   :   Teletype =
+
     given ScalaSyntaxPalette = palette
 
     // Harlequin-highlights `text` in `context` as a Teletype. Called through the typeclass instance
@@ -126,13 +121,14 @@ object SemanticRender:
     // note in `flame_client.colourful`).
     def code(text: Text, context: Scala.Context): Teletype =
       harlequin.syntaxHighlighting.unnumberedTeletypeable
-       . teletype(Scala.highlight(stripAnsi(text), context))
+      . teletype(Scala.highlight(stripAnsi(text), context))
 
     def pieces(nodes: List[Markup]): List[Piece] = nodes.flatMap(piece)
 
     def piece(markup: Markup): List[Piece] = markup match
       case Markup.Textual(text) => prose(text)
       case Markup.Code(_, _)    => List(Piece.Atom(code(markup.plain, Scala.Context.Term)))
+
       case typed: Markup.Typed =>
         List(Piece.Atom(code(typeText(typed, reifier), Scala.Context.Type)))
 
@@ -186,7 +182,7 @@ object SemanticRender:
           val space: Text = rest.keep(blank)
           recur(rest.skip(space.length), Piece.Space(space) :: pieces)
         else
-          val word: Text = rest.keep { char => char != '\n' && !blank(char) }
+          val word: Text = rest.keep: char => char != '\n' && !blank(char)
           recur(rest.skip(word.length), Piece.Word(e"$word") :: pieces)
 
     recur(plain, Nil)
@@ -197,8 +193,8 @@ object SemanticRender:
     import hieroglyph.textMetrics.uniformMetric
     Flow.wrap(text, wrapWidth).join(t"\n")
 
-  // The stenography rendering of a type marker (Unset reifier, or a failed reification, falls back to
-  // the compiler-printed text the marker also carries in `plain`).
+  // The stenography rendering of a type marker (Unset reifier, or a failed reification, falls back
+  // to the compiler-printed text the marker also carries in `plain`).
   private def typeText(typed: Markup.Typed, reifier: Optional[Reifier])(using Imports): Text =
     reifier.lay(Unset: Optional[Syntax])(_.syntax(typed)).let(_.text).or(typed.plain)
 
@@ -209,7 +205,8 @@ object SemanticRender:
   // which is not shown; the submission it concerns is already in the transcript, marked.
   def blocks(notices: List[Notice], reifier: Optional[Reifier])(using Imports): List[Block] =
     notices.map: (notice: Notice) =>
-      Notices.diagnostic(notice.copy(file = t""), types = { (typed: Markup.Typed) => typeText(typed, reifier) })
+      Notices.diagnostic
+        ( notice.copy(file = t""),
+          types = { (typed: Markup.Typed) => typeText(typed, reifier) } )
 
   def stripAnsi(text: Text): Text = text.unstyled
-
