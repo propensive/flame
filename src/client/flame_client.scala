@@ -515,9 +515,10 @@ private def httpServe(portNumber: Int)
     case Signal(Interrupt.Int, _, _, _) => quit.offer(()) yet SignalResponse.Accept
 
   // Printed from the client (not the daemon) so it reaches the user's terminal; the URL is
-  // on its own line so terminals render it as a clean, clickable link.
+  // on its own line so terminals render it as a clean, clickable link. A port of 0 is a free
+  // port behind the machine's hub, so the address is the hub's, as `FlameWeb.address` says.
   Out.println(t"Serving the web REPL (press Ctrl+C to stop):")
-  Out.println(t"  http://localhost:$portNumber/")
+  Out.println(t"  ${FlameWeb.address(portNumber)}")
 
   // A TYPED Ctrl+C never reaches the `trap`: the Ethereal launcher reads the terminal in raw mode
   // and forwards the keystroke as a byte (never a SIGINT), and there is no editor to consume it. So
