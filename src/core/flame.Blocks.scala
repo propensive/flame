@@ -114,7 +114,13 @@ object Blocks:
             column += part.length
 
     flush()
-    Block.Code(Language.Scala, lines.reverse, notes.reverse)
+
+    // An unclosed string is a string to the end of its line, not what the scanner recovered
+    // from its missing quote with.
+    val closed: List[Block.Line] =
+      lines.reverse.map: (line: Block.Line) => Block.Line(Token.closeStrings(line.tokens))
+
+    Block.Code(Language.Scala, closed, notes.reverse)
 
   // The code shifted right by `columns`: a run of spaces before every line, and its notes moved
   // with it. A transcript entry keeps the column its line was typed at, past the prompt marker.

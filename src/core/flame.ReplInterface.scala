@@ -468,9 +468,11 @@ class ReplInterface(engine: Engine, options: ReplInterface.Options)(using Monito
     val kept: List[Control.Field.Completion] =
       if extending then field.decoration().completions else Nil
 
+    // A string still being typed is a string to the end of its line, not what the scanner
+    // recovers from its missing quote with.
     field.decoration() =
       Control.Field.Decoration
-        ( tokens(text).map(Blocks.token), kept, incomplete, detail + scopeRow,
+        ( Token.closeStrings(tokens(text).map(Blocks.token)), kept, incomplete, detail + scopeRow,
           prompt = prompt(prose), version = current )
 
     if text != t"" then
