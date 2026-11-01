@@ -70,7 +70,6 @@ import termcapDefinitions.xtermTrueColorTermcap
 import textMetrics.wideCharacterWidthMetric
 import threads.platformThreads
 
-val Serve = Subcommand("serve", "serve the Flame web front-end")
 val Listen = Subcommand("listen", "serve the terminal REPL over TCP, for remote clients")
 
 val Port =
@@ -366,17 +365,6 @@ object Client uses parasite.threads, surveillance.Watcher:
                 case _ =>
                   command(connectSocket(intent, settings, history, context))
 
-          // `flame serve [--port N | -p N]` — the web front-end, interactively (default port
-          // `FlameWeb.port`). `Port()` registers the flag (so it is offered in tab-completion) and
-          // reads its value; the pure `Int` interpreter above yields `Unset` for an absent or
-          // non-numeric value, so `.or(FlameWeb.port)` falls back.
-          //
-          // The read is OUTSIDE `command`: in completion mode `execute` returns without running its
-          // block at all, so a flag read within it would never register and never be suggested.
-          case Serve() :: _ =>
-            val port: Int = Port().value.or(workspace.port).or(FlameWeb.port)
-            command(httpServe(port))
-
           // `flame listen [--port N | -p N]` — a REPL server bound to a TCP port (not a per-process
           // UNIX socket), so a `flame --host` client on another machine can reach its sessions.
           // Defaults to `defaultPort`; a non-numeric `--port` also falls back to it.
@@ -496,46 +484,6 @@ private def basicRepl(settings: List[Text])(using Stdio, Monitor, Probate, Syste
           Out.println()
           running = false
 
-  Exit.Ok
-
-// Launches the web-based front-end (`flame.web`) on the given TCP port, blocking until
-// interrupted. It reuses `serverClassloader` — the same compile-classpath loader the
-// socket server uses — so the embedded engine finds the scala library under the
-// Burdock/Ethereal launcher, exactly as the terminal server does.
-private def httpServe(portNumber: Int)
-  ( using Stdio, Monitor, Probate, System, Cli, Console, Environment )
-:   Exit =
-
-  given Classloader = serverClassloader
-
-  val quit: Promise[Unit] = Promise()
-
-  // A real SIGINT (e.g. `kill -INT <pid>`) fulfils `quit` and stops the server cleanly.
-  trap:
-    case Signal(Interrupt.Int, _, _, _) => quit.offer(()) yet SignalResponse.Accept
-
-  // Printed from the client (not the daemon) so it reaches the user's terminal; the URL is
-  // on its own line so terminals render it as a clean, clickable link. A port of 0 is a free
-  // port behind the machine's hub, so the address is the hub's, as `FlameWeb.address` says.
-  Out.println(t"Serving the web REPL (press Ctrl+C to stop):")
-  Out.println(t"  ${FlameWeb.address(portNumber)}")
-
-  // A TYPED Ctrl+C never reaches the `trap`: the Ethereal launcher reads the terminal in raw mode
-  // and forwards the keystroke as a byte (never a SIGINT), and there is no editor to consume it. So
-  // read the terminal ourselves — in the background, while the server blocks on `quit` — and fulfil
-  // `quit` on Ctrl+C (or Ctrl+D). This is why the server never responded to Ctrl+C before.
-  async:
-    safely:
-      interactive: terminal ?=>
-        given Stdio = terminal.stdio
-        val events = terminal.eventIterator()
-        var reading = true
-
-        while reading && events.hasNext do events.next() match
-          case Keypress.Ctrl('C' | 'D') => quit.offer(()); reading = false
-          case _                        => ()
-
-  serveHttp(portNumber, quit, FlameWeb.address(portNumber))
   Exit.Ok
 
 // The directory holding per-process REPL sockets, and this process's socket file.
