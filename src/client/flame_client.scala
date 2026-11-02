@@ -48,21 +48,17 @@ import dysasymptotics.linearSize
 import escapade.Faint
 import escapade.Italic
 import filesystemBackends.javaBaseFilesystem
-import filesystemOptions.createNonexistentParents
 import filesystemOptions.deleteOnlyEmpty
-import filesystemOptions.failOnPreexisting
 import internetAccess.online
 import interpreters.posixInterpreter
 import logging.silentLogging
-import pathInterfaces.pathOnLinux
 import probates.cancelProbate
-import profanity.Interrupt
 import pyrocosm.TerminalFrontend
 // `soundness.*` also exports an unrelated `Tool` (anthology's, since flame's classpath has the
 // compiler driver), so Pyrocosm's tool descriptor is named explicitly: an explicit import beats
 // the wildcard. Its extension methods (`standard`, `version`, `repoFile`, …) are top-level in the
 // `pyrocosm` package, so each is imported by name where it is used.
-import pyrocosm.Tool
+import pyrocosm.{Processes, Runtimes, Tool}
 import socketBackends.javaBaseSockets
 import systems.javaBaseSystem
 import temporaryDirectories.systemTemporaryDirectory
@@ -105,11 +101,8 @@ val Flame: Tool =
 object FlameWeb extends Tool.Web:
   def port: Int = 0
 
-  // Where the REPL on `port` is found: under the hub's origin for port 0, which the hub holds,
-  // and at the port itself otherwise.
-  def address(port: Int): Text =
-    if port == 0 then t"http://localhost:${pyrocosm.Hubs.port}/flame/"
-    else t"http://localhost:$port/"
+  // Where the REPL on `port` is found.
+  def address(port: Int): Text = Flame.address(port)
 
   // The promise a running server waits on, so that `stop` can reach it from another invocation.
   // A `Promise` holds no capability; vouched untracked so the field can be assigned from `serve`.
@@ -494,7 +487,8 @@ private def envText(name: Text): Optional[Text] =
   safely(Environment(name))
 
 private def socketDirectory: Text =
-  t"${envText(t"XDG_RUNTIME_DIR").or(envText(t"TMPDIR")).or(t"/tmp")}/flame"
+  import environments.javaBaseEnvironment
+  Flame.runtimeDirectory.let(_.encode).or(t"${envText(t"TMPDIR").or(t"/tmp")}/flame")
 
 private def socketFile: Text = t"$socketDirectory/${ProcessHandle.current.nn.pid}.sock"
 
@@ -575,37 +569,13 @@ private def serveSocket()(using Stdio, Monitor, Probate, System): Exit =
 // (e.g. `ethereal.script` unset, or a non-`URLClassLoader` launcher) we fall back
 // to the thread-context loader.
 private def serverClassloader(using System): Classloader =
-  // `recover`/`protect` handles the filesystem errors the path operations RAISE; the outer `try`
-  // catches anything the classloader machinery THROWS (a missing `ethereal.script`, a non-URL
-  // launcher). Either way we fall back to the thread-context loader.
+  // The entries the process was loaded from, the executable's `.jar` link first (`Runtimes`),
+  // as URLs; a non-URL launcher, or no executable, falls back to the thread-context loader.
   try
-    recover:
-      case _: Path.Error | _: Io.Error => threadContextClassloader
+    val urls: List[jn.URL] = Runtimes.classpath().map: entry => ji.File(entry.s).toURI.nn.toURL.nn
 
-    . protect:
-      val executable: Text = unsafely(System.properties.ethereal.script[Text]())
-      val tmpDir: Path on Linux = temporaryDirectory/Uuid()
-      tmpDir.create[Directory]()
-      val link: Path on Linux = unsafely(tmpDir/t"flame.jar")
-      executable.as[Path on Linux].symlinkTo(link)
-      // `.javaFile`/`.javaPath` are re-exported into `soundness` from both galilei-core and
-      // galilei-jvm (an orphan-given clash), so the extension search is ambiguous; build the
-      // `java.io.File` from the path's encoded text instead.
-      val url: jn.URL = ji.File(link.encode.s).toURI.nn.toURL.nn
-
-      val executablePath: Text = ji.File(executable.s).getCanonicalPath.nn.tt
-
-      val bootstrapUrls: List[jn.URL] = threadContextClassloader.java match
-        case loader: jn.URLClassLoader =>
-          val urls = loader.getURLs.nn.iterator.map(_.nn).filter: entry =>
-            safely(ji.File(entry.toURI).getCanonicalPath.nn.tt) != executablePath
-
-          List.from(urls)
-
-        case _ =>
-          Nil
-
-      val entries: scala.Array[jn.URL | Null] = (url :: bootstrapUrls).stdlib.toArray
+    if urls.nil then threadContextClassloader else
+      val entries: scala.Array[jn.URL | Null] = urls.stdlib.toArray
       new Classloader(jn.URLClassLoader(entries, threadContextClassloader.java))
   catch case _: Throwable => threadContextClassloader
 
@@ -666,14 +636,9 @@ private def launchServer[result]()(using Stdio, System, Monitor)(body: Duplex =>
   safely(System.properties.ethereal.script[Text]()).lay(Unset): executable =>
     val before: List[Text] = socketPaths(socketDirectory)
 
-    // `ProcessBuilder` rather than guillotine's `fork`: this child must be fully DETACHED, with
-    // its streams discarded, and guillotine's job API has no redirection control — a forked child
-    // inherits pipes that nobody drains, and a server writing to stdout would eventually block.
-    val builder = jl.ProcessBuilder(executable.s, "serve-socket")
-    builder.redirectOutput(jl.ProcessBuilder.Redirect.DISCARD)
-    builder.redirectError(jl.ProcessBuilder.Redirect.DISCARD)
-    builder.redirectInput(ji.File("/dev/null"))
-    safely(builder.start())
+    // Detached, its streams discarded (`Processes.detach`): a forked child would inherit pipes
+    // that nobody drains, and a server writing to stdout would eventually block.
+    Processes.detach(List(executable, t"serve-socket"))
 
     var result: Optional[result] = Unset
     var waited: Int              = 0
@@ -852,7 +817,8 @@ private def converse
       frontend.run(interface.interface)(interface.handle)
       engine.close()
 
-      interface.failure.lay(Exit.Ok): (message: Text) => Exit.Fail(10)
+      // `32`: a tool's own statuses are numbered from 32, so that none collides with Pyrocosm's.
+      interface.failure.lay(Exit.Ok): (message: Text) => Exit.Fail(32)
 
 // The `--basic` mode's rendering of a reply: captured output, the `name = value : type` line and
 // the diagnostics, as text the terminal wraps itself.

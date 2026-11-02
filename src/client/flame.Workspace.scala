@@ -35,6 +35,7 @@ package flame
 import soundness.*
 
 import filesystemBackends.javaBaseFilesystem
+import pyrocosm.Tool
 
 // The per-project configuration: a `.pyrocosm/flame/config.tel` file in the invocation's working
 // directory or the nearest ancestor holding one — resolved upwards exactly like `.git` (and exactly
@@ -108,22 +109,18 @@ object Workspace:
   // file (`<root>/.pyrocosm/flame/config.tel`) — since the REPL server that `/classload`s them is a
   // background daemon with a working directory of its own.
   def config(directory: Text): Config =
-    Flame.repoFile(directory).let { file => Flame.repoConfig(directory).let((file, _)) }.lay(empty):
-      (file, tel) =>
-        val root: Text = file.parent.let(_.parent).let(_.parent).let(_.encode).or(directory)
+    val project: Tool.Project = Flame.project(directory)
 
-        def atoms(keyword: Text): List[Text] =
-          tel.fields(keyword).to[List].map(_.primaryAtom).filter(_ != t"")
+    project.config.lay(empty): tel =>
+      def atoms(keyword: Text): List[Text] = Tool.atoms(tel, keyword)
+      def absolute(entry: Text): Text = project.resolve(entry).encode
 
-        def absolute(entry: Text): Text =
-          if entry.starts(t"/") then entry else t"$root/$entry"
-
-        Config
-          ( sets      = atoms(t"set"),
-            languages = atoms(t"language"),
-            classpath = atoms(t"classpath").map(absolute),
-            port      = atoms(t"port").head.let { (text: Text) => safely(text.as[Int]) },
-            host      = atoms(t"host").head,
-            join      = atoms(t"join").head,
-            create    = atoms(t"create").head,
-            history   = atoms(t"history").head.let { (text: Text) => safely(text.as[Int]) } )
+      Config
+        ( sets      = atoms(t"set"),
+          languages = atoms(t"language"),
+          classpath = atoms(t"classpath").map(absolute),
+          port      = atoms(t"port").head.let { (text: Text) => safely(text.as[Int]) },
+          host      = atoms(t"host").head,
+          join      = atoms(t"join").head,
+          create    = atoms(t"create").head,
+          history   = atoms(t"history").head.let { (text: Text) => safely(text.as[Int]) } )

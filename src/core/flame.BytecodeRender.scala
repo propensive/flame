@@ -53,11 +53,11 @@ object BytecodeRender:
   // subdued like a comment, and the stack-frame outline in the faint gutter grey.
   private given palette: BytecodePalette = new Palette:
     type Form = Srgb
-    def background: Color in Srgb = srgb(0x000000)
-    def foreground: Color in Srgb = srgb(0xd4be98)
-    def bytecode:   Color in Srgb = srgb(0xffcc99)
-    def sourceCode: Color in Srgb = srgb(0x928374)
-    def outline:    Color in Srgb = srgb(0x5a524c)
+    def background: Color in Srgb = srgb(FlameColours.background)
+    def foreground: Color in Srgb = srgb(FlameColours.foreground)
+    def bytecode:   Color in Srgb = srgb(FlameColours.term)
+    def sourceCode: Color in Srgb = srgb(FlameColours.comment)
+    def outline:    Color in Srgb = srgb(FlameColours.subdued)
 
   // Method names that are compiler scaffolding, never the user's code: the constructors and the
   // `writeReplace` the wrapper object gets for serialization. Filtered out so the listing shows

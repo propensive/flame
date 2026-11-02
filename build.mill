@@ -173,6 +173,7 @@ object settings:
   . map(component(soundness))
 
   def pyrocosmCoreDeps(pyrocosm: String) = Seq(
+    mvn"dev.propensive:pyrocosm-system:$pyrocosm",
     mvn"dev.propensive:pyrocosm-model:$pyrocosm",
     mvn"dev.propensive:pyrocosm-compiler:$pyrocosm",
     mvn"dev.propensive:pyrocosm-media:$pyrocosm")
@@ -374,7 +375,8 @@ object flame extends Project:
   // .pyrocosm/fume/config.tel) discovers it. `flame.runTests` is the plain-`java` fallback the shared CI
   // workflow uses, driving `Tests.invoke` in-process.
   object test extends Component(core):
-    def mvnDeps = Task(settings.testDeps(deps.soundness()))
+    def mvnDeps = Task:
+      settings.testDeps(deps.soundness()) ++ Seq(mvn"dev.propensive:pyrocosm-harness:${deps.pyrocosm()}")
     def scalacPluginMvnDeps = Task(Seq(mvn"dev.propensive:beneficence-plugin:${deps.soundness()}"))
     def finalMainClass = "flame.runTests"
 

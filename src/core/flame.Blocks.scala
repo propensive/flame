@@ -54,18 +54,7 @@ import vacuous.*
 object Blocks:
   // The model's accents are harlequin's, which the wire's accent names spell in lower case.
   def token(token: Repl.Token): Token =
-    val accent: Token.Accent = token.accent.s match
-      case "keyword"  => Token.Accent.Keyword
-      case "modifier" => Token.Accent.Modifier
-      case "typal"    => Token.Accent.Typal
-      case "string"   => Token.Accent.String
-      case "number"   => Token.Accent.Number
-      case "symbol"   => Token.Accent.Symbol
-      case "parens"   => Token.Accent.Parens
-      case "error"    => Token.Accent.Error
-      case "unparsed" => Token.Accent.Unparsed
-      case "command"  => Token.Accent.Command
-      case _          => Token.Accent.Term
+    val accent: Token.Accent = Token.Accent.parse(token.accent)
 
     val role: Optional[Token.Role] = token.role.let: (role: Text) =>
       if role == t"binding" then Token.Role.Binding else Token.Role.Usage

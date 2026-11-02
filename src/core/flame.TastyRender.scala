@@ -50,18 +50,18 @@ object TastyRender:
   // column and the italic parameter tag.
   private given palette: TastyPalette = new Palette:
     type Form = Srgb
-    def background:     Color in Srgb = srgb(0x000000)
-    def foreground:     Color in Srgb = srgb(0xd4be98)
-    def typeDefinition: Color in Srgb = srgb(0x00cc99)
-    def termDefinition: Color in Srgb = srgb(0xffcc99)
+    def background:     Color in Srgb = srgb(FlameColours.background)
+    def foreground:     Color in Srgb = srgb(FlameColours.foreground)
+    def typeDefinition: Color in Srgb = srgb(FlameColours.tpe)
+    def termDefinition: Color in Srgb = srgb(FlameColours.term)
     def typeReference:  Color in Srgb = srgb(0x4ec9b0)
-    def termReference:  Color in Srgb = srgb(0xd4be98)
-    def flagOn:         Color in Srgb = srgb(0x00cc99)
-    def flagOff:        Color in Srgb = srgb(0x5a524c)
-    def propertyOn:     Color in Srgb = srgb(0xff6633)
-    def propertyOff:    Color in Srgb = srgb(0x5a524c)
-    def outline:        Color in Srgb = srgb(0x928374)
-    def accented:       Color in Srgb = srgb(0xff6633)
+    def termReference:  Color in Srgb = srgb(FlameColours.foreground)
+    def flagOn:         Color in Srgb = srgb(FlameColours.tpe)
+    def flagOff:        Color in Srgb = srgb(FlameColours.subdued)
+    def propertyOn:     Color in Srgb = srgb(FlameColours.keyword)
+    def propertyOff:    Color in Srgb = srgb(FlameColours.subdued)
+    def outline:        Color in Srgb = srgb(FlameColours.comment)
+    def accented:       Color in Srgb = srgb(FlameColours.keyword)
 
   // The tree's `Teletypeable` (hyperbole's top-level `tastyTreeTeletypeable` given) renders the
   // escritoire table; `render(termcap)` flattens the styled `Teletype` to truecolor ANSI text —
