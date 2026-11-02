@@ -1153,6 +1153,19 @@ object Repl:
     case Reply.Advising(id)                      => id
     case Reply.Advised(id, _, _, _)              => id
 
+  // The id a request's reply must echo, so that a failure to answer it can still be reported
+  // against the right entry (`Sessions#converse`).
+  def requestId(request: Request): Int = request match
+    case Request.Submit(id, _)      => id
+    case Request.Tokenize(id, _)    => id
+    case Request.Complete(id, _, _) => id
+    case Request.Quit(id)           => id
+    case Request.Session(id, _)     => id
+    case Request.Join(id, _)        => id
+    case Request.Create(id, _)      => id
+    case Request.SessionList(id)    => id
+    case Request.Context(id, _, _)  => id
+
   object messages:
     def session(name: Text): Text = t"Session $name"
 
@@ -1695,15 +1708,41 @@ class Repl[version <: Scalac.Versions]
   // JARs or directories added with `/classload`. It is a `URLClassLoader` SUBCLASS so `/classload`
   // can append a URL through the protected `addURL` directly — no reflection and no `--add-opens`,
   // and, crucially, the SAME loader instance keeps every already-loaded wrapper (and its session
-  // state) intact while making the new classes visible. The `findClass`-first `loadClass` mirrors
-  // hellenism's own delegating loader, so a freshly-compiled wrapper outranks a same-named class on
-  // the parent.
+  // state) intact while making the new classes visible.
+  //
+  // Delegation is child-first ONLY for what this session compiled — a class whose file is in
+  // `out` — so a freshly-compiled wrapper outranks a same-named class on the parent; everything
+  // else is parent-first, the JDK's own order, which then falls through to the `/classload`
+  // entries for a class the parent cannot see. That mirrors the compile classpath's policy
+  // (`classpath`, below: the base classpath first, an added entry only supplements it), and it
+  // matters: a `/classload`ed fat jar re-bundling the scala library or Soundness would otherwise
+  // DEFINE second copies of classes the parent had already resolved for earlier lines, and the
+  // JVM refuses the mix with `LinkageError: loader constraint violation`. `findLoadedClass` is
+  // consulted first, under the class-loading lock, as hellenism's delegating loader does:
+  // without it a second request for a class already defined here reaches `defineClass` again.
+  // The loader is not registered parallel-capable (`registerAsParallelCapable` registers its
+  // CALLER, which from Scala would be the companion), so the lock is the loader itself — what the
+  // default `loadClass` locks on too.
   private def outUrl = Classpath.Entry.Directory(out.encode).javaUrl
 
   private class ReplLoader(parent: ClassLoader)
   extends jn.URLClassLoader(scala.Array[jn.URL | Null](outUrl), parent):
+    // Whether this session compiled `name`: its classfile is in `out`. Nested, anonymous and
+    // lambda classes are `$`-mangled flat files there too, so one test covers all a line yields.
+    private def compiledHere(name: String): Boolean =
+      ji.File(out.encode.s, name.replace('.', '/').nn+".class").isFile
+
     override def loadClass(name: String | Null, resolve: Boolean): Class[?] | Null =
-      try findClass(name) catch case _: ClassNotFoundException => super.loadClass(name, resolve)
+      getClassLoadingLock(name).nn.synchronized:
+        val loaded: Class[?] | Null = findLoadedClass(name)
+
+        if loaded != null then
+          if resolve then resolveClass(loaded)
+          loaded
+        else if compiledHere(name.nn) then
+          findClass(name)
+        else
+          super.loadClass(name, resolve)
 
     def append(url: jn.URL): Unit = addURL(url)
 
@@ -3500,27 +3539,40 @@ class Repl[version <: Scalac.Versions]
         highlighter.let(_.join())
         highlighted.value.or(Repl.tokenize(code))
 
-    val unprocessed = Repl.Reply.Failed(id, t"the input could not be processed")
+    // Whatever escaped the compile or the run that `safely` (which catches only `Exception`s) and
+    // the run's own guards did not — a `StackOverflowError` in scalac, say — so that the fallback
+    // reply can name it: a submission must ALWAYS be answered, under its own id, or the front-end's
+    // entry for it stays pending forever and, over the socket, the client never settles.
+    val failure: Repl.Cell[Optional[Throwable]] = Repl.Cell(Unset)
+
+    def unprocessed: Repl.Reply.Failed =
+      val reason: Text = failure.value.lay(t""): error => t": ${error.toString.tt}"
+      Repl.Reply.Failed(id, t"the input could not be processed$reason")
 
     // Compile under the mutex (counted as pending, so completions stand aside); run the deferred
     // load off it.
     val advice: Repl.Cell[Optional[() -> List[Notice]]] = Repl.Cell(Unset)
 
-    val outcome: Optional[Outcome] = safely:
-      val built: Built^{onOutput} =
-        pendingSubmissions.incrementAndGet()
+    val outcome: Optional[Outcome] =
+      try
+        safely:
+          val built: Built^{onOutput} =
+            pendingSubmissions.incrementAndGet()
 
-        try
-          mutex:
-            val built = build(code, onOutput)
-            advice.value = pendingAdvice
-            pendingAdvice = Unset
-            built
-        finally pendingSubmissions.decrementAndGet()
+            try
+              mutex:
+                val built = build(code, onOutput)
+                advice.value = pendingAdvice
+                pendingAdvice = Unset
+                built
+            finally pendingSubmissions.decrementAndGet()
 
-      built match
-        case Built.Complete(result) => result
-        case Built.Deferred(run)    => run()
+          built match
+            case Built.Complete(result) => result
+            case Built.Deferred(run)    => run()
+      catch case error: Throwable =>
+        failure.value = error
+        Unset
 
     // Under `Exhibit`, the reply carries the result as blocks (the value from its exhibit, the
     // output by stream, the diagnostics, a stack trace) and the text fields stay empty; under
@@ -3544,7 +3596,10 @@ class Repl[version <: Scalac.Versions]
     def diagnosticsText(notices: List[Notice]): Text =
       if exhibiting then t"" else renderDiagnostics(notices)
 
-    outcome.lay(unprocessed):
+    // Rendering the outcome resolves classes through `loader` (the stack trace, the semantic
+    // reifier) and decodes the exhibited value, any of which may throw an `Error` no guard above
+    // sees; the reply then says so rather than never arriving.
+    try outcome.lay(unprocessed):
       case Outcome.Ran(notices, value, output, name, tpe) =>
         // `evaluate` has already chosen the binding name/type and suppressed the value of a bare
         // `Unit` EXPRESSION (a `Unit` `val`/`var` definition keeps its binding, so it still shows).
@@ -3612,3 +3667,6 @@ class Repl[version <: Scalac.Versions]
       case Outcome.Crashed(notices, _) =>
         val blocks: Text = Blocks.encode(noticeBlocks(notices))
         Repl.Reply.Crashed(id, diagnosticsText(notices), tokens, blocks)
+
+    catch case error: Throwable =>
+      Repl.Reply.Failed(id, t"the result could not be rendered: ${error.toString.tt}")

@@ -263,9 +263,12 @@ class Sessions[version <: Scalac.Versions]
                 Repl.streamChunks(chunk).each: (stream, text) =>
                   push(Repl.Reply.Output(id, text, stream))
 
+              // `safely` catches only `Exception`s; an `Error` must not leave the entry pending.
               val reply: Repl.Reply =
-                safely(repl.react(id, code, output, advice))
-                . or(Repl.Reply.Failed(id, t"the submission could not be processed"))
+                try
+                  safely(repl.react(id, code, output, advice))
+                  . or(Repl.Reply.Failed(id, t"the submission could not be processed"))
+                catch case error: Throwable => Repl.Reply.Failed(id, error.toString.tt)
 
               push(reply)
 
@@ -344,12 +347,15 @@ class Sessions[version <: Scalac.Versions]
         val message: Data = requests.next()
 
         async:
+          // Decoded before it is answered, so that a failure to answer carries the request's own
+          // id: the client settles only the entries it has pending, and 0 is never one of them.
+          val request: Optional[Repl.Request] = safely(Bintel.read[Repl.Request](message))
+
           val response: Optional[Repl.Reply] =
-            try
-              safely(Bintel.read[Repl.Request](message))
-              . lay(Repl.Reply.Failed(0, t"the request could not be parsed")): request =>
-                  connection.respond(request)
-            catch case error: Throwable => Repl.Reply.Failed(0, error.toString.tt)
+            request.lay(Repl.Reply.Failed(0, t"the request could not be parsed")): request =>
+              try connection.respond(request)
+              catch case error: Throwable =>
+                Repl.Reply.Failed(Repl.requestId(request), error.toString.tt)
 
           response.let: reply => send(encode(reply))
     catch case _: Throwable => ()
