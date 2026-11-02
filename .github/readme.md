@@ -30,11 +30,13 @@ compile, where merely being in scope cost each line a search for it.
 ## The standard command line
 
 Flame is a [Pyrocosm](https://github.com/propensive/pyrocosm) tool, so it shares the command line
-every Pyrocosm tool has, alongside its own `serve` and `listen`:
+every Pyrocosm tool has, alongside its own `listen`:
 
 ```sh
 flame about       # flame's version, its executable, the daemon's pid and uptime, and its config files
 flame install     # install shell tab-completions and the manpage (--force overwrites the manpage)
+flame serve       # serve the web REPL from the daemon, in the background, at http://localhost:8090/flame/
+flame serve stop  # stop serving it
 flame quit        # stop the background daemon, and the web REPL if it is serving one
 flame --version   # (or -v) just the version
 ```
@@ -64,7 +66,7 @@ serve
   depends on `org.scala-lang:scala3-compiler_3` in addition to its Soundness components.
 - **`web`** — an alternative web front-end (`flame.web`), driving the same `core` engine.
 - **`client`** — the interactive front-end library: `flame.Client.run` and its command dispatch.
-  `flame serve <port>` runs a REPL server; bare `flame` (over a per-process UNIX socket) connects.
+  `flame listen <port>` runs a REPL server; bare `flame` (over a per-process UNIX socket) connects.
 - **`launcher`** — the invocation point, alone in its own module: just
   `@main def repl = externalize(Client.run())`. It depends on `client`/`core`/`web` as **published
   coordinates** (resolved from `~/.ivy2/local`), so Burdock's `externalize` records their jar
