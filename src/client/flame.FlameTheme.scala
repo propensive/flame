@@ -38,6 +38,8 @@ import pyrocosm.{TerminalTheme, Token, Tone}
 // Flame's terminal theme: the Zed colours the REPL has always used (see `FlameColours`),
 // mapped onto Pyrocosm's vocabulary.
 object FlameTheme extends TerminalTheme:
+  // The editor's black ground, which a subdued colour fades toward.
+  def background: Chroma = Chroma(FlameColours.background)
   def foreground: Chroma = Chroma(FlameColours.foreground)
   def muted: Chroma = Chroma(FlameColours.subdued)
   def key: Chroma = Chroma(FlameColours.parameter)

@@ -74,6 +74,7 @@ import prepositional.*
 // Named imports only: a wildcard would make `Text is Tel.Decodable` ambiguous with the anchor
 // above.
 import pyrocosm.Block
+import pyrocosm.Diversions
 import rudiments.*
 import symbolism.*
 import denominative.dysasymptotics.linearSize
@@ -130,48 +131,6 @@ object Repl:
     case Threw(notices: List[Notice], error: Throwable, output: Text)
     case Rejected(notices: List[Notice])
     case Crashed(notices: List[Notice], error: StackTrace)
-
-  // Process-wide capture of Java-side `System.out` AND `System.err`. Each is a single global, so
-  // with concurrent runs (async mode runs each line off the compiler mutex) we cannot redirect and
-  // restore them per run — two overlapping runs would clobber each other's saved stream. Instead
-  // ONE dispatcher is installed for each (lazily, once for the whole JVM) that routes every write
-  // to the running thread's current capture stream — set by `capture` around a run — falling back
-  // to the real stream for threads with none. Scala-side `println`/`Console.err` are already
-  // thread-local via `Console.withOut`/`withErr`, so this covers Java prints and anything else
-  // writing to the `System` streams (the ambient `Stdio` of `ReplStdio` resolves them at each
-  // write).
-  object CapturedOut:
-    private val currentOut: ThreadLocal[ji.OutputStream] = ThreadLocal()
-    private val currentErr: ThreadLocal[ji.OutputStream] = ThreadLocal()
-
-    private def dispatcher(current: ThreadLocal[ji.OutputStream], real: ji.OutputStream)
-    :   ji.OutputStream =
-
-      new ji.OutputStream:
-        private def target: ji.OutputStream = Optional(current.get).or(real)
-        def write(byte: Int): Unit = target.write(byte)
-
-        override def write(bytes: scala.Array[Byte] | Null, off: Int, len: Int): Unit =
-          target.write(bytes, off, len)
-
-        override def flush(): Unit = target.flush()
-
-    private lazy val installed: Unit =
-      jl.System.setOut(ji.PrintStream(dispatcher(currentOut, jl.System.out.nn), true, "UTF-8"))
-      jl.System.setErr(ji.PrintStream(dispatcher(currentErr, jl.System.err.nn), true, "UTF-8"))
-
-    // Routes this thread's Java-side `System.out`/`System.err` to `out`/`err` for the duration of
-    // `body`, then restores whatever they were before (nested captures are honoured).
-    def capture[result](out: ji.OutputStream, err: ji.OutputStream)(body: => result): result =
-      installed
-      val previousOut: ji.OutputStream | Null = currentOut.get
-      val previousErr: ji.OutputStream | Null = currentErr.get
-      currentOut.set(out)
-      currentErr.set(err)
-
-      try body finally
-        currentOut.set(previousOut)
-        currentErr.set(previousErr)
 
   // Captured stdout and stderr are kept IN ORDER, as they interleaved, and travel through an
   // `Outcome`'s `output` tagged in-band: each captured run is bracketed by a private-use marker
@@ -2702,7 +2661,7 @@ class Repl[version <: Scalac.Versions]
         Built.Deferred: () =>
           // Capture whatever the user's code prints to stdout. Scala's `println` writes to
           // `scala.Console.out` (a thread-local, set by `withOut`), while Java code writes to the
-          // process-global `System.out` (routed to this thread by `CapturedOut.capture`). Both
+          // process-global `System.out` (routed to this thread by `Diversions.threaded`). Both
           // land in `captured`, which also TEES to `onOutput`: on each flush (an auto-flushing
           // `PrintStream` flushes after every write/`println`) the newly-captured bytes are decoded
           // and handed to the sink, so async mode can stream stdout as it appears. The full text is
@@ -2769,7 +2728,7 @@ class Repl[version <: Scalac.Versions]
               case _                             => termcapDefinitions.xterm256Termcap
 
             ReplStdio.withTermcap(termcap):
-              Repl.CapturedOut.capture(out, err):
+              Diversions.threaded(out, err):
                 scala.Console.withOut(out)(scala.Console.withErr(err)(loader.on(t"$name$$")))
 
             Outcome.Ran(notices, rendered, output)
