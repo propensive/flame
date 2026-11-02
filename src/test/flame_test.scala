@@ -683,6 +683,54 @@ object Tests extends Suite(m"Flame Tests"):
           case Repl.Outcome.Ran(_, _, output, _, _) => output.contains(t"/usr")
           case _                                    => false
 
+      // The jar this suite runs from — the test assembly — re-bundles the scala library, Soundness
+      // and flame itself, so `/classload`ing it duplicates the whole base classpath. A line is run
+      // BEFORE the classload so that the parent has already resolved classes for this session's
+      // loader; a later line must still take its classes from the parent, not from the jar, or
+      // the JVM rejects the mix as a loader constraint violation (`ReplLoader`).
+      def duplicateJar: Text =
+        val location = classOf[Repl[?]].getProtectionDomain.nn.getCodeSource.nn.getLocation.nn
+        java.io.File(location.toURI).getPath.nn.tt
+
+      test(m"/classload of a jar duplicating the base classpath does not break later lines"):
+        isolated:
+          val repl = Opened(Repl())
+          repl.interpret(t"1 + 1")
+          repl.interpret(t"/classload $duplicateJar")
+          repl.interpret(t"List(1, 2, 3).map(_ + 1)")
+
+      . assert:
+          case Repl.Outcome.Ran(_, value, _, _, _) => value.or(t"").contains(t"2, 3, 4")
+          case _                                   => false
+
+      test(m"a class a /classload'ed jar duplicates still comes from the base classpath"):
+        isolated:
+          val repl = Opened(Repl())
+          repl.interpret(t"/classload $duplicateJar")
+          repl.interpret(t"classOf[Function1[?, ?]].getClassLoader.toString")
+
+      . assert:
+          case Repl.Outcome.Ran(_, value, _, _, _) => !value.or(t"").contains(t"ReplLoader")
+          case _                                   => false
+
+      test(m"a redefined object still shadows its predecessor after a /classload"):
+        isolated:
+          val repl = Opened(Repl())
+          repl.interpret(t"/classload $duplicateJar")
+          repl.interpret(t"object Foo { def x = 1 }")
+          repl.interpret(t"Foo.x")
+          repl.interpret(t"object Foo { def x = 2 }")
+          repl.interpret(t"Foo.x")
+
+      . assert:
+          case Repl.Outcome.Ran(_, value, _, _, _) => value.or(t"").contains(t"2")
+          case _                                   => false
+
+      test(m"a request's id is the one its reply must echo"):
+        Repl.requestId(Repl.Request.Submit(7, t"1"))
+
+      . assert(_ == 7)
+
       // Whole-line `/classload <path>` candidates, at least one of them a directory (e.g. /usr/ or
       // /bin/).
       test(m"/classload tab-completion lists filesystem entries as whole-line candidates"):

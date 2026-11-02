@@ -150,16 +150,28 @@ class LocalEngine(sessions: Sessions[3.9])(using Monitor, System, Probate) exten
   // Answered on a task of its own, as the socket server answers each request, so a keystroke's
   // handler returns as soon as it has asked: a `Tokenize` may typecheck for the scope row, which
   // must not hold up the WebSocket thread, nor the keystrokes behind it.
+  //
+  // `respond` may throw an `Error` that `react`'s own guards miss; answered as a `Failed` under the
+  // same id, or the callback would never be claimed and the page's entry never settle.
   def request(request: Int => Repl.Request)(reply: Repl.Reply => Unit): Unit =
     val id = nextId.ere(_ + 1)
     callbacks.revise(_.define(id, caps.unsafe.unsafeAssumePure(reply)))
     val message: Repl.Request = request(id)
-    async(connection.respond(message).let(deliver))
+
+    async:
+      try connection.respond(message).let(deliver)
+      catch case error: Throwable => deliver(Repl.Reply.Failed(id, error.toString.tt))
+
     ()
 
   def send(request: Int => Repl.Request): Unit =
-    val message: Repl.Request = request(nextId.ere(_ + 1))
-    async(connection.respond(message))
+    val id = nextId.ere(_ + 1)
+    val message: Repl.Request = request(id)
+
+    async:
+      try connection.respond(message)
+      catch case error: Throwable => sink(Repl.Reply.Failed(id, error.toString.tt))
+
     ()
 
   def pushed(sink: Repl.Reply => Unit): Unit = this.sink = caps.unsafe.unsafeAssumePure(sink)
