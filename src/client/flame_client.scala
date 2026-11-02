@@ -572,7 +572,7 @@ private def serverClassloader(using System): Classloader =
   // The entries the process was loaded from, the executable's `.jar` link first (`Runtimes`),
   // as URLs; a non-URL launcher, or no executable, falls back to the thread-context loader.
   try
-    val urls: List[jn.URL] = Runtimes.classpath().map: entry => ji.File(entry.s).toURI.nn.toURL.nn
+    val urls: List[jn.URL] = Runtimes.compilable().map: entry => ji.File(entry.s).toURI.nn.toURL.nn
 
     if urls.nil then threadContextClassloader else
       val entries: scala.Array[jn.URL | Null] = urls.stdlib.toArray
