@@ -344,9 +344,7 @@ class Sessions[version <: Scalac.Versions]
       // conversation exactly as the end of the stream does.
       val requests = duplex.source.chunks.frames[LengthPrefix]
 
-      while requests.hasNext do
-        val message: Data = requests.next()
-
+      requests.each: (message: Data) =>
         async:
           // Decoded before it is answered, so that a failure to answer carries the request's own
           // id: the client settles only the entries it has pending, and 0 is never one of them.

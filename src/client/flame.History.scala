@@ -59,8 +59,8 @@ object History:
         safely:
           val frames = Iterator(path.read[Data]).frames[LengthPrefix]
 
-          while frames.hasNext do
-            safely(Bintel.read[Repl.HistoryEntry](frames.next())).let: entry =>
+          frames.each: (frame: Data) =>
+            safely(Bintel.read[Repl.HistoryEntry](frame)).let: entry =>
               entries = entry.line :: entries
 
         entries.reverse
