@@ -137,6 +137,7 @@ class LocalEngine(sessions: Sessions[3.9])(using Monitor, System, Probate) exten
     case Repl.Reply.Warming(_, _, _)    => sink(reply)
     case Repl.Reply.Advising(_)         => sink(reply)
     case Repl.Reply.Advised(_, _, _, _) => sink(reply)
+    case Repl.Reply.Diagnosing(_)       => sink(reply)
 
     case _ =>
       val id = Repl.replyId(reply)

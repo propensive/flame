@@ -238,8 +238,9 @@ class Sessions[version <: Scalac.Versions]
 
           ReplContext.set(repl.session, ReplContext.Values(directory, variables))
 
-    // Where a submission's advice goes, if it is to follow the reply at all.
-    private val advice: Optional[Repl.Reply -> Unit] = if frontend then push else Unset
+    // Where what a submission pushes ahead of its reply (`Diagnosing`) and after it (its advice)
+    // goes, if anywhere.
+    private val pushes: Optional[Repl.Reply -> Unit] = if frontend then push else Unset
 
     def respond(request: Repl.Request): Optional[Repl.Reply] logs CompileEvent = request match
       case Repl.Request.Tokenize(id, code) =>
@@ -254,7 +255,7 @@ class Sessions[version <: Scalac.Versions]
 
       case Repl.Request.Submit(id, code) =>
         session(currentName).lay(Repl.Reply.Failed(id, t"no active session")): repl =>
-          if !repl.asyncEnabled then repl.react(id, code, onAdvice = advice)
+          if !repl.asyncEnabled then repl.react(id, code, onPush = pushes)
           else
             push(Repl.Reply.Pending(id))
 
@@ -266,7 +267,7 @@ class Sessions[version <: Scalac.Versions]
               // `safely` catches only `Exception`s; an `Error` must not leave the entry pending.
               val reply: Repl.Reply =
                 try
-                  safely(repl.react(id, code, output, advice))
+                  safely(repl.react(id, code, output, pushes))
                   . or(Repl.Reply.Failed(id, t"the submission could not be processed"))
                 catch case error: Throwable => Repl.Reply.Failed(id, error.toString.tt)
 

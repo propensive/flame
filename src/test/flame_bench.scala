@@ -93,10 +93,14 @@ def firstLine(args: String*): Unit =
         t"Point(1, 2)",
         t"def twice(n: Int): Int = n*2",
         t"val wrong: Int = \"text\"",
+        t"undefinedName.size",
+        t"val bad: Int = undefinedName",
+        t"def bad: Int = undefinedName",
         t"sys.error(\"thrown\")",
         t"/set experimental",
         t"import soundness.*",
-        t"t\"hello\"" )
+        t"t\"hello\"",
+        t"summon[rudiments.DecimalConverter]" )
 
   val probes: List[Text] = option("--probes").lay(builtin): file =>
     val text: String = java.nio.file.Files.readString(java.nio.file.Path.of(file)).nn
