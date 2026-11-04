@@ -458,6 +458,10 @@ object Repl:
     // The follow-up to `Advising`: the submission's diagnostics again, in the shape of `Rejected`,
     // now with Soundness's advice on the missing given (or as they were, if there was none).
     case Advised(id: Int, diagnostics: Text, highlight: List[Token], blocks: Text = t"")
+    // Pushed as soon as a submission is known to have failed to compile, before its diagnostics
+    // are rendered (which, for a type mismatch, may take a while): the reply is a rejection, and
+    // is on its way. Carries the submission's `id`.
+    case Diagnosing(id: Int)
 
   // Pure anchors for the top-level wire enums, on the same footing as the leaf codecs above, so
   // `Bintel.read[Request]`/`[Reply]` (whose context bound requires a pure instance) resolves.
@@ -1111,6 +1115,7 @@ object Repl:
     case Reply.Warming(id, _, _)                 => id
     case Reply.Advising(id)                      => id
     case Reply.Advised(id, _, _, _)              => id
+    case Reply.Diagnosing(id)                    => id
 
   // The id a request's reply must echo, so that a failure to answer it can still be reported
   // against the right entry (`Sessions#converse`).
@@ -2572,10 +2577,46 @@ class Repl[version <: Scalac.Versions]
   // by every implicit search that fails, in lines that compile as in those that do not. So no
   // line is compiled with it (see `Repl.unadvised`), and a line that fails for want of a given
   // is compiled a SECOND time with it: by a compiler of its own, off the session's mutex, so the
-  // session is free meanwhile. `compile` leaves here how to do that, for `react` to pick up
-  // under the same hold of the mutex.
+  // session is free meanwhile. `compile` leaves here the search for that advice, for `react` to
+  // pick up under the same hold of the mutex. Under `react` (`seekAdvice`) the search starts the
+  // moment the first compile of the line shows the need, so it runs alongside whatever the line
+  // compiles next (the statement fallback of a rejected expression) and the rendering of its
+  // diagnostics; any other caller leaves it unstarted, so it costs nothing unless it is wanted.
   @scala.caps.unsafe.untrackedCaptures
-  private var pendingAdvice: Optional[() -> List[Notice]] = Unset
+  private var pendingAdvice: Optional[Seeking] = Unset
+
+  @volatile
+  @scala.caps.unsafe.untrackedCaptures
+  private var seekAdvice: Boolean = false
+
+  // A search for advice (see `seek`), started on demand — at most once — and then awaited, or
+  // handed on to a sink, from any thread.
+  private final class Seeking(advice: () -> List[Notice]):
+    private val found: Repl.Cell[Optional[List[Notice]]] = Repl.Cell(Unset)
+
+    @scala.caps.unsafe.untrackedCaptures
+    private var thread: Optional[Thread] = Unset
+
+    def start(): Thread = synchronized:
+      thread.or:
+        val started: Thread = seek(advice)(found.value = _)
+        thread = started
+        started
+
+    // What the search found, once it has ended: the advised notices, or `Unset`.
+    def await(): Optional[List[Notice]] =
+      start().join()
+      found.value
+
+    // Hands what the search finds to `sink`, from a thread of its own, without waiting for it.
+    def deliver(sink: Optional[List[Notice]] => Unit): Unit =
+      val runnable: Runnable = caps.unsafe.unsafeAssumePure: () =>
+        val result: Optional[List[Notice]] = try await() catch case _: Throwable => Unset
+        safely(sink(result))
+
+      val created = Thread(null, runnable, "flame-advised", Warm.stackSize)
+      created.setDaemon(true)
+      created.start()
 
   // The notices of `source` compiled with the advice, cold, into a directory nothing reads.
   private def advise
@@ -2625,17 +2666,24 @@ class Repl[version <: Scalac.Versions]
     val (outcome, raw) = warmCompile(Map(t"$name.scala" -> source))
 
     // A line that failed for want of a given is worth compiling again WITH the advice (see
-    // `Repl.unadvised`): how to is left for `react`, which decides when.
-    if outcome == CompileResult.Failure && Repl.missingGiven(raw) then
+    // `Repl.unadvised`): under `react`, at once, while the line goes on to be compiled otherwise
+    // and diagnosed; else when (and if) it is wanted. The first compile of the line to need it
+    // starts the search, and a later one (the statement fallback of an expression) keeps it,
+    // since its notices are positioned against the line as typed, either way.
+    if outcome == CompileResult.Failure && Repl.missingGiven(raw) && pendingAdvice.absent then
       val advisedImports: List[Text] = imports.map(Repl.advised)
       val advisedSource: Text = layout.wrap(index, imported, advisedImports, code)
       val scalac: Scalac[version, Universe.Classfile] = effectiveScalac
       val path: LocalClasspath = classpath
       val line: Int = layout.bodyLine(imported, advisedImports)
 
-      pendingAdvice = caps.unsafe.unsafeAssumePure: () =>
+      val search: () -> List[Notice] = caps.unsafe.unsafeAssumePure: () =>
         val advised: List[Notice] = advise(scalac, path, t"$name.scala", advisedSource)
         positioned(advised, t"$name.scala", line, code, origin)
+
+      val seeking: Seeking = Seeking(search)
+      if seekAdvice then seeking.start()
+      pendingAdvice = seeking
 
     // Every notice's span is rewritten into the USER's coordinates (`Repl.userSpan`), or dropped
     // when it lies outside the user's text, so the front-ends can underline it in the submitted
@@ -2982,13 +3030,17 @@ class Repl[version <: Scalac.Versions]
       case (t"val" | t"var", bound: Text) => valDefinition(line, bound, key, context, onOutput)
 
       case (t"def", defName: Text) =>
-        // The signature is computed now (under the mutex, where the compiler is in use); the
-        // run itself produces no output for a `def`.
-        val shown: stenography.Imports = semanticImports
-        val signature: Text = typed(Repl.defSignature(line, defName, context, shown))
+        // The signature is computed under the mutex, where the compiler is in use, but only once
+        // the line has compiled: a line that fails is not typed a second time just to be
+        // rejected. The run itself produces no output for a `def`.
+        compile(contextImports(line), line, onOutput)(Unset) match
+          case deferred @ Built.Deferred(_) =>
+            val shown: stenography.Imports = semanticImports
+            val signature: Text = typed(Repl.defSignature(line, defName, context, shown))
+            mapRan(deferred): ran => ran.copy(output = t"$signature\n")
 
-        mapRan(compile(contextImports(line), line, onOutput)(Unset)):
-          ran => ran.copy(output = t"$signature\n")
+          case complete =>
+            complete
 
       case _ =>
         // The line compiled as a statement; if it introduced imports, remember them now (under
@@ -3099,22 +3151,37 @@ class Repl[version <: Scalac.Versions]
 
     given LocalClasspath = classpath
 
-    val tpe: Optional[Repl.TypeText] =
+    // The type is probed under the mutex, but only once the definition has compiled: a line that
+    // fails is not typed a second time just to be rejected.
+    def tpe: Optional[Repl.TypeText] =
       safely(typed(Repl.resultType(context, t"{ $line\n$bound }"))).let(typeText)
 
     val lazyVal: Boolean =
       line.trim.cut(t" ").keep { word => word != t"val" && word != t"var" }.has(t"lazy")
 
     if lazyVal then
-      mapRan(compile(contextImports(line), line, onOutput)(Unset)):
-        ran => ran.copy(output = t"$bound${tpe.let { each => t": ${each.plain}" }.or(t"")}\n")
+      compile(contextImports(line), line, onOutput)(Unset) match
+        case deferred @ Built.Deferred(_) =>
+          val shown: Text = tpe.let { each => t": ${each.plain}" }.or(t"")
+          mapRan(deferred): ran => ran.copy(output = t"$bound$shown\n")
+
+        case complete =>
+          complete
     else
       val inspectedLines: List[Text] = line :: renderInto(bound, key)
       val inspected: Text = inspectedLines.join(t"\n")
 
-      mapRan(compile(contextImports(line), inspected, onOutput, line):
-          Optional(ReplBridge.fetch[String](session, key.s)).let(_.tt)):
-        ran => ran.copy(name = bound, tpe = tpe)
+      val built: Built^{onOutput} =
+        compile(contextImports(line), inspected, onOutput, line):
+          Optional(ReplBridge.fetch[String](session, key.s)).let(_.tt)
+
+      built match
+        case deferred @ Built.Deferred(_) =>
+          val shown: Optional[Repl.TypeText] = tpe
+          mapRan(deferred): ran => ran.copy(name = bound, tpe = shown)
+
+        case complete =>
+          complete
 
   // The prelude's pickled definitions and binding accessors are recompiled once,
   // as the first object (`rs$line$0`), straight from TASTy — preserving the
@@ -3480,15 +3547,17 @@ class Repl[version <: Scalac.Versions]
   // `onOutput` (async mode) receives each chunk of the run's stdout as it appears, so a front-end
   // can stream it; the chunk is still captured and returned in the reply's `output` as usual.
   //
-  // A line that fails for want of a given is answered with Soundness's advice on it (see
-  // `pendingAdvice`), which takes seconds to find. Without `onAdvice` the reply waits for it;
-  // with it, the reply is the plain rejection at once, preceded by an `Advising` and followed,
-  // when the advice is in, by an `Advised`, both handed to `onAdvice`.
+  // `onPush` receives what is pushed ahead of the reply, or after it. A line that fails to compile
+  // is announced by a `Diagnosing` the moment the failure is known, since rendering its
+  // diagnostics may take a while. A line that fails for want of a given is answered with
+  // Soundness's advice on it (see `pendingAdvice`), which takes seconds to find. Without `onPush`
+  // the reply waits for it; with it, the reply is the plain rejection at once, preceded by an
+  // `Advising` and followed, when the advice is in, by an `Advised`.
   def react
     ( id:       Int,
       code:     Text,
       onOutput: Text => Unit                 = _ => (),
-      onAdvice: Optional[Repl.Reply => Unit] = Unset )
+      onPush:   Optional[Repl.Reply => Unit] = Unset )
     ( using Monitor, System, Probate )
   :   Repl.Reply logs CompileEvent =
 
@@ -3533,7 +3602,7 @@ class Repl[version <: Scalac.Versions]
 
     // Compile under the mutex (counted as pending, so completions stand aside); run the deferred
     // load off it.
-    val advice: Repl.Cell[Optional[() -> List[Notice]]] = Repl.Cell(Unset)
+    val advice: Repl.Cell[Optional[Seeking]] = Repl.Cell(Unset)
 
     val outcome: Optional[Outcome] =
       try
@@ -3543,10 +3612,15 @@ class Repl[version <: Scalac.Versions]
 
             try
               mutex:
-                val built = build(code, onOutput)
-                advice.value = pendingAdvice
-                pendingAdvice = Unset
-                built
+                seekAdvice = true
+
+                try
+                  val built = build(code, onOutput)
+                  advice.value = pendingAdvice
+                  built
+                finally
+                  seekAdvice = false
+                  pendingAdvice = Unset
             finally pendingSubmissions.decrementAndGet()
 
           built match
@@ -3555,6 +3629,16 @@ class Repl[version <: Scalac.Versions]
       catch case error: Throwable =>
         failure.value = error
         Unset
+
+    val push: Optional[Repl.Reply -> Unit] = caps.unsafe.unsafeAssumePure(onPush)
+
+    // The line has failed, which the front-end can show before the diagnostics are ready.
+    outcome match
+      case _: Outcome.Rejected | _: Outcome.Crashed =>
+        push.let { push => safely(push(Repl.Reply.Diagnosing(id))) }
+
+      case _ =>
+        ()
 
     // Under `Exhibit`, the reply carries the result as blocks (the value from its exhibit, the
     // output by stream, the diagnostics, a stack trace) and the text fields stay empty; under
@@ -3611,18 +3695,13 @@ class Repl[version <: Scalac.Versions]
           val blocks: Text = Blocks.encode(noticeBlocks(notices))
           Repl.Reply.Rejected(id, diagnosticsText(notices), Repl.mark(tokens, notices), blocks)
 
-        val advising: Optional[() -> List[Notice]] = advice.value
+        val advising: Optional[Seeking] = advice.value
 
-        advising.lay(rejected(notices)): thunk =>
-          onAdvice.lay
-            ( locally:
-                val found: Repl.Cell[Optional[List[Notice]]] = Repl.Cell(Unset)
-                seek(thunk)(found.value = _).join()
-                rejected(found.value.or(notices)) ): sink =>
-            val push: Repl.Reply -> Unit = caps.unsafe.unsafeAssumePure(sink)
+        advising.lay(rejected(notices)): seeking =>
+          push.lay(rejected(seeking.await().or(notices))): push =>
             safely(push(Repl.Reply.Advising(id)))
 
-            seek(thunk): found =>
+            seeking.deliver: found =>
               val advised: List[Notice] = found.or(notices)
               val blocks: Text = Blocks.encode(noticeBlocks(advised))
               val marked = Repl.mark(tokens, advised)

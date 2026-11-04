@@ -393,7 +393,8 @@ object Tests extends Suite(m"Flame Tests"):
       . assert: diag => diag.contains(t"decimalConverters.javaDecimalConverter")
 
       // With somewhere for the advice to go, the rejection does not wait for it: the plain
-      // rejection is the reply, announced by an `Advising`, and the advice follows as an `Advised`.
+      // rejection is the reply, announced by a `Diagnosing` and an `Advising`, and the advice
+      // follows as an `Advised`.
       test(m"a missing given is rejected at once, its advice following"):
         isolated:
           val repl = Opened(Repl())
@@ -405,7 +406,7 @@ object Tests extends Suite(m"Flame Tests"):
             repl.react
               ( 1,
                 t"summon[rudiments.DecimalConverter]",
-                onAdvice = { reply => lock { pushed = reply :: pushed } } )
+                onPush = { reply => lock { pushed = reply :: pushed } } )
 
           var waited: Int = 0
 
@@ -419,9 +420,56 @@ object Tests extends Suite(m"Flame Tests"):
           (diagnostics(reply), lock(pushed.reverse))
 
       . assert:
-          case (plain, Repl.Reply.Advising(1) :: Repl.Reply.Advised(1, advice, _, _) :: Nil) =>
+          case
+            ( plain,
+              Repl.Reply.Diagnosing(1) :: Repl.Reply.Advising(1) ::
+                Repl.Reply.Advised(1, advice, _, _) :: Nil ) =>
             plain.contains(t"No given instance of type") && !plain.contains(t"resolving") &&
               SemanticRender.stripAnsi(advice).contains(t"resolving")
+
+          case _ =>
+            false
+
+      // A line that fails to compile is announced the moment its failure is known, before its
+      // diagnostics are rendered; a line that compiles pushes nothing.
+      test(m"a rejection is announced by a Diagnosing push, and a success pushes nothing"):
+        isolated:
+          val repl = Opened(Repl())
+          val lock = Mutex()
+          var pushed: List[Repl.Reply] = Nil
+          val sink: Repl.Reply => Unit = reply => lock { pushed = reply :: pushed }
+          val rejected = repl.react(3, t"val wrong: Int = \"text\"", onPush = sink)
+          val afterRejection: List[Repl.Reply] = lock(pushed.reverse)
+          lock { pushed = Nil }
+          val ran = repl.react(4, t"1 + 1", onPush = sink)
+          (rejected, afterRejection, ran, lock(pushed))
+
+      . assert:
+          case (_: Repl.Reply.Rejected, Repl.Reply.Diagnosing(3) :: Nil, _: Repl.Reply.Ran, Nil) =>
+            true
+
+          case _ =>
+            false
+
+      // The type of a `val` and the signature of a `def` are probed only after the line has
+      // compiled, and are still shown; a rejected definition still reports its error.
+      test(m"a val and a def show their type once compiled, and a failing one is rejected"):
+        isolated:
+          val repl = Opened(Repl())
+          val value = repl.react(0, t"val xs = List(1, 2, 3)")
+          val method = repl.react(1, t"def twice(n: Int) = n*2")
+          val badValue = repl.react(2, t"val bad: Int = undefinedName")
+          val badMethod = repl.react(3, t"def bad: Int = undefinedName")
+          (value, method, badValue, badMethod)
+
+      . assert:
+          case
+            ( Repl.Reply.Ran(_, _, _, tpe: Repl.TypeText, name: Text, _, _, _, _),
+              Repl.Reply.Ran(_, _, output, _, _, _, _, _, _),
+              Repl.Reply.Rejected(_, _, _, _),
+              Repl.Reply.Rejected(_, _, _, _) ) =>
+            name == t"xs" && tpe.text.contains(t"List[") &&
+              output.contains(t"twice(n: Int): Int")
 
           case _ =>
             false
@@ -1722,6 +1770,30 @@ object Tests extends Suite(m"Flame Tests"):
           during.head.lay(false)(pendingEntry) && texts(during).contains(t"no given") &&
             !after.head.lay(true)(pendingEntry) && texts(after).contains(t"try this given") &&
             !texts(after).contains(t"no given")
+
+      test(m"a Diagnosing push captions the pending entry's gauge until the reply settles it"):
+        isolated:
+          val (engine, interface) = fresh()
+          interface.handle(Event.Submitted(interface.field.input, t"undefinedName"))
+          val before = interface.transcript()
+          engine.push(Repl.Reply.Diagnosing(1))
+          val during = interface.transcript()
+          engine.answer(1, Repl.Reply.Rejected(1, t"", Nil, blocksOf(t"not found")))
+          (before, during, interface.transcript())
+
+      . assert: (before, during, after) =>
+          def caption(blocks: List[Block]): Text = blocks.head.lay(t""):
+            case Block.Group(content) =>
+              content.last.lay(t""):
+                case Block.Gauge(_, caption) => texts(List(Block.Paragraph(caption.or(Nil))))
+                case _                       => t""
+
+            case _ =>
+              t""
+
+          caption(before) == t"evaluating" && caption(during) == t"diagnosing" &&
+            pendingEntry(during.head.or(Block.Group(Nil))) &&
+            !after.head.lay(true)(pendingEntry) && texts(after).contains(t"not found")
 
       test(m"a trailing blank line is stripped from a submission"):
         isolated:

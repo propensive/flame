@@ -175,6 +175,10 @@ class ReplInterface(engine: Engine, options: ReplInterface.Options)(using Monito
   // `Repl#react`): each stays pending, showing its rejection, until the advice settles it.
   private val advising: Atomic.Ref[List[Int]] = Atomic.Ref(Nil)
 
+  // The entries known to have failed (a `Diagnosing` push) whose diagnostics are still to come:
+  // each keeps its gauge, captioned to say so, until the rejection settles it.
+  private val diagnosing: Atomic.Ref[List[Int]] = Atomic.Ref(Nil)
+
   // The sessions offered for selection, by their action.
   private val choices: Atomic.Ref[Map[Text, Action]] = Atomic.Ref(Map())
 
@@ -267,7 +271,11 @@ class ReplInterface(engine: Engine, options: ReplInterface.Options)(using Monito
 
   private def entry(id: Int): Block =
     val code: Block = codes().at(id).or(Block.Code(Language.Scala, Nil))
-    val gauge: Block = Block.Gauge(pyrocosm.Status.Indeterminate(), Inline.text(t"evaluating"))
+    val caption: List[Inline] =
+      if diagnosing().has(id) then List(Inline.Toned(Tone.Failure, Inline.text(t"diagnosing")))
+      else Inline.text(t"evaluating")
+
+    val gauge: Block = Block.Gauge(pyrocosm.Status.Indeterminate(), caption)
     Block.Group(framed(code) + outputs().at(id).or(Nil) + List(gauge))
 
   private def replace(id: Int, settled: Block): Unit =
@@ -283,6 +291,7 @@ class ReplInterface(engine: Engine, options: ReplInterface.Options)(using Monito
     val code: Block = codes().at(id).or(Block.Code(Language.Scala, Nil))
     replace(id, Block.Group(framed(code) + blocks))
     pending.revise(_.omit(id)); outputs.revise(_.omit(id)); codes.revise(_.omit(id))
+    diagnosing.revise(_.filter(_ != id))
 
   // A reply's content as blocks: those it carries, or, from a server rendering text, its text.
   private def content(reply: Repl.Reply): List[Block] = reply match
@@ -381,6 +390,11 @@ class ReplInterface(engine: Engine, options: ReplInterface.Options)(using Monito
       replace(id, entry(id))
 
     case Repl.Reply.Pending(_) => ()
+
+    case Repl.Reply.Diagnosing(id) =>
+      if pending().defines(id) then
+        diagnosing.revise(id :: _)
+        replace(id, entry(id))
 
     case Repl.Reply.Advising(id) =>
       advising.revise(id :: _)
