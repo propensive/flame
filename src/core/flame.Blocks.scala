@@ -222,6 +222,11 @@ object Blocks:
         List(Inline.Snippet(Language.Scala, tokens))
 
       value match
+        // A command's block (a bytecode listing, a TASTy tree) has no binding and no type: it is
+        // the whole reply, not a result line around it.
+        case block: Block if binding.nil && typed.nil =>
+          List(block)
+
         case block: Block =>
           val before: List[Block] = if binding.nil then Nil else List(Block.Paragraph(binding))
           val after: List[Block] = if typed.nil then Nil else List(Block.Paragraph(typed))

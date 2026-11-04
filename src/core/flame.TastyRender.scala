@@ -37,12 +37,15 @@ import escapade.*, termcapDefinitions.xtermTrueColorTermcap
 import hyperbole.*, hyperbole.tastyTreeTeletypeable
 import iridescence.*
 import prepositional.*
+import pyrocosm.Tasties
 import FlameColours.srgb
 
-// Renders a hyperbole `Tasty.Tree` (the typed AST produced by the `syntax` macro) to a coloured,
-// truecolor-ANSI table, for the REPL's `/tasty` command. Called by name from the generated probe
-// object each `/tasty` line compiles — so it must be plain (non-`@experimental`) and reachable by
-// the fully-qualified name `flame.TastyRender.render`, exactly as the REPL reaches `ReplBridge`.
+// Renders a hyperbole `Tasty.Tree` (the typed AST produced by the `syntax` macro) for the REPL's
+// `/tasty` command: under `Rendering.Exhibit` as Pyrocosm's `Block.Tree` (`blocks`), under
+// `Rendering.Inspect` as a coloured, truecolor-ANSI table (`render`). Both are called by name from
+// the generated probe object each `/tasty` line compiles — so they must be plain
+// (non-`@experimental`) and reachable by the fully-qualified names `flame.TastyRender.render` and
+// `flame.TastyRender.blocks`, exactly as the REPL reaches `ReplBridge`.
 object TastyRender:
   // Colours matched to the CLI's Zed-derived syntax palette (see `flame_client.scala`): a type is
   // teal, a term is peach; definitions are shown at full strength and references a little muted, so
@@ -66,4 +69,9 @@ object TastyRender:
   // The tree's `Teletypeable` (hyperbole's top-level `tastyTreeTeletypeable` given) renders the
   // escritoire table; `render(termcap)` flattens the styled `Teletype` to truecolor ANSI text —
   // which the CLI prints verbatim through the REPL's `output` channel.
-  def render(tree: Tasty.Tree): Text = tree.teletype.render(xtermTrueColorTermcap)
+  def render(tree: Tasty.Tree): Text =
+    Names.wrapper(tree.teletype.render(xtermTrueColorTermcap))
+
+  // The tree as a block, encoded as an exhibit for the bridge (see `ExhibitRender`): the probe
+  // stashes it under the line's key, and the outcome carries it as its value.
+  def blocks(tree: Tasty.Tree): Text = ExhibitRender.encode(Names.block(Tasties.tree(tree)))

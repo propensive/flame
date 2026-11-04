@@ -624,6 +624,27 @@ object Tests extends Suite(m"Flame Tests"):
 
       . assert: diag => diag.contains(t"Foo.Bar.type") && !diag.contains(t"rs$$line$$")
 
+      test(m"the wrapper object renders as a subscripted line, in either spelling"):
+        List(t"rs$$line$$3$$", t"rs$$line$$12.foo", t"rs#line₃#", t"rs#line₃#Foo#", t"rs#line₃# . f()", t"plain")
+        . map(Names.wrapper(_))
+
+      . assert(_ == List(t"line₃", t"line₁₂.foo", t"line₃", t"line₃#Foo#", t"line₃ . f()", t"plain"))
+
+      test(m"a JVM name is demangled by digression's rules, the wrapper by Flame's"):
+        (Names.rewrite(t"foo$$default$$1", true), Names.rewrite(t"rs$$line$$3$$$$anon$$1"))
+
+      . assert(_ == (t"fooδ₁()", t"line₃#α₁"))
+
+      test(m"a bytecode listing in the text rendering names no wrapper object"):
+        isolated:
+          Opened(Repl()).interpret(t"/bytecode def fib(n: Int): Int = if n < 2 then n else fib(n - 1)")
+
+      . assert:
+          case Repl.Outcome.Ran(_, _, output, _, _) =>
+            output.contains(t"fib()") && !output.contains(t"rs$$line$$")
+
+          case _ => false
+
       test(m"a completion signature shows no wrapper object"):
         isolated:
           val repl = Opened(Repl())
@@ -1369,6 +1390,7 @@ object Tests extends Suite(m"Flame Tests"):
           case Inline.Snippet(_, tokens) => tokens.map(_.text).join
           case Inline.Phrase(content)    => content.map(inline).join
           case Inline.Emphasis(content)  => content.map(inline).join
+          case Inline.Strong(content)    => content.map(inline).join
           case Inline.Toned(_, content)  => content.map(inline).join
           case Inline.Numeral(value, _)  => value.toString.tt
           case _                         => t""
@@ -1378,7 +1400,7 @@ object Tests extends Suite(m"Flame Tests"):
           case Block.Group(content)                             => texts(content)
           case Block.Notice(_, _, content)                      => texts(content)
           case Block.Diagnostic(_, _, message, excerpt, detail) => texts(message + excerpt + detail)
-          case Block.Output(text, _)                            => text
+          case Block.Output(text, _, _)                         => text
 
           case Block.Code(_, lines, _, _, _, _) =>
             lines.map(_.tokens.map(_.text).join).join(t"\n")
@@ -1416,6 +1438,46 @@ object Tests extends Suite(m"Flame Tests"):
 
           case _ => false
 
+      test(m"a bytecode listing is a table per method, with its names demangled"):
+        isolated:
+          exhibiting.react
+            ( 0, t"/bytecode def fib(n: Int): Int = if n < 2 then n else fib(n - 1) + fib(n - 2)" )
+
+      . assert:
+          case Repl.Reply.Ran(_, value, output, _, _, _, _, _, blocks) =>
+            val decoded = Blocks.decode(blocks)
+            val text = texts(decoded)
+
+            // The listing is a group of groups, one per method, each a header and a table.
+            def tables(blocks: List[Block]): List[Block.Table] = blocks.bind:
+              case table: Block.Table   => List(table)
+              case Block.Group(content) => tables(content)
+              case _                    => Nil
+
+            value.absent && output == t"" && !tables(decoded).nil && text.contains(t"fib()") &&
+              text.contains(t"invoke·virtual line") && text.contains(t" ⌗ fib()") &&
+              !text.contains(t"rs$$line$$") && !text.contains(t"rs#line") &&
+              !blocks.contains(t"\u001b")
+
+          case _ => false
+
+      test(m"a TASTy tree is a tree block, free of the wrapper object"):
+        isolated(exhibiting.react(0, t"/tasty (x: Int) => x + 1"))
+
+      . assert:
+          case Repl.Reply.Ran(_, value, output, _, _, _, _, _, blocks) =>
+            def labels(node: Block.TreeNode): Text =
+              (Inline.plain(node.label) :: node.children.map(labels)).join(t"\n")
+
+            val trees: List[Block.Tree] = Blocks.decode(blocks).sweep { case tree: Block.Tree => tree }
+            val text: Text = trees.bind(_.roots).map(labels).join(t"\n")
+
+            value.absent && output == t"" && !trees.nil && text.contains(t"Int") &&
+              !text.contains(t"rs$$line$$") && !text.contains(t"rs#line") &&
+              !blocks.contains(t"\u001b")
+
+          case _ => false
+
       test(m"captured output becomes output blocks by stream"):
         isolated:
           exhibiting.react
@@ -1423,7 +1485,7 @@ object Tests extends Suite(m"Flame Tests"):
 
       . assert:
           case Repl.Reply.Ran(_, _, _, _, _, _, _, _, blocks) =>
-            Blocks.decode(blocks).sweep { case Block.Output(text, error) => (text.trim, error) } ==
+            Blocks.decode(blocks).sweep { case Block.Output(text, error, _) => (text.trim, error) } ==
               List((t"hi", false), (t"oh", true))
 
           case _ => false
@@ -1605,7 +1667,7 @@ object Tests extends Suite(m"Flame Tests"):
           case Block.Group(content)                             => texts(content)
           case Block.Notice(_, _, content)                      => texts(content)
           case Block.Diagnostic(_, _, message, excerpt, detail) => texts(message + excerpt + detail)
-          case Block.Output(text, _)                            => text
+          case Block.Output(text, _, _)                         => text
 
           case Block.Trace(stacks) =>
             def describe(stack: Block.Trace.Stack): Text =

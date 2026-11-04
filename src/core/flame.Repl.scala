@@ -2870,20 +2870,30 @@ class Repl[version <: Scalac.Versions]
     lines.join(t"\n")
 
   // The probe object body for `/tasty <expr>`: it reflects `<expr>`'s typed AST with hyperbole's
-  // `syntax` macro (which runs at compile time and reifies the tree WITHOUT evaluating `<expr>`),
-  // renders it to a coloured ANSI table via `flame.TastyRender`, and prints it — so the render is
-  // captured as the line's `output`. Wrapped by `layout.wrap`, it sits inside the numbered object
-  // with the history imports, so `<expr>` sees the session's prior imports and definitions.
+  // `syntax` macro (which runs at compile time and reifies the tree WITHOUT evaluating `<expr>`)
+  // and renders it via `flame.TastyRender` — under `Exhibit` as a tree block, stashed under `key`
+  // through `ReplBridge` as a result's exhibit is (see `renderInto`), so the outcome carries it as
+  // its value; under `Inspect` as a coloured ANSI table, printed, so the render is captured as the
+  // line's `output`. Wrapped by `layout.wrap`, it sits inside the numbered object with the
+  // history imports, so `<expr>` sees the session's prior imports and definitions.
   // The `val` is `@experimental` because hyperbole (`Introspect`/`internal`) is itself experimental
   // (built with `genericNumberLiterals`); the annotation enables experimental mode for its
   // initializer, so no session-wide `/set experimental` is needed — exactly as `expressionCode`
   // does for the `@experimental` `inspect` renderer.
-  private def tastyProbe(expr: Text): Text =
-    val render: Text = t"flame.TastyRender.render(hyperbole.Introspect.syntax(false)($expr))"
+  private def tastyProbe(expr: Text, key: Text): Text =
+    val tree: Text = t"hyperbole.Introspect.syntax(false)($expr)"
+
+    val body: Text = render match
+      case Repl.Rendering.Inspect =>
+        t"scala.Predef.print(flame.TastyRender.render($tree))"
+
+      case Repl.Rendering.Exhibit(_) =>
+        val id: Text = session.toString.tt
+        t"flame.ReplBridge.put(${id}L, \"$key\", flame.TastyRender.blocks($tree))"
 
     List
       ( t"@scala.annotation.experimental private val tastyRendered: scala.Unit =",
-        t"  scala.Predef.print($render)" )
+        t"  $body" )
 
     . join(t"\n")
 
@@ -2897,13 +2907,18 @@ class Repl[version <: Scalac.Versions]
     val expr: Text = line.skip(t"/tasty".length).trim
 
     if expr == t"" then Built.Complete(Outcome.Ran(Nil, Unset, t"Usage: /tasty <expression>\n"))
-    else compile(contextImports(line), tastyProbe(expr), onOutput)(Unset)
+    else
+      val key: Text = t"tasty:${session.toString.tt}:${index.toString.tt}"
+
+      compile(contextImports(line), tastyProbe(expr, key), onOutput):
+        Optional(ReplBridge.fetch[String](session, key.s)).let(_.tt)
 
   // `/bytecode <code>` disassembles the JVM bytecode of an expression or definition — e.g.
   // `/bytecode def fib(n: Int): Int = if n < 2 then n else fib(n - 1) + fib(n - 2)`. Unlike
   // `/tasty`, this is a pure COMPILE (no macro, no run): the code is compiled into a throwaway
   // wrapper object in the session scope, then `flame.BytecodeRender` reads that class's bytes back
-  // through the REPL's classloader (never loading the class) and renders each method. An expression
+  // through the REPL's classloader (never loading the class) and renders each method — under
+  // `Exhibit` as blocks, carried as the outcome's value; under `Inspect` as ANSI text. An expression
   // is wrapped in a method first (so it becomes disassemblable code); a definition that cannot be a
   // method's RHS is then compiled directly. The wrapper is neither run nor added to `history`, so
   // it does not pollute the session — only `index` advances, to keep the object name unique.
@@ -2931,13 +2946,21 @@ class Repl[version <: Scalac.Versions]
         result match
           case CompileResult.Success =>
             index += 1
+            val resource: Text = t"$name$$.class"
+            val none: Outcome = Outcome.Ran(Nil, Unset, t"No bytecode was produced\n")
 
-            BytecodeRender.render(t"$name$$.class")(using loader) match
-              case rendered: Text if rendered.trim != t"" =>
-                Outcome.Ran(Nil, Unset, t"$rendered\n")
+            render match
+              case Repl.Rendering.Exhibit(_) =>
+                BytecodeRender.blocks(resource)(using loader).lay(none): (block: Block) =>
+                  Outcome.Ran(Nil, ExhibitRender.encode(block), t"")
 
-              case _ =>
-                Outcome.Ran(Nil, Unset, t"No bytecode was produced\n")
+              case Repl.Rendering.Inspect =>
+                BytecodeRender.render(resource)(using loader) match
+                  case rendered: Text if rendered.trim != t"" =>
+                    Outcome.Ran(Nil, Unset, t"$rendered\n")
+
+                  case _ =>
+                    none
 
           case CompileResult.Crash(trace) => Outcome.Crashed(notices, trace)
           case CompileResult.Failure      => Outcome.Rejected(notices)
