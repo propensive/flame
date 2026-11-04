@@ -264,10 +264,14 @@ private def liveSessionNames(): List[Text] =
       safely:
         val frames = duplex.source.chunks.frames[LengthPrefix]
 
-        if !frames.hasNext then Nil else
-          Bintel.read[Repl.Reply](frames.next()) match
-            case Repl.Reply.SessionList(_, names) => names
-            case _                                => Nil
+        frames.next() match
+          case frame: Data =>
+            Bintel.read[Repl.Reply](frame) match
+              case Repl.Reply.SessionList(_, names) => names
+              case _                                => Nil
+
+          case _ =>
+            Nil
 
       . or(Nil)
 
@@ -600,16 +604,25 @@ private def unreachableRemote(host: Text, portNumber: Int)(using Stdio): Exit =
 // (`^{online, caps.any}`), and its `caps.any` cannot flow into the fresh capture variable the
 // `duplex` loan introduces. The loan confines the connection to `body`, so a pure connectable is
 // sound here: seal it for this call. (The domain-socket connectable carries no `caps.any`, so
-// `connectDomain` needs no such seal.)
+// `connectDomain` needs no such seal.) A connection refused raises `Socket.Error`.
 private def connect[result](endpoint: Endpoint[Tcp.Port])(body: Duplex => result)
 :   Optional[result] =
 
   given (Endpoint[Tcp.Port] is Connectable) = caps.unsafe.unsafeAssumePure(Connectable.tcpEndpoint)
-  try endpoint.duplex(body) catch case _: ji.IOException => Unset
+
+  recover:
+    case _: Socket.Error => Unset
+
+  . protect:
+    try endpoint.duplex(body) catch case _: ji.IOException => Unset
 
 // As `connect`, but over a UNIX domain socket.
 private def connectDomain[result](socket: DomainSocket)(body: Duplex => result): Optional[result] =
-  try socket.duplex(body) catch case _: ji.IOException => Unset
+  recover:
+    case _: Socket.Error => Unset
+
+  . protect:
+    try socket.duplex(body) catch case _: ji.IOException => Unset
 
 private def unreachableSocket(path: Text)(using Stdio): Exit =
   Out.println(t"Could not connect to $path")
@@ -660,6 +673,7 @@ private def launchServer[result]()(using Stdio, System, Monitor)(body: Duplex =>
 private def socketPaths(directory: Text): List[Text] =
   recover:
     case _: Path.Error => Nil
+    case _: Io.Error   => Nil
 
   . protect:
     directory.as[Path on Linux].children.map(_.encode).filter(_.ends(t".sock")).to[List]
