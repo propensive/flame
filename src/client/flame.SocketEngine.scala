@@ -81,22 +81,32 @@ class SocketEngine(duplex: Duplex)(using Monitor, Probate) extends Engine:
       // the server closes the stream.
       val frames = duplex.source.chunks.frames[LengthPrefix]
 
-      while live && frames.hasNext do
-        safely(Bintel.read[Repl.Reply](frames.next())).let: reply =>
-          val id = Repl.replyId(reply)
+      // Each reply in turn until the engine is closed or the server closes the stream; one
+      // frame per call, in tail position.
+      @scala.annotation.tailrec
+      def read(): Unit = if live then frames.next() match
+        case Iterator.Exhausted => ()
 
-          reply match
-            case Repl.Reply.Output(_, _, _)     => sink(reply)
-            case Repl.Reply.Warming(_, _, _)    => sink(reply)
-            case Repl.Reply.Advising(_)         => sink(reply)
-            case Repl.Reply.Advised(_, _, _, _) => sink(reply)
-            case Repl.Reply.Diagnosing(_)       => sink(reply)
-            case _ =>
-              // Claimed atomically: the callback is removed and read in one transition, so a
-              // reply can be delivered only once.
-              val callback: Optional[Repl.Reply -> Unit] = callbacks().at(id)
-              callbacks.revise(_.omit(id))
-              callback.lay(sink(reply))(_(reply))
+        case frame: Data =>
+          safely(Bintel.read[Repl.Reply](frame)).let: reply =>
+            val id = Repl.replyId(reply)
+
+            reply match
+              case Repl.Reply.Output(_, _, _)     => sink(reply)
+              case Repl.Reply.Warming(_, _, _)    => sink(reply)
+              case Repl.Reply.Advising(_)         => sink(reply)
+              case Repl.Reply.Advised(_, _, _, _) => sink(reply)
+              case Repl.Reply.Diagnosing(_)       => sink(reply)
+              case _ =>
+                // Claimed atomically: the callback is removed and read in one transition, so a
+                // reply can be delivered only once.
+                val callback: Optional[Repl.Reply -> Unit] = callbacks().at(id)
+                callbacks.revise(_.omit(id))
+                callback.lay(sink(reply))(_(reply))
+
+          read()
+
+      read()
 
       live = false
       ended()

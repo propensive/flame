@@ -74,10 +74,10 @@ class Wire(duplex: Duplex) extends caps.ExclusiveCapability:
 
   def exchange(request: Repl.Request): Repl.Reply =
     send(request)
-    // `hasNext` is what pulls the next frame from the connection; `next()` hands back what it
-    // read.
-    if !replies.hasNext then panic(m"the server closed the connection without replying")
-    Bintel.read[Repl.Reply](replies.next())
+    // `next()` pulls the next frame from the connection, or finds it closed.
+    replies.next() match
+      case Iterator.Exhausted => panic(m"the server closed the connection without replying")
+      case frame: Data        => Bintel.read[Repl.Reply](frame)
 
   def close(): Unit = safely(duplex.close())
 
