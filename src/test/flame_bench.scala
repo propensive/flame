@@ -58,10 +58,12 @@ import threads.platformThreads
 // Session A submits every probe twice (first, then repeat); session B, opened afterwards in the
 // same JVM, shows how much of a first line's cost is the session's own rather than the JVM's.
 @main
-def firstLine(args: String*): Unit =
+def firstLine(args0: String*): Unit =
   given Scalac[3.9, Universe.Classfile] = Scalac(Nil)
 
-  val arguments: List[Text] = List.from(args.map(_.tt))
+  // The options are read by position, which the stdlib's `Seq` gives directly.
+  val args: scala.collection.immutable.Seq[String] = args0.stdlib
+  val arguments: List[Text] = args0.map(_.tt)
   val viaSessions: Boolean = arguments.has(t"--sessions")
   val settle: Boolean = arguments.has(t"--settle")
   val began: Long = java.lang.System.nanoTime
