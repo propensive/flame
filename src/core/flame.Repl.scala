@@ -298,8 +298,11 @@ object Repl:
       out.reverse
 
   // One tab-completion candidate. The Harlequin `Completion`'s `Syntax` signature is rendered
-  // to text here so the reply serializes simply.
-  case class CompletionItem(name: Text, kind: Text, signature: Text)
+  // to text here so the reply serializes simply. `qualified` is the member's owner-qualified
+  // name (`gossamer.Text#length`), the key documentation is looked up by; a command, a keyword
+  // or a path has none.
+  case class CompletionItem
+    ( name: Text, kind: Text, signature: Text, qualified: Optional[Text] = Unset )
 
   // One binding an unfinished line has introduced into scope (see `Repl#scopeAt`): its `name`
   // where the user could write one (a lambda's `x`, a `using x: Foo`), or none for a synthetic
@@ -886,7 +889,8 @@ object Repl:
     // items are dropped here — otherwise every keyword would be offered twice.
     Scala.highlight(wrapped, caret = caret.z).completions.lay(Nil): completions =>
       completions.items.filter(_.kind != prophesy.Completion.Kind.Keyword).map: item =>
-        CompletionItem(item.name, item.kind.toString.tt, item.signature.text(using imports))
+        CompletionItem
+          ( item.name, item.kind.toString.tt, item.signature.text(using imports), item.qualified )
 
   // Completion's cursor analysis — `memberBase`, `infixBase` and the identifier and
   // expression scans beneath them — lives in `harlequin.Fragment`, which is called directly.

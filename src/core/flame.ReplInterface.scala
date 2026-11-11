@@ -65,7 +65,8 @@ object ReplInterface:
       history:      List[Text]                        = Nil,
       historyLimit: Int                               = 100,
       persist:      Text => Unit                      = _ => (),
-      leave:        () => Unit                        = () => () )
+      leave:        () => Unit                        = () => (),
+      help:         Text => Optional[Text]            = _ => Unset )
 
   // The delay before a completion is asked for after a keystroke, so typing is not a query
   // per character.
@@ -600,9 +601,16 @@ class ReplInterface(engine: Engine, options: ReplInterface.Options)(using Monito
               field.revise(current, replaced, replaced.length)
 
             if lone.absent then
+              // A candidate with a qualified name may have a line of documentation to hand,
+              // from `options.help`: a local lookup, never a query.
               val completions: List[Control.Field.Completion] =
                 items.map: (item: Repl.CompletionItem) =>
-                  Control.Field.Completion(item.name, item.kind, item.signature, whole(item.name))
+                  Control.Field.Completion
+                    ( item.name,
+                      item.kind,
+                      item.signature,
+                      whole(item.name),
+                      info = item.qualified.let(options.help(_)) )
 
               completedFor = text
               field.decoration.amend(_.copy(completions = completions))

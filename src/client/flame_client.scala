@@ -114,7 +114,8 @@ object FlameWeb extends Tool.Web:
     given Classloader = serverClassloader
     val quit: Promise[Unit] = Promise()
     quitting = quit
-    serveHttp(port, quit, address(port))
+    FuelHelp.start()
+    serveHttp(port, quit, address(port), FuelHelp.lookup(_))
 
   def stop(): Unit = quitting.let(_.offer(()))
 
@@ -823,9 +824,11 @@ private def converse
             history = loaded,
             historyLimit = historyConfig.limit,
             persist = { (line: Text) => historyConfig.file.let(flame.History.append(_, line)) },
-            leave = () => frontend.stop() )
+            leave = () => frontend.stop(),
+            help = FuelHelp.lookup(_) )
 
       val interface: ReplInterface = caps.unsafe.unsafeAssumePure(ReplInterface(engine, options))
+      FuelHelp.start()
       engine.start: () => frontend.stop()
       interface.start()
       frontend.run(interface.interface)(interface.handle)
