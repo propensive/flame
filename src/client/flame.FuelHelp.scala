@@ -84,17 +84,17 @@ object FuelHelp:
   private val started: Atomic[Boolean] = Atomic(false)
 
   // The info line for a qualified name, if Fuel has one; `Unset` is the usual answer.
-  def lookup(key: Text): Optional[Text] = index.get(key).getOrElse(Unset)
+  def lookup(key: Text): Optional[Text] = index.at(key)
 
   // Holds the index: a copy is fetched now, and again whenever Fuel announces a new model.
   // Called where a REPL interface is made; later calls do nothing.
   def start()(using Monitor): Unit =
-    if !started.getAndSet(true) then
+    if !started.swap(true) then
       Swarm.of(Flame.name).let: swarm =>
         swarm.subscribe(Swarm.Filter(tools = Set(tool), kinds = Set(event), remote = false)):
           (_, envelope) => envelope.event match
             case Bus.Event.Tool(_, _, payload) =>
-              val announced: Optional[Long] = safely(Text(payload.utf8).as[Long])
+              val announced: Optional[Long] = safely(payload.utf8.as[Long])
               if announced != edition then async(fetch())
             case _ => ()
 
@@ -137,5 +137,5 @@ object FuelHelp:
             case scala.Left(_)      => Unset
 
       fetched.let: fetched =>
-        index = fetched.entries.map { entry => entry.key -> entry.info }.to(Map)
+        index = Map(fetched.entries.map { entry => entry.key -> entry.info }*)
         edition = fetched.edition
