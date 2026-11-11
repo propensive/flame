@@ -66,7 +66,7 @@ object ReplInterface:
       historyLimit: Int                               = 100,
       persist:      Text => Unit                      = _ => (),
       leave:        () => Unit                        = () => (),
-      help:         Text => Optional[Text]            = _ => Unset )
+      help:         Text -> Optional[Text]            = _ => Unset )
 
   // The delay before a completion is asked for after a keystroke, so typing is not a query
   // per character.

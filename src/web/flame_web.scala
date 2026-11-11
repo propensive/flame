@@ -251,7 +251,7 @@ def serveHttp
   ( port:    Int,
     quit:    Promise[Unit],
     address: Optional[Text]       = Unset,
-    help:    Text => Optional[Text] = _ => Unset )
+    help:    Text -> Optional[Text] = _ => Unset )
   ( using Monitor, System, Probate, Classloader )
 :   Unit =
 
