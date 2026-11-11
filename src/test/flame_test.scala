@@ -920,6 +920,20 @@ object Tests extends Suite(m"Flame Tests"):
 
       . assert(_.has(t"map"))
 
+      test(m"a member completion carries its owner-qualified name"):
+        isolated:
+          val code = t"List(1, 2, 3).lengthCompa"
+          Opened(Repl()).completionsAt(code, code.length).filter(_.name == t"lengthCompare")
+          . map(_.qualified)
+
+      . assert(_.has(t"scala.collection.immutable.List#lengthCompare"))
+
+      test(m"a command completion has no qualified name"):
+        isolated:
+          Opened(Repl()).completionsAt(t"/tas", 4).map(_.qualified)
+
+      . assert(_.all(_.absent))
+
       test(m"completions are offered inside a definition's right-hand side"):
         isolated:
           val code = t"def foo() = System.o"
@@ -1450,7 +1464,7 @@ object Tests extends Suite(m"Flame Tests"):
           case Block.Diagnostic(_, _, message, excerpt, detail) => texts(message + excerpt + detail)
           case Block.Output(text, _, _)                         => text
 
-          case Block.Code(_, lines, _, _, _, _) =>
+          case Block.Code(_, lines, _, _, _, _, _, _) =>
             lines.map(_.tokens.map(_.text).join).join(t"\n")
 
           case Block.Table(_, rows, _) =>
@@ -1895,7 +1909,7 @@ object Tests extends Suite(m"Flame Tests"):
 
       . assert: entries =>
           def indented(block: Block): Boolean = block match
-            case Block.Code(_, lines, _, _, _, _) =>
+            case Block.Code(_, lines, _, _, _, _, _, _) =>
               lines.head.lay(false)(_.tokens.head.lay(false)(_.text == t"  "))
 
             case _ =>
@@ -2006,6 +2020,46 @@ object Tests extends Suite(m"Flame Tests"):
           (interface.field.value(), interface.field.revision())
 
       . assert(_ == (t"1.toLo", Control.Field.Revision(4, t"1.toLong", 8)))
+
+      test(m"a candidate with a qualified name is shown with the info the lookup has for it"):
+        isolated:
+          val help: Text -> Optional[Text] =
+            key => if key == t"scala.Int#toLong" then t"this number, widened" else Unset
+
+          val (engine, interface) = fresh(ReplInterface.Options(help = help))
+          interface.field.value() = t"1.to"
+          interface.handle(Event.Edited(interface.field.input, t"1.to", 4, 4))
+          interface.handle(Event.Key(Keypress.Tab))
+          val id = engine.requests.size
+
+          val items =
+            List
+              ( Repl.CompletionItem(t"toLong", t"method", t"Long", t"scala.Int#toLong"),
+                Repl.CompletionItem(t"toLower", t"method", t"String", t"scala.Int#toLower"),
+                Repl.CompletionItem(t"/tasty", t"command", t"show the TASTy") )
+
+          engine.answer(id, Repl.Reply.Completed(id, items))
+          interface.field.decoration().completions.map(_.info)
+
+      . assert(_ == List(t"this number, widened", Unset, Unset))
+
+      test(m"a candidate has no info without a lookup"):
+        isolated:
+          val (engine, interface) = fresh()
+          interface.field.value() = t"1.to"
+          interface.handle(Event.Edited(interface.field.input, t"1.to", 4, 4))
+          interface.handle(Event.Key(Keypress.Tab))
+          val id = engine.requests.size
+
+          val items =
+            List
+              ( Repl.CompletionItem(t"toLong", t"method", t"Long", t"scala.Int#toLong"),
+                Repl.CompletionItem(t"toLower", t"method", t"String", t"scala.Int#toLower") )
+
+          engine.answer(id, Repl.Reply.Completed(id, items))
+          interface.field.decoration().completions.map(_.info)
+
+      . assert(_ == List(Unset, Unset))
 
       test(m"a completion for an older version of the text is dropped"):
         isolated:

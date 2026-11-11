@@ -247,7 +247,11 @@ private def restApi(apiSessions: Sessions[3.9])(request: Http.Request)(using Mon
 // Burdock/Ethereal launcher). Blocks until `quit` is fulfilled (the CLI completes it on Ctrl+C;
 // the standalone `web` main passes one that is never fulfilled and relies on the JVM's own
 // signal handling).
-def serveHttp(port: Int, quit: Promise[Unit], address: Optional[Text] = Unset)
+def serveHttp
+  ( port:    Int,
+    quit:    Promise[Unit],
+    address: Optional[Text]       = Unset,
+    help:    Text -> Optional[Text] = _ => Unset )
   ( using Monitor, System, Probate, Classloader )
 :   Unit =
 
@@ -268,7 +272,7 @@ def serveHttp(port: Int, quit: Promise[Unit], address: Optional[Text] = Unset)
   async:
     frontend.serve: () =>
       val engine: LocalEngine = caps.unsafe.unsafeAssumePure(LocalEngine(sessions))
-      val options = ReplInterface.Options(navigation = true, quitAllowed = false)
+      val options = ReplInterface.Options(navigation = true, quitAllowed = false, help = help)
       val interface: ReplInterface = caps.unsafe.unsafeAssumePure(ReplInterface(engine, options))
       interface.start()
       (interface.interface, interface.handle)
