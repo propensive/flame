@@ -6,11 +6,6 @@ name: CI
 # flame-client as published coordinates, so all three are published locally first: `flame.__`
 # is Mill's wildcard, which resolves `publishLocal` to exactly the publishable modules (the
 # shell, not Mill, would expand a brace pattern, and Mill takes one target here).
-#
-# The suites run under plain `java`, through `flame.runTests`, rather than through fume: a fume
-# release reads the test events only of the Soundness it was built with, and fume is built on
-# Pyrocosm, so none reads Soundness 0.76.0's until Pyrocosm has been released against it. Drop
-# `test_main` once etc/tools pins a fume which does.
 
 on:
   pull_request:
@@ -26,4 +21,3 @@ jobs:
       publish_local: flame.__
       assembly:      flame.launcher.assembly
       test_assembly: flame.test.assembly
-      test_main:     flame.runTests
