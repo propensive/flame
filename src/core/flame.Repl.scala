@@ -1135,6 +1135,12 @@ object Repl:
     case Request.SessionList(id)    => id
     case Request.Context(id, _, _)  => id
 
+  // A failure to answer request `id`: its message after the label of its bolt code, as
+  // `fulminate.Error#labelled` writes one. A `Failed` reply carries nothing but its message, which
+  // every front-end shows as it is, so the code travels in it.
+  def failed(id: Int, bolt: fulminate.Bolt, message: Text): Reply.Failed =
+    Reply.Failed(id, t"${bolt.label} $message")
+
   object messages:
     def session(name: Text): Text = t"Session $name"
 
@@ -3606,7 +3612,9 @@ class Repl[version <: Scalac.Versions]
 
     def unprocessed: Repl.Reply.Failed =
       val reason: Text = failure.value.lay(t""): error => t": ${error.toString.tt}"
-      Repl.Reply.Failed(id, t"the input could not be processed$reason")
+      val cause: fulminate.Bolt = failure.value.lay(fulminate.Bolt.Uncoded)(FlameBolts.of(_))
+      val bolt: fulminate.Bolt = FlameBolts(FlameBolts.core, 1, 1).carrying(cause)
+      Repl.failed(id, bolt, t"the input could not be processed$reason")
 
     // Compile under the mutex (counted as pending, so completions stand aside); run the deferred
     // load off it.
@@ -3738,4 +3746,5 @@ class Repl[version <: Scalac.Versions]
         Repl.Reply.Crashed(id, diagnosticsText(notices), tokens, blocks)
 
     catch case error: Throwable =>
-      Repl.Reply.Failed(id, t"the result could not be rendered: ${error.toString.tt}")
+      val bolt: fulminate.Bolt = FlameBolts(FlameBolts.core, 1, 2).carrying(FlameBolts.of(error))
+      Repl.failed(id, bolt, t"the result could not be rendered: ${error.toString.tt}")

@@ -1761,6 +1761,40 @@ object Tests extends Suite(m"Flame Tests"):
           submissions.head.lay(false)(_.code == t"1 + 1") && submissions.size == 1 &&
             entries.size == 1 && entries.head.lay(false)(pendingEntry)
 
+      test(m"a session which cannot be joined fails with its bolt code"):
+        isolated:
+          val join = ReplInterface.Session.Join(t"work")
+          val (engine, interface) = fresh(ReplInterface.Options(session = join))
+          interface.start()
+          engine.answer(1, Repl.Reply.Session(1, t"work", Nil, Repl.SessionOutcome.Missing))
+          (interface.failure, texts(interface.transcript()))
+
+      . assert: (failure, shown) =>
+          failure == t"[↯/f.17.2.1] No session named 'work'" && shown.contains(failure.or(t"-"))
+
+      test(m"a failed reply is shown after its bolt code's label"):
+        isolated:
+          val (engine, interface) = fresh()
+          interface.handle(Event.Submitted(interface.field.input, t"1 + 1"))
+          val id = engine.submissions.head.let(_.id).or(0)
+          val bolt = FlameBolts(FlameBolts.core, 1, 1)
+          engine.answer(id, Repl.failed(id, bolt, t"the input could not be processed"))
+          texts(interface.transcript())
+
+      . assert(_.contains(t"[↯/f.17.1.1] the input could not be processed"))
+
+      test(m"a failure carries the code of the error it is reported on account of"):
+        import errorDiagnostics.emptyDiagnostics
+        val tel: Tel.Error = Tel.Error(Tel.Error.Reason.TooManyAtoms)
+        val bolt = FlameBolts(FlameBolts.core, 1, 4)
+
+        ( bolt.carrying(FlameBolts.of(tel)).text,
+          bolt.carrying(FlameBolts.of(RuntimeException("unexpected"))).text,
+          tel.bolt.text )
+
+      . assert: (carried, plain, cause) =>
+          carried == t"↯/f.17.1.4${cause.skip(1)}" && plain == t"↯/f.17.1.4" && cause != t""
+
       test(m"the server's warm-up shows as a gauge above the prompt until it is over"):
         isolated:
           val (engine, interface) = fresh()
