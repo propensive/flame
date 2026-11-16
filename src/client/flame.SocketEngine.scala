@@ -82,9 +82,10 @@ class SocketEngine(duplex: Duplex)(using Monitor, Probate) extends Engine:
       val frames = duplex.source.chunks.frames[LengthPrefix]
 
       // Each reply in turn until the engine is closed or the server closes the stream; one
-      // frame per call, in tail position.
+      // frame per call, in tail position. `@unchecked`, because the compiler cannot
+      // see that `Iterator.Exhausted`, an opaque `null`, is never `Data`.
       @scala.annotation.tailrec
-      def read(): Unit = if live then frames.next() match
+      def read(): Unit = if live then (frames.next(): @unchecked) match
         case Iterator.Exhausted => ()
 
         case frame: Data =>

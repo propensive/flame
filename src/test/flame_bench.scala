@@ -59,7 +59,7 @@ import threads.platformThreads
 // same JVM, shows how much of a first line's cost is the session's own rather than the JVM's.
 @main
 def firstLine(args0: String*): Unit =
-  given Scalac[3.9, Universe.Classfile] = Scalac(Nil)
+  given Scalac[3.9, Toolchain.Universe.Classfile] = Scalac(Nil)
 
   // The options are read by position, which the stdlib's `Seq` gives directly.
   val args: scala.collection.immutable.Seq[String] = args0.stdlib

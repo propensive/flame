@@ -255,7 +255,7 @@ def serveHttp
   ( using Monitor, System, Probate, Classloader )
 :   Unit =
 
-  given Scalac[3.9, Universe.Classfile] = Scalac(Nil)
+  given Scalac[3.9, Toolchain.Universe.Classfile] = Scalac(Nil)
 
   // Each page auto-starts a fresh randomly-named session and may `/session`-switch to any other.
   // Results are exhibited as blocks, without terminal colour.

@@ -258,14 +258,15 @@ private def sessionIntent
 // a socket that refuses is skipped. A short timeout keeps a wedged server from stalling the shell.
 private def liveSessionNames(): List[Text] =
   def ask(path: Text): List[Text] =
-    connectDomain(DomainSocket(path)): duplex =>
+    connectDomain(Uds(path)): duplex =>
       val request = SocketEngine.encode(Repl.Request.SessionList(0))
       duplex.send(zephyrine.Stream(LengthPrefix.encode(request)))
 
       safely:
         val frames = duplex.source.chunks.frames[LengthPrefix]
 
-        frames.next() match
+        // `@unchecked`: the compiler cannot see that `Iterator.Exhausted` is never `Data`.
+        (frames.next(): @unchecked) match
           case frame: Data =>
             Bintel.read[Repl.Reply](frame) match
               case Repl.Reply.SessionList(_, names) => names
@@ -390,7 +391,7 @@ object Client uses parasite.threads, surveillance.Watcher:
 
 // Runs a REPL server on the given TCP port and blocks until interrupted.
 private def serve(portNumber: Int)(using Stdio, Monitor, Probate, System): Exit =
-  given Scalac[3.9, Universe.Classfile] = Scalac(Nil)
+  given Scalac[3.9, Toolchain.Universe.Classfile] = Scalac(Nil)
   given Classloader = serverClassloader
 
   safely(urticose.Port[Tcp](portNumber)).lay(invalidPort(portNumber)): port =>
@@ -416,7 +417,7 @@ private def serve(portNumber: Int)(using Stdio, Monitor, Probate, System): Exit 
 // applied first; `/quit` (or Ctrl+D / EOF) ends the session. `async` has no effect here (every
 // submission runs synchronously), so `/set async` is intercepted with a short notice.
 private def basicRepl(settings: List[Text])(using Stdio, Monitor, Probate, System, Resident): Exit =
-  given Scalac[3.9, Universe.Classfile] = Scalac(Nil)
+  given Scalac[3.9, Toolchain.Universe.Classfile] = Scalac(Nil)
   given Classloader = serverClassloader
 
   val repl: Repl[3.9] = Repl.make[3.9](Repl.Prelude.empty)
@@ -500,7 +501,7 @@ private def socketFile: Text = t"$socketDirectory/${ProcessHandle.current.nn.pid
 // Runs a REPL server on a per-process UNIX domain socket (used when no port is
 // given) and blocks until quit, unlinking the socket file on the way out.
 private def serveSocket()(using Stdio, Monitor, Probate, System): Exit =
-  given Scalac[3.9, Universe.Classfile] = Scalac(Nil)
+  given Scalac[3.9, Toolchain.Universe.Classfile] = Scalac(Nil)
   given Classloader = serverClassloader
 
   val socketPath: Text = socketFile
@@ -618,7 +619,7 @@ private def connect[result](endpoint: Endpoint[Tcp.Port])(body: Duplex => result
     try endpoint.duplex(body) catch case _: ji.IOException => Unset
 
 // As `connect`, but over a UNIX domain socket.
-private def connectDomain[result](socket: DomainSocket)(body: Duplex => result): Optional[result] =
+private def connectDomain[result](socket: Uds)(body: Duplex => result): Optional[result] =
   recover:
     case _: Socket.Error => Unset
 
@@ -665,7 +666,7 @@ private def launchServer[result]()(using Stdio, System, Monitor)(body: Duplex =>
 
       socketPaths(socketDirectory).each: candidate =>
         if result.absent && !before.has(candidate) then
-          result = connectDomain(DomainSocket(candidate))(body)
+          result = connectDomain(Uds(candidate))(body)
 
     result
 
@@ -721,7 +722,7 @@ private def connectSocket
   var live: List[Text] = Nil
 
   socketPaths(socketDirectory).each: path =>
-    if connectDomain(DomainSocket(path)) { _ => () }.absent then
+    if connectDomain(Uds(path)) { _ => () }.absent then
       recover:
         case _: Path.Error | _: Io.Error => ()
 
@@ -736,7 +737,7 @@ private def connectSocket
       launchServer()(converse(intent, initial, history, context)(_)).or(failedToLaunch)
 
     case path :: Nil =>
-      connectDomain(DomainSocket(path))(converse(intent, initial, history, context)(_))
+      connectDomain(Uds(path))(converse(intent, initial, history, context)(_))
       . or(unreachableSocket(path))
 
     case paths =>
@@ -792,7 +793,7 @@ private def converse
 
   // The inline block renders relative to the cursor, so each prompt appears where output has
   // flowed to, right after the previous result, and never docks to a screen edge.
-  given InlineAnchoring = InlineAnchoring.Flow
+  given Tui.Block.Anchoring = Tui.Block.Anchoring.Flow
 
   // The persisted prompt history (see `flame.History`), most recent `limit` entries; a file
   // already over the limit is trimmed on load, so it cannot grow without bound across sessions.
@@ -809,7 +810,7 @@ private def converse
 
   . protect:
       val frontend: TerminalFrontend =
-        caps.unsafe.unsafeAssumePure(TerminalFrontend(ultimatum.Occupancy.Inline, FlameTheme))
+        caps.unsafe.unsafeAssumePure(TerminalFrontend(Tui.Occupancy.Inline, FlameTheme))
 
       val engine: SocketEngine = caps.unsafe.unsafeAssumePure(SocketEngine(duplex))
 

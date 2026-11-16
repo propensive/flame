@@ -56,6 +56,7 @@ import dotty.tools.dotc.util.SourceFile as DottySourceFile
 
 import ambience.*
 import anthology.*
+import anthology.Compiler.Notice
 import anticipation.*
 import aperture.*
 import contingency.*
@@ -813,7 +814,7 @@ object Repl:
   private def project(source: SourceCode): List[Token] =
     // `SourceCode.lines` is a frozen `Array`, so it crosses to a `List` through its readable view.
     val lines: List[List[Token]] = source.lines.to[List].map: line =>
-      line.map: (token: harlequin.Token) =>
+      line.map: (token: harlequin.SourceCode.Token) =>
         Token
           ( token.text,
             token.accent.toString.tt.lower,
@@ -1544,13 +1545,13 @@ object Repl:
 
   def make[version <: Scalac.Versions]
     ( prelude: Repl.Prelude, render: Repl.Rendering = Repl.Rendering.Inspect )
-    ( using Scalac[version, Universe.Classfile], Classloader, TemporaryDirectory )
+    ( using Scalac[version, Toolchain.Universe.Classfile], Classloader, TemporaryDirectory )
   :   Repl[version] =
 
     new Repl[version](prelude = prelude, render = render)
 
   inline def apply[version <: Scalac.Versions](inline body: Unit = ())
-    ( using scalac:      Scalac[version, Universe.Classfile],
+    ( using scalac:      Scalac[version, Toolchain.Universe.Classfile],
             classloader: Classloader,
             temporary:   TemporaryDirectory )
   :   Repl[version] =
@@ -1561,7 +1562,7 @@ class Repl[version <: Scalac.Versions]
   ( layout:  Repl.Layout    = Repl.Layout.Standard(),
     prelude: Repl.Prelude   = Repl.Prelude.empty,
     render:  Repl.Rendering = Repl.Rendering.Inspect )
-  ( using scalac:      Scalac[version, Universe.Classfile],
+  ( using scalac:      Scalac[version, Toolchain.Universe.Classfile],
           classloader: Classloader,
           temporary:   TemporaryDirectory ):
 
@@ -1994,7 +1995,7 @@ class Repl[version <: Scalac.Versions]
   // The compiler to use for the next line: the session's `Scalac` plus the flag of every setting
   // the user has switched on (`/set <name>`). `Scalac.Option` is contravariant in its version, so
   // an option built for this `version` is a valid extra flag for it.
-  private def effectiveScalac: Scalac[version, Universe.Classfile] =
+  private def effectiveScalac: Scalac[version, Toolchain.Universe.Classfile] =
     val experimentalOn: Boolean = enabledSettings.has(t"experimental")
 
     // An enabled experimental language feature is only APPLIED while `experimental` is on — so
@@ -2096,13 +2097,13 @@ class Repl[version <: Scalac.Versions]
     // not leave the session thread blocked on a rendezvous nobody will keep.
     enum Request:
       case Compile
-        ( sources: Map[Text, Text], reply: juc.BlockingQueue[(CompileResult, List[Notice])] )
+        ( sources: Map[Text, Text], reply: juc.BlockingQueue[(Compiler.Result, List[Notice])] )
       // Something to run on the session thread with the session's front end (see `inspect`);
       // `done` is told when it has run, whether or not it threw.
       case Probe(run: Scalac.Session.Frontend -> Unit, done: juc.BlockingQueue[java.lang.Boolean])
       case Retire
 
-  private class Warm(setup: Scalac.Setup[version, Universe.Classfile])(using System):
+  private class Warm(setup: Scalac.Setup[version, Toolchain.Universe.Classfile])(using System):
     private val requests: juc.SynchronousQueue[Warm.Request] = juc.SynchronousQueue()
 
     // The session handle is confined to `serve`, so the thread is started with a plain `Runnable`
@@ -2125,12 +2126,12 @@ class Repl[version <: Scalac.Versions]
     // as soon as the thread is gone, and the line reports the death as a compiler crash — which the
     // caller already knows how to render, and which retires the session so the next line opens a
     // fresh one.
-    def compile(sources: Map[Text, Text]): (CompileResult, List[Notice]) =
-      val reply: juc.BlockingQueue[(CompileResult, List[Notice])] = juc.ArrayBlockingQueue(1)
+    def compile(sources: Map[Text, Text]): (Compiler.Result, List[Notice]) =
+      val reply: juc.BlockingQueue[(Compiler.Result, List[Notice])] = juc.ArrayBlockingQueue(1)
       val request = Warm.Request.Compile(sources, reply)
 
-      def crashed: (CompileResult, List[Notice]) =
-        (CompileResult.Crash(failure.or(StackTrace(Warm.DeadSession()))), Nil)
+      def crashed: (Compiler.Result, List[Notice]) =
+        (Compiler.Result.Crash(failure.or(StackTrace(Warm.DeadSession()))), Nil)
 
       var handed: Boolean = false
 
@@ -2138,7 +2139,7 @@ class Repl[version <: Scalac.Versions]
         handed = requests.offer(request, Warm.pollInterval, juc.TimeUnit.MILLISECONDS)
 
       if !handed then crashed else
-        var result: Optional[(CompileResult, List[Notice])] = Unset
+        var result: Optional[(Compiler.Result, List[Notice])] = Unset
 
         while result.absent && thread.isAlive do
           result = Optional(reply.poll(Warm.pollInterval, juc.TimeUnit.MILLISECONDS))
@@ -2190,7 +2191,7 @@ class Repl[version <: Scalac.Versions]
       try session()
       catch case error: Throwable => failure = StackTrace(error)
 
-    private def session(): Unit = mute[CompileEvent]:
+    private def session(): Unit = mute[Compiler.Event]:
       import strategies.throwUnsafely
 
       // The session thread is nobody's child: it is a daemon of this `Repl`, outliving any one
@@ -2212,15 +2213,15 @@ class Repl[version <: Scalac.Versions]
             done.offer(java.lang.Boolean.TRUE)
 
           case Warm.Request.Compile(sources, reply) =>
-            val result: (CompileResult, List[Notice]) =
+            val result: (Compiler.Result, List[Notice]) =
               try
                 val process = compilation.compile(sources)
                 val outcome = process.complete()
                 // Only a successful compile has classfiles worth materializing; a failed one leaves
                 // the output directory untouched, exactly as the cold compile did.
-                if outcome == CompileResult.Success then process.save(out)
+                if outcome == Compiler.Result.Success then process.save(out)
                 (outcome, process.notices)
-              catch case error: Throwable => (CompileResult.Crash(error.stackTrace), Nil)
+              catch case error: Throwable => (Compiler.Result.Crash(error.stackTrace), Nil)
 
             reply.offer(result)
 
@@ -2256,7 +2257,7 @@ class Repl[version <: Scalac.Versions]
 
         val source: Text = layout.wrap(index, historyImports, contextImports(code), content)
         val offset: Int = source.offsetOf(ScopeInspector.marker, Rtl).let(_.n0).or(-1)
-        val scalac: Scalac[version, Universe.Classfile] = effectiveScalac
+        val scalac: Scalac[version, Toolchain.Universe.Classfile] = effectiveScalac
         val path: Text = classpath()
         // The line index is part of the key: a fresh inspector per submitted line, since one that
         // is already open cannot see the wrapper classfile the latest submission added (see
@@ -2294,7 +2295,7 @@ class Repl[version <: Scalac.Versions]
   // if either has changed since it was; `Unset` under `FLAME_COLD`. Called under `mutex`.
   private def warmSession()(using System): Optional[Warm] =
     if coldCompiles then Unset else
-      val scalac: Scalac[version, Universe.Classfile] = effectiveScalac
+      val scalac: Scalac[version, Toolchain.Universe.Classfile] = effectiveScalac
       val path: LocalClasspath = classpath
       val key: Text = t"${scalac.commandLineArguments.join(t" ")} ${path()}"
 
@@ -2327,11 +2328,11 @@ class Repl[version <: Scalac.Versions]
   // compiler arguments or classpath have changed since it was opened. Called under `mutex`, which
   // is what keeps one submission's request/reply pair from interleaving with another's.
   private def warmCompile(sources: Map[Text, Text])(using System, Monitor, Probate)
-  :   (CompileResult, List[Notice]) =
+  :   (Compiler.Result, List[Notice]) =
 
     val opened: Optional[Warm] = warmSession()
 
-    def cold: (CompileResult, List[Notice]) =
+    def cold: (Compiler.Result, List[Notice]) =
       import strategies.throwUnsafely
       val process = effectiveScalac(classpath)(sources, out)
       (process.complete(), process.notices)
@@ -2458,7 +2459,7 @@ class Repl[version <: Scalac.Versions]
     primeListeners.each: listener => safely(listener(done, Repl.primingTotal))
     if done >= Repl.primingTotal then primeListeners = Nil
 
-  private def runPrimer(cold: Boolean)(using System, Probate): Unit = mute[CompileEvent]:
+  private def runPrimer(cold: Boolean)(using System, Probate): Unit = mute[Compiler.Event]:
     // An orphan monitor, for the reason the warm session has one (see `Warm#session`).
     given monitor: Monitor = caps.unsafe.unsafeAssumePure(parasite.unsupervised.orphanMonitor)
 
@@ -2502,7 +2503,7 @@ class Repl[version <: Scalac.Versions]
   // The session's own part: its warm compiler, opened by a source no line will ever name, and its
   // semantic imports. Neither is begun once a line is pending (which will do the same itself) or
   // the session has been closed.
-  private def primeSession()(using Monitor, System, Probate): Unit logs CompileEvent =
+  private def primeSession()(using Monitor, System, Probate): Unit logs Compiler.Event =
     val epoch: Int = primeEpoch.get
     def wanted: Boolean = primeEpoch.get == epoch && pendingSubmissions.get == 0
 
@@ -2624,11 +2625,14 @@ class Repl[version <: Scalac.Versions]
 
   // The notices of `source` compiled with the advice, cold, into a directory nothing reads.
   private def advise
-    ( scalac: Scalac[version, Universe.Classfile], path: LocalClasspath, file: Text, source: Text )
+    ( scalac: Scalac[version, Toolchain.Universe.Classfile],
+      path:   LocalClasspath,
+      file:   Text,
+      source: Text )
     ( using System, Probate )
   :   List[Notice] =
 
-    mute[CompileEvent]:
+    mute[Compiler.Event]:
       import strategies.throwUnsafely
       given monitor: Monitor = caps.unsafe.unsafeAssumePure(parasite.unsupervised.orphanMonitor)
       val scratch: Path on Linux = temporaryDirectory/Uuid()
@@ -2662,7 +2666,7 @@ class Repl[version <: Scalac.Versions]
     ( imports: List[Text], code: Text, onOutput: Text => Unit, origin: Optional[Text] = Unset )
     ( rendered: => Optional[Text] )
     ( using Monitor, System, Probate )
-  :   (Built^{onOutput, rendered}) logs CompileEvent raises Compiler.Error raises Async.Error =
+  :   (Built^{onOutput, rendered}) logs Compiler.Event raises Compiler.Error raises Async.Error =
 
     val name:    Text = layout.objectName(index)
     val imported: List[Text] = historyImports
@@ -2674,10 +2678,10 @@ class Repl[version <: Scalac.Versions]
     // and diagnosed; else when (and if) it is wanted. The first compile of the line to need it
     // starts the search, and a later one (the statement fallback of an expression) keeps it,
     // since its notices are positioned against the line as typed, either way.
-    if outcome == CompileResult.Failure && Repl.missingGiven(raw) && pendingAdvice.absent then
+    if outcome == Compiler.Result.Failure && Repl.missingGiven(raw) && pendingAdvice.absent then
       val advisedImports: List[Text] = imports.map(Repl.advised)
       val advisedSource: Text = layout.wrap(index, imported, advisedImports, code)
-      val scalac: Scalac[version, Universe.Classfile] = effectiveScalac
+      val scalac: Scalac[version, Toolchain.Universe.Classfile] = effectiveScalac
       val path: LocalClasspath = classpath
       val line: Int = layout.bodyLine(imported, advisedImports)
 
@@ -2699,13 +2703,13 @@ class Repl[version <: Scalac.Versions]
       positioned(raw, t"$name.scala", layout.bodyLine(imported, imports), code, origin)
 
     outcome match
-      case CompileResult.Crash(trace) =>
+      case Compiler.Result.Crash(trace) =>
         Built.Complete(Outcome.Crashed(notices, trace))
 
-      case CompileResult.Failure =>
+      case Compiler.Result.Failure =>
         Built.Complete(Outcome.Rejected(notices))
 
-      case CompileResult.Success =>
+      case Compiler.Result.Success =>
         index += 1
         history = history :+ name
         historyMembers = historyMembers.define(name, wrapperMembers(name))
@@ -2954,7 +2958,7 @@ class Repl[version <: Scalac.Versions]
   // scope; the expression is only type-checked and reflected, never run. A blank argument prints
   // usage.
   private def tasty(line: Text, onOutput: Text => Unit)(using Monitor, System, Probate)
-  :   (Built^{onOutput}) logs CompileEvent raises Compiler.Error raises Async.Error =
+  :   (Built^{onOutput}) logs Compiler.Event raises Compiler.Error raises Async.Error =
 
     val expr: Text = line.skip(t"/tasty".length).trim
 
@@ -2975,7 +2979,7 @@ class Repl[version <: Scalac.Versions]
   // method's RHS is then compiled directly. The wrapper is neither run nor added to `history`, so
   // it does not pollute the session — only `index` advances, to keep the object name unique.
   private def bytecode(line: Text)(using Monitor, System, Probate)
-  :   Built logs CompileEvent raises Compiler.Error raises Async.Error =
+  :   Built logs Compiler.Event raises Compiler.Error raises Async.Error =
 
     Built.Complete:
       val code: Text = line.skip(t"/bytecode".length).trim
@@ -2986,17 +2990,17 @@ class Repl[version <: Scalac.Versions]
         val name: Text = layout.objectName(index)
 
         // Compile `body` as the wrapper object's contents, returning the result and its notices.
-        def attempt(body: Text): (CompileResult, List[Notice]) =
+        def attempt(body: Text): (Compiler.Result, List[Notice]) =
           val source = layout.wrap(index, historyImports, contextImports(line), body)
           warmCompile(Map(t"$name.scala" -> source))
 
         // Try the code as an expression (wrapped in a method) first, then as a raw definition.
         val (result, notices) = attempt(t"def bytecodeResult = $code") match
-          case (CompileResult.Success, ns) => (CompileResult.Success, ns)
+          case (Compiler.Result.Success, ns) => (Compiler.Result.Success, ns)
           case _                           => attempt(code)
 
         result match
-          case CompileResult.Success =>
+          case Compiler.Result.Success =>
             index += 1
             val resource: Text = t"$name$$.class"
             val none: Outcome = Outcome.Ran(Nil, Unset, t"No bytecode was produced\n")
@@ -3014,8 +3018,8 @@ class Repl[version <: Scalac.Versions]
                   case _ =>
                     none
 
-          case CompileResult.Crash(trace) => Outcome.Crashed(notices, trace)
-          case CompileResult.Failure      => Outcome.Rejected(notices)
+          case Compiler.Result.Crash(trace) => Outcome.Crashed(notices, trace)
+          case Compiler.Result.Failure      => Outcome.Rejected(notices)
 
 
   // The definition/statement path of `evaluate`: a `val`/`var`/`def` is displayed like an
@@ -3026,7 +3030,7 @@ class Repl[version <: Scalac.Versions]
   private def definitionOrStatement
     ( line: Text, key: Text, context: List[Text], onOutput: Text => Unit )
     ( using Monitor, System, Probate )
-  :   (Built^{onOutput}) logs CompileEvent raises Compiler.Error raises Async.Error =
+  :   (Built^{onOutput}) logs Compiler.Event raises Compiler.Error raises Async.Error =
 
     given LocalClasspath = classpath
 
@@ -3066,7 +3070,7 @@ class Repl[version <: Scalac.Versions]
           case complete => complete
 
   private def evaluate(line: Text, onOutput: Text => Unit)(using Monitor, System, Probate)
-  :   (Built^{onOutput}) logs CompileEvent raises Compiler.Error raises Async.Error =
+  :   (Built^{onOutput}) logs Compiler.Event raises Compiler.Error raises Async.Error =
 
     given LocalClasspath = classpath
 
@@ -3089,7 +3093,7 @@ class Repl[version <: Scalac.Versions]
   private def expressionFirst
     ( line: Text, key: Text, context: List[Text], onOutput: Text => Unit )
     ( using Monitor, System, Probate )
-  :   (Built^{onOutput}) logs CompileEvent raises Compiler.Error raises Async.Error =
+  :   (Built^{onOutput}) logs Compiler.Event raises Compiler.Error raises Async.Error =
 
     given LocalClasspath = classpath
 
@@ -3151,7 +3155,7 @@ class Repl[version <: Scalac.Versions]
   private def valDefinition
     ( line: Text, bound: Text, key: Text, context: List[Text], onOutput: Text => Unit )
     ( using Monitor, System, Probate )
-  :   (Built^{onOutput}) logs CompileEvent raises Compiler.Error raises Async.Error =
+  :   (Built^{onOutput}) logs Compiler.Event raises Compiler.Error raises Async.Error =
 
     given LocalClasspath = classpath
 
@@ -3193,7 +3197,7 @@ class Repl[version <: Scalac.Versions]
   // members via the history import. Imports create no members, so they are
   // re-injected into every line instead.
   private def ensureSeeded()(using Monitor, System, Probate)
-  :   Optional[Outcome] logs CompileEvent raises Compiler.Error raises Async.Error =
+  :   Optional[Outcome] logs Compiler.Event raises Compiler.Error raises Async.Error =
 
     if seeded || prelude.seedTasty.nil then Unset
     else
@@ -3389,7 +3393,7 @@ class Repl[version <: Scalac.Versions]
   // settings) — and returns the run DEFERRED (`Built`), so `react` can hold the compiler mutex only
   // for this phase and execute the object load off it. `onOutput` streams the run's stdout.
   private def build(line: Text, onOutput: Text => Unit)(using Monitor, System, Probate)
-  :   (Built^{onOutput}) logs CompileEvent raises Compiler.Error raises Async.Error =
+  :   (Built^{onOutput}) logs Compiler.Event raises Compiler.Error raises Async.Error =
 
     // A submission can change the session scope (a new definition, import, or `/set`), so any
     // cached member lists may be stale; drop them.
@@ -3415,7 +3419,7 @@ class Repl[version <: Scalac.Versions]
   // callers (and the test suite) that want the fused result; `react` instead splits the two phases
   // to run off the mutex. Single-threaded callers need no mutex.
   def interpret(line: Text)(using Monitor, System, Probate)
-  :   Outcome logs CompileEvent raises Compiler.Error raises Async.Error =
+  :   Outcome logs Compiler.Event raises Compiler.Error raises Async.Error =
 
     build(line, _ => ()) match
       case Built.Complete(outcome) => outcome
@@ -3429,7 +3433,7 @@ class Repl[version <: Scalac.Versions]
   // applied HERE, at the front-end entry point, so `keywordCompletions` keeps returning the bare
   // keyword names its direct callers (and tests) rely on.
   def completionsAt(code: Text, offset: Int)(using Monitor, System, Probate)
-  :   List[Repl.CompletionItem] logs CompileEvent =
+  :   List[Repl.CompletionItem] logs Compiler.Event =
 
     val ticket: Long = completionTickets.incrementAndGet()
 
@@ -3444,7 +3448,7 @@ class Repl[version <: Scalac.Versions]
     if stale then Nil else mutex(if stale then Nil else block)
 
   private def completionItems(code: Text, offset: Int, ticket: Long)(using Monitor, System, Probate)
-  :   List[Repl.CompletionItem] logs CompileEvent =
+  :   List[Repl.CompletionItem] logs Compiler.Event =
 
     // `/unimport <tokens>` completes against the imports currently in scope, so the user can pick
     // the one to remove; `/tasty <expr>` and `/bytecode <code>` complete their ARGUMENT as ordinary
@@ -3492,7 +3496,7 @@ class Repl[version <: Scalac.Versions]
   // can reuse it on the stripped expression.
   private def scalaCompletions(code: Text, offset: Int, ticket: Long)
     ( using Monitor, System, Probate )
-  :   List[Repl.CompletionItem] logs CompileEvent =
+  :   List[Repl.CompletionItem] logs Compiler.Event =
 
     given LocalClasspath = classpath
 
@@ -3563,7 +3567,7 @@ class Repl[version <: Scalac.Versions]
       onOutput: Text => Unit                 = _ => (),
       onPush:   Optional[Repl.Reply => Unit] = Unset )
     ( using Monitor, System, Probate )
-  :   Repl.Reply logs CompileEvent =
+  :   Repl.Reply logs Compiler.Event =
 
     given LocalClasspath = classpath
 

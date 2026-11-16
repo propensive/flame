@@ -32,7 +32,7 @@
                                                                                                   */
 package flame
 
-import anthology.*
+import anthology.Compiler.Notice
 import anticipation.*
 import delicious.*  // Markup, SemanticMessage, Reifier, `semantic` on Notice and `teletype`
 import denominative.*

@@ -60,7 +60,7 @@ import hellenism.*
 object ReplMacro:
   def bound[version <: Scalac.Versions: Type]
     ( body:        Expr[Unit],
-      scalac:      Expr[Scalac[version, Universe.Classfile]],
+      scalac:      Expr[Scalac[version, Toolchain.Universe.Classfile]],
       classloader: Expr[Classloader],
       temporary:   Expr[TemporaryDirectory] )
     ( using Quotes )

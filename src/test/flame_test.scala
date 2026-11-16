@@ -58,7 +58,7 @@ object Wire:
     Wire(caps.unsafe.unsafeAssumePure(Connectable.tcpEndpoint).connect(endpoint, Unset))
 
   def domain(path: Text): Wire^ =
-    Wire(Connectable.domainSocket.connect(DomainSocket(path), Unset))
+    Wire(Connectable.uds.connect(Uds(path), Unset))
 
 // One framed connection to a REPL server, as the client speaks it: each request and reply is a
 // record framed by its four-byte big-endian length (`obligatory.LengthPrefix`) carrying a BinTEL
@@ -74,8 +74,9 @@ class Wire(duplex: Duplex) extends caps.ExclusiveCapability:
 
   def exchange(request: Repl.Request): Repl.Reply =
     send(request)
-    // `next()` pulls the next frame from the connection, or finds it closed.
-    replies.next() match
+    // `next()` pulls the next frame from the connection, or finds it closed; `@unchecked`, as
+    // the compiler cannot see that `Iterator.Exhausted` is never `Data`.
+    (replies.next(): @unchecked) match
       case Iterator.Exhausted => panic(m"the server closed the connection without replying")
       case frame: Data        => Bintel.read[Repl.Reply](frame)
 
@@ -138,8 +139,8 @@ object ReplFixture:
   var greeting: String = "hello"
 
   def session
-    ( using Scalac[3.9, Universe.Classfile], Classloader, TemporaryDirectory, Monitor, System,
-            Probate )
+    ( using Scalac[3.9, Toolchain.Universe.Classfile], Classloader, TemporaryDirectory, Monitor,
+            System, Probate )
   :   (Repl.Outcome, Repl.Outcome) =
 
     val repl = Repl[3.9]:
@@ -154,7 +155,7 @@ object ReplFixture:
 object Tests extends Suite(m"Flame Tests"):
   def run(): Unit =
     suite(m"REPL tests"):
-      given Scalac[3.9, Universe.Classfile] = Scalac(Nil)
+      given Scalac[3.9, Toolchain.Universe.Classfile] = Scalac(Nil)
 
       test(m"a definition is visible on a later line"):
         isolated:
@@ -1178,7 +1179,7 @@ object Tests extends Suite(m"Flame Tests"):
           case _ => false
 
     suite(m"REPL binding tests"):
-      given Scalac[3.9, Universe.Classfile] = Scalac(Nil)
+      given Scalac[3.9, Toolchain.Universe.Classfile] = Scalac(Nil)
 
       test(m"captured values and a lifted definition are usable in the REPL"):
         isolated:
@@ -1229,7 +1230,7 @@ object Tests extends Suite(m"Flame Tests"):
           case _                               => false
 
     suite(m"REPL result rendering"):
-      given Scalac[3.9, Universe.Classfile] = Scalac(Nil)
+      given Scalac[3.9, Toolchain.Universe.Classfile] = Scalac(Nil)
 
       test(m"an expression's value is rendered via Inspectable"):
         isolated:
@@ -1443,7 +1444,7 @@ object Tests extends Suite(m"Flame Tests"):
       . assert(_ == List())
 
     suite(m"Exhibiting replies"):
-      given Scalac[3.9, Universe.Classfile] = Scalac(Nil)
+      given Scalac[3.9, Toolchain.Universe.Classfile] = Scalac(Nil)
 
       // Every piece of text in a run of blocks, for checks that do not care about structure.
       def texts(blocks: List[Block]): Text =
@@ -1461,7 +1462,8 @@ object Tests extends Suite(m"Flame Tests"):
           case Block.Paragraph(content)                         => content.map(inline).join
           case Block.Group(content)                             => texts(content)
           case Block.Notice(_, _, content)                      => texts(content)
-          case Block.Diagnostic(_, _, message, excerpt, detail) => texts(message + excerpt + detail)
+          case Block.Diagnostic(_, _, message, excerpt, detail, _) =>
+            texts(message + excerpt + detail)
           case Block.Output(text, _, _)                         => text
 
           case Block.Code(_, lines, _, _, _, _, _, _) =>
@@ -1560,7 +1562,7 @@ object Tests extends Suite(m"Flame Tests"):
             val decoded = Blocks.decode(blocks)
 
             def failure(block: Block): Boolean = block match
-              case Block.Diagnostic(Tone.Failure, _, _, _, _) => true
+              case Block.Diagnostic(Tone.Failure, _, _, _, _, _) => true
               case _                                          => false
 
             diagnostics == t"" && decoded.exists(failure) && texts(decoded).contains(t"Int") &&
@@ -1728,7 +1730,8 @@ object Tests extends Suite(m"Flame Tests"):
           case Block.Paragraph(content)                         => content.map(inline).join
           case Block.Group(content)                             => texts(content)
           case Block.Notice(_, _, content)                      => texts(content)
-          case Block.Diagnostic(_, _, message, excerpt, detail) => texts(message + excerpt + detail)
+          case Block.Diagnostic(_, _, message, excerpt, detail, _) =>
+            texts(message + excerpt + detail)
           case Block.Output(text, _, _)                         => text
 
           case Block.Trace(stacks) =>
@@ -2151,7 +2154,7 @@ object Tests extends Suite(m"Flame Tests"):
       . assert(_ == true)
 
     suite(m"REPL TCP server"):
-      given Scalac[3.9, Universe.Classfile] = Scalac(Nil)
+      given Scalac[3.9, Toolchain.Universe.Classfile] = Scalac(Nil)
 
       // The type is the SINGLETON `2`, not `Int`: an expression line is bound as a `final val`, so
       // a constant expression keeps the constant type the compiler folds it to (see
@@ -2605,7 +2608,7 @@ object Tests extends Suite(m"Flame Tests"):
             false
 
     suite(m"session priming"):
-      given Scalac[3.9, Universe.Classfile] = Scalac(Nil)
+      given Scalac[3.9, Toolchain.Universe.Classfile] = Scalac(Nil)
 
       // A connection to a session of its own, in sessions that are warmed up, and what the
       // connection has been sent so far, oldest first.
@@ -2682,7 +2685,7 @@ object Tests extends Suite(m"Flame Tests"):
           case _                                             => false
 
     suite(m"REPL block captures outside references"):
-      given Scalac[3.9, Universe.Classfile] = Scalac(Nil)
+      given Scalac[3.9, Toolchain.Universe.Classfile] = Scalac(Nil)
 
       test(m"a lifted def can reference a value from the enclosing scope"):
         isolated:

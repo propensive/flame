@@ -96,7 +96,7 @@ object Sessions:
 // following as a `Reply.Advised` (see `Repl#react`) instead of holding the rejection up.
 class Sessions[version <: Scalac.Versions]
   ( render: Repl.Rendering = Repl.Rendering.Inspect, frontend: Boolean = false )
-  ( using scalac:      Scalac[version, Universe.Classfile],
+  ( using scalac:      Scalac[version, Toolchain.Universe.Classfile],
           classloader: Classloader,
           temporary:   TemporaryDirectory ):
 
@@ -166,7 +166,7 @@ class Sessions[version <: Scalac.Versions]
   // could not then flow into `serve`'s.
   private def accept[target](target: target)(using bindable: target is Bindable)
     ( using Monitor, System, Probate, bindable.Input =:= Duplex )
-    ( using (CompileEvent is Loggable)^, Tactic[Bind.Error]^ )
+    ( using (Compiler.Event is Loggable)^, Tactic[Bind.Error]^ )
   :   Socket.Service^ =
 
     val binding: bindable.Binding =
@@ -197,14 +197,14 @@ class Sessions[version <: Scalac.Versions]
         ()
 
   def serve(port: Port over Tcp)(using Monitor, System, Probate)
-  :   Socket.Service logs CompileEvent raises Bind.Error =
+  :   Socket.Service logs Compiler.Event raises Bind.Error =
 
     accept(port)
 
   def serve(socketPath: Text)(using Monitor, System, Probate)
-  :   Socket.Service logs CompileEvent raises Bind.Error =
+  :   Socket.Service logs Compiler.Event raises Bind.Error =
 
-    accept(DomainSocket(socketPath))
+    accept(Uds(socketPath))
 
   // One client's connection: its current session (created lazily, so a probe leaves none
   // behind), its context, and `respond`, which answers a request or, for an asynchronous
@@ -242,7 +242,7 @@ class Sessions[version <: Scalac.Versions]
     // goes, if anywhere.
     private val pushes: Optional[Repl.Reply -> Unit] = if frontend then push else Unset
 
-    def respond(request: Repl.Request): Optional[Repl.Reply] logs CompileEvent = request match
+    def respond(request: Repl.Request): Optional[Repl.Reply] logs Compiler.Event = request match
       case Repl.Request.Tokenize(id, code) =>
         val scope: List[Repl.ScopeBinding] = session(currentName).lay(Nil)(_.scopeAt(code))
 
@@ -323,7 +323,7 @@ class Sessions[version <: Scalac.Versions]
     caps.unsafe.unsafeAssumePure(new Connection(send))
 
   private def converse(duplex: Duplex)(using Monitor, System, Probate)
-  :   Unit logs CompileEvent =
+  :   Unit logs Compiler.Event =
 
     import strategies.throwUnsafely
 
