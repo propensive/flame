@@ -96,7 +96,7 @@ object Sessions:
 // following as a `Reply.Advised` (see `Repl#react`) instead of holding the rejection up.
 class Sessions[version <: Scalac.Versions]
   ( render: Repl.Rendering = Repl.Rendering.Inspect, frontend: Boolean = false )
-  ( using scalac:      Scalac[version, Universe.Classfile],
+  ( using scalac:      Scalac[version, Toolchain.Universe.Classfile],
           classloader: Classloader,
           temporary:   TemporaryDirectory ):
 
@@ -166,7 +166,7 @@ class Sessions[version <: Scalac.Versions]
   // could not then flow into `serve`'s.
   private def accept[target](target: target)(using bindable: target is Bindable)
     ( using Monitor, System, Probate, bindable.Input =:= Duplex )
-    ( using (CompileEvent is Loggable)^, Tactic[Bind.Error]^ )
+    ( using (Compiler.Event is Loggable)^, Tactic[Bind.Error]^ )
   :   Socket.Service^ =
 
     val binding: bindable.Binding =
@@ -197,14 +197,14 @@ class Sessions[version <: Scalac.Versions]
         ()
 
   def serve(port: Port over Tcp)(using Monitor, System, Probate)
-  :   Socket.Service logs CompileEvent raises Bind.Error =
+  :   Socket.Service logs Compiler.Event raises Bind.Error =
 
     accept(port)
 
   def serve(socketPath: Text)(using Monitor, System, Probate)
-  :   Socket.Service logs CompileEvent raises Bind.Error =
+  :   Socket.Service logs Compiler.Event raises Bind.Error =
 
-    accept(DomainSocket(socketPath))
+    accept(Uds(socketPath))
 
   // One client's connection: its current session (created lazily, so a probe leaves none
   // behind), its context, and `respond`, which answers a request or, for an asynchronous
@@ -242,7 +242,7 @@ class Sessions[version <: Scalac.Versions]
     // goes, if anywhere.
     private val pushes: Optional[Repl.Reply -> Unit] = if frontend then push else Unset
 
-    def respond(request: Repl.Request): Optional[Repl.Reply] logs CompileEvent = request match
+    def respond(request: Repl.Request): Optional[Repl.Reply] logs Compiler.Event = request match
       case Repl.Request.Tokenize(id, code) =>
         val scope: List[Repl.ScopeBinding] = session(currentName).lay(Nil)(_.scopeAt(code))
 
@@ -254,7 +254,10 @@ class Sessions[version <: Scalac.Versions]
             scope )
 
       case Repl.Request.Submit(id, code) =>
-        session(currentName).lay(Repl.Reply.Failed(id, t"no active session")): repl =>
+        val inactive: Repl.Reply.Failed =
+          Repl.failed(id, FlameBolts(FlameBolts.core, 3), t"no active session")
+
+        session(currentName).lay(inactive): repl =>
           if !repl.asyncEnabled then repl.react(id, code, onPush = pushes)
           else
             push(Repl.Reply.Pending(id))
@@ -267,9 +270,15 @@ class Sessions[version <: Scalac.Versions]
               // `safely` catches only `Exception`s; an `Error` must not leave the entry pending.
               val reply: Repl.Reply =
                 try
-                  safely(repl.react(id, code, output, pushes))
-                  . or(Repl.Reply.Failed(id, t"the submission could not be processed"))
-                catch case error: Throwable => Repl.Reply.Failed(id, error.toString.tt)
+                  safely(repl.react(id, code, output, pushes)).or:
+                    val bolt: fulminate.Bolt = FlameBolts(FlameBolts.core, 1, 3)
+                    Repl.failed(id, bolt, t"the submission could not be processed")
+
+                catch case error: Throwable =>
+                  val bolt: fulminate.Bolt =
+                    FlameBolts(FlameBolts.core, 1, 4).carrying(FlameBolts.of(error))
+
+                  Repl.failed(id, bolt, error.toString.tt)
 
               push(reply)
 
@@ -323,7 +332,7 @@ class Sessions[version <: Scalac.Versions]
     caps.unsafe.unsafeAssumePure(new Connection(send))
 
   private def converse(duplex: Duplex)(using Monitor, System, Probate)
-  :   Unit logs CompileEvent =
+  :   Unit logs Compiler.Event =
 
     import strategies.throwUnsafely
 
@@ -350,11 +359,17 @@ class Sessions[version <: Scalac.Versions]
           // id: the client settles only the entries it has pending, and 0 is never one of them.
           val request: Optional[Repl.Request] = safely(Bintel.read[Repl.Request](message))
 
+          val unparsed: Repl.Reply.Failed =
+            Repl.failed(0, FlameBolts(FlameBolts.core, 4, 1), t"the request could not be parsed")
+
           val response: Optional[Repl.Reply] =
-            request.lay(Repl.Reply.Failed(0, t"the request could not be parsed")): request =>
+            request.lay(unparsed): request =>
               try connection.respond(request)
               catch case error: Throwable =>
-                Repl.Reply.Failed(Repl.requestId(request), error.toString.tt)
+                val bolt: fulminate.Bolt =
+                  FlameBolts(FlameBolts.core, 4, 2).carrying(FlameBolts.of(error))
+
+                Repl.failed(Repl.requestId(request), bolt, error.toString.tt)
 
           response.let: reply => send(encode(reply))
     catch case _: Throwable => ()

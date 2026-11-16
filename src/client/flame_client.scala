@@ -188,12 +188,12 @@ private def startupCommands(flagged: List[Repl.Setting], workspace: Workspace.Co
 // How a launch chooses its session: create a fresh one under a made-up name (the default, when
 // neither flag is given), JOIN a named existing one (`--join`), or CREATE a named new one
 // (`--create`). `Invalid` carries the message for a misuse — both flags at once, or a flag with no
-// name — caught before any connection is attempted.
+// name — and its code, caught before any connection is attempted.
 enum SessionIntent:
   case Default
   case Join(name: Text)
   case Create(name: Text)
-  case Invalid(message: Text)
+  case Invalid(bolt: fulminate.Bolt, message: Text)
 
   // The requested name, for a failure message; empty for `Default`/`Invalid`.
   def requestedName: Text = this match
@@ -236,17 +236,21 @@ private def sessionIntent
   val joinGiven:   Boolean = flagGiven(arguments, t"--join", 'j')
   val createGiven: Boolean = flagGiven(arguments, t"--create", 'c')
 
+  // Each misuse is a variant of the client's first error.
+  def invalid(variant: Int, message: Text): SessionIntent =
+    SessionIntent.Invalid(FlameBolts(FlameBolts.client, 1, variant), message)
+
   if joinGiven && createGiven then
-    SessionIntent.Invalid(t"Specify only one of --join and --create")
+    invalid(1, t"Specify only one of --join and --create")
   else if joinGiven then
-    join.value.lay(SessionIntent.Invalid(t"--join requires a session name"))(SessionIntent.Join(_))
+    join.value.lay(invalid(2, t"--join requires a session name"))(SessionIntent.Join(_))
   else if createGiven then
-    val missing: SessionIntent = SessionIntent.Invalid(t"--create requires a session name")
+    val missing: SessionIntent = invalid(3, t"--create requires a session name")
     create.value.lay(missing)(SessionIntent.Create(_))
   else
     (workspace.join, workspace.create) match
       case (join: Text, create: Text) =>
-        SessionIntent.Invalid(t"config.tel names both a join and a create session")
+        invalid(4, t"config.tel names both a join and a create session")
 
       case (join: Text, _)   => SessionIntent.Join(join)
       case (_, create: Text) => SessionIntent.Create(create)
@@ -258,14 +262,15 @@ private def sessionIntent
 // a socket that refuses is skipped. A short timeout keeps a wedged server from stalling the shell.
 private def liveSessionNames(): List[Text] =
   def ask(path: Text): List[Text] =
-    connectDomain(DomainSocket(path)): duplex =>
+    connectDomain(Uds(path)): duplex =>
       val request = SocketEngine.encode(Repl.Request.SessionList(0))
       duplex.send(zephyrine.Stream(LengthPrefix.encode(request)))
 
       safely:
         val frames = duplex.source.chunks.frames[LengthPrefix]
 
-        frames.next() match
+        // `@unchecked`: the compiler cannot see that `Iterator.Exhausted` is never `Data`.
+        (frames.next(): @unchecked) match
           case frame: Data =>
             Bintel.read[Repl.Reply](frame) match
               case Repl.Reply.SessionList(_, names) => names
@@ -354,7 +359,7 @@ object Client uses parasite.threads, surveillance.Watcher:
             // do not apply to its single in-process session, so they are simply ignored here.
             if basic then command(basicRepl(settings))
             else intent match
-              case SessionIntent.Invalid(message) => command(sessionArgError(message))
+              case SessionIntent.Invalid(bolt, message) => command(sessionArgError(bolt, message))
 
               case intent => host match
                 case host: Text =>
@@ -380,7 +385,7 @@ object Client uses parasite.threads, surveillance.Watcher:
           // `flame` starts a new session, with whatever the workspace's `config.tel` asks for.
           case Nil =>
             sessionIntent(Nil, Join(), Create(), workspace) match
-              case SessionIntent.Invalid(message) => command(sessionArgError(message))
+              case SessionIntent.Invalid(bolt, message) => command(sessionArgError(bolt, message))
 
               case intent =>
                 command(connectSocket(intent, startupCommands(Nil, workspace), history, context))
@@ -390,13 +395,20 @@ object Client uses parasite.threads, surveillance.Watcher:
 
 // Runs a REPL server on the given TCP port and blocks until interrupted.
 private def serve(portNumber: Int)(using Stdio, Monitor, Probate, System): Exit =
-  given Scalac[3.9, Universe.Classfile] = Scalac(Nil)
+  given Scalac[3.9, Toolchain.Universe.Classfile] = Scalac(Nil)
   given Classloader = serverClassloader
 
   safely(urticose.Port[Tcp](portNumber)).lay(invalidPort(portNumber)): port =>
     recover:
-      case Bind.Error(_) => Out.println(t"Port $portNumber is unavailable"); Exit.Fail(5)
-      case error: Error  => Out.println(t"${error.message}"); Exit.Fail(6)
+      case error: Bind.Error =>
+        report(FlameBolts(FlameBolts.client, 2, 1).carrying(error.bolt))
+          ( t"Port $portNumber is unavailable" )
+
+        Exit.Fail(5)
+
+      case error: Error =>
+        report(FlameBolts(FlameBolts.client, 2, 2).carrying(error.bolt))(t"${error.message}")
+        Exit.Fail(6)
 
     . protect:
         val sessions = Sessions(Repl.Rendering.Exhibit(ansi = true), frontend = true)
@@ -416,7 +428,7 @@ private def serve(portNumber: Int)(using Stdio, Monitor, Probate, System): Exit 
 // applied first; `/quit` (or Ctrl+D / EOF) ends the session. `async` has no effect here (every
 // submission runs synchronously), so `/set async` is intercepted with a short notice.
 private def basicRepl(settings: List[Text])(using Stdio, Monitor, Probate, System, Resident): Exit =
-  given Scalac[3.9, Universe.Classfile] = Scalac(Nil)
+  given Scalac[3.9, Toolchain.Universe.Classfile] = Scalac(Nil)
   given Classloader = serverClassloader
 
   val repl: Repl[3.9] = Repl.make[3.9](Repl.Prelude.empty)
@@ -500,7 +512,7 @@ private def socketFile: Text = t"$socketDirectory/${ProcessHandle.current.nn.pid
 // Runs a REPL server on a per-process UNIX domain socket (used when no port is
 // given) and blocks until quit, unlinking the socket file on the way out.
 private def serveSocket()(using Stdio, Monitor, Probate, System): Exit =
-  given Scalac[3.9, Universe.Classfile] = Scalac(Nil)
+  given Scalac[3.9, Toolchain.Universe.Classfile] = Scalac(Nil)
   given Classloader = serverClassloader
 
   val socketPath: Text = socketFile
@@ -535,8 +547,10 @@ private def serveSocket()(using Stdio, Monitor, Probate, System): Exit =
     // A bind failure here means another server already holds this per-process socket path; it is
     // reported like any other failure to serve.
     recover:
-      case Bind.Error(_) =>
-        Out.println(t"Could not serve on $socketPath: the socket is already in use")
+      case error: Bind.Error =>
+        report(FlameBolts(FlameBolts.client, 2, 3).carrying(error.bolt))
+          ( t"Could not serve on $socketPath: the socket is already in use" )
+
         Exit.Fail(5)
 
     . protect:
@@ -553,7 +567,9 @@ private def serveSocket()(using Stdio, Monitor, Probate, System): Exit =
 
         Exit.Ok
   catch case error: Throwable =>
-    Out.println(t"Could not serve on $socketPath: ${error.toString.tt}")
+    report(FlameBolts(FlameBolts.client, 2, 4).carrying(FlameBolts.of(error)))
+      ( t"Could not serve on $socketPath: ${error.toString.tt}" )
+
     Exit.Fail(6)
 
 // Builds the classloader the REPL compiles against inside the Ethereal daemon.
@@ -584,20 +600,27 @@ private def serverClassloader(using System): Classloader =
       new Classloader(jn.URLClassLoader(entries, threadContextClassloader.java))
   catch case _: Throwable => threadContextClassloader
 
+// Prints a failure's message after the label of its bolt code, as `fulminate.Error#labelled`
+// writes one.
+private def report(bolt: fulminate.Bolt)(message: Text)(using Stdio): Unit =
+  Out.println(t"${bolt.label} $message")
+
 private def invalidPort(portNumber: Int)(using Stdio): Exit =
-  Out.println(t"$portNumber is not a valid TCP port")
+  report(FlameBolts(FlameBolts.client, 3, 1))(t"$portNumber is not a valid TCP port")
   Exit.Fail(2)
 
 private def missingHost(using Stdio): Exit =
-  Out.println(t"The --host flag needs the hostname of a flame server to connect to")
+  report(FlameBolts(FlameBolts.client, 3, 2))
+    ( t"The --host flag needs the hostname of a flame server to connect to" )
+
   Exit.Fail(2)
 
 private def invalidHost(host: Text)(using Stdio): Exit =
-  Out.println(t"'$host' is not a valid hostname")
+  report(FlameBolts(FlameBolts.client, 3, 3))(t"'$host' is not a valid hostname")
   Exit.Fail(2)
 
 private def unreachableRemote(host: Text, portNumber: Int)(using Stdio): Exit =
-  Out.println(t"Could not connect to $host:$portNumber")
+  report(FlameBolts(FlameBolts.client, 4, 1))(t"Could not connect to $host:$portNumber")
   Exit.Fail(3)
 
 // Runs `body` over a fresh TCP connection to `endpoint` — always closing it afterwards —
@@ -618,7 +641,7 @@ private def connect[result](endpoint: Endpoint[Tcp.Port])(body: Duplex => result
     try endpoint.duplex(body) catch case _: ji.IOException => Unset
 
 // As `connect`, but over a UNIX domain socket.
-private def connectDomain[result](socket: DomainSocket)(body: Duplex => result): Optional[result] =
+private def connectDomain[result](socket: Uds)(body: Duplex => result): Optional[result] =
   recover:
     case _: Socket.Error => Unset
 
@@ -626,17 +649,17 @@ private def connectDomain[result](socket: DomainSocket)(body: Duplex => result):
     try socket.duplex(body) catch case _: ji.IOException => Unset
 
 private def unreachableSocket(path: Text)(using Stdio): Exit =
-  Out.println(t"Could not connect to $path")
+  report(FlameBolts(FlameBolts.client, 4, 2))(t"Could not connect to $path")
   Exit.Fail(3)
 
 private def failedToLaunch(using Stdio): Exit =
-  Out.println(t"Could not start a REPL server")
+  report(FlameBolts(FlameBolts.client, 4, 3))(t"Could not start a REPL server")
   Exit.Fail(3)
 
 // Reports a misuse of `--join`/`--create` (both at once, or a flag with no name) and fails, without
 // attempting any connection.
-private def sessionArgError(message: Text)(using Stdio): Exit =
-  Out.println(message)
+private def sessionArgError(bolt: fulminate.Bolt, message: Text)(using Stdio): Exit =
+  report(bolt)(message)
   Exit.Fail(2)
 
 // Starts a REPL server in the background — a detached `flame serve-socket` process on its
@@ -665,7 +688,7 @@ private def launchServer[result]()(using Stdio, System, Monitor)(body: Duplex =>
 
       socketPaths(socketDirectory).each: candidate =>
         if result.absent && !before.has(candidate) then
-          result = connectDomain(DomainSocket(candidate))(body)
+          result = connectDomain(Uds(candidate))(body)
 
     result
 
@@ -721,7 +744,7 @@ private def connectSocket
   var live: List[Text] = Nil
 
   socketPaths(socketDirectory).each: path =>
-    if connectDomain(DomainSocket(path)) { _ => () }.absent then
+    if connectDomain(Uds(path)) { _ => () }.absent then
       recover:
         case _: Path.Error | _: Io.Error => ()
 
@@ -736,11 +759,11 @@ private def connectSocket
       launchServer()(converse(intent, initial, history, context)(_)).or(failedToLaunch)
 
     case path :: Nil =>
-      connectDomain(DomainSocket(path))(converse(intent, initial, history, context)(_))
+      connectDomain(Uds(path))(converse(intent, initial, history, context)(_))
       . or(unreachableSocket(path))
 
     case paths =>
-      Out.println(t"Several REPL servers are running:")
+      report(FlameBolts(FlameBolts.client, 5))(t"Several REPL servers are running:")
 
       paths.each: (path: Text) => Out.println(t"  $path")
 
@@ -792,7 +815,7 @@ private def converse
 
   // The inline block renders relative to the cursor, so each prompt appears where output has
   // flowed to, right after the previous result, and never docks to a screen edge.
-  given InlineAnchoring = InlineAnchoring.Flow
+  given Tui.Block.Anchoring = Tui.Block.Anchoring.Flow
 
   // The persisted prompt history (see `flame.History`), most recent `limit` entries; a file
   // already over the limit is trimmed on load, so it cannot grow without bound across sessions.
@@ -803,13 +826,15 @@ private def converse
     kept
 
   recover:
-    case Terminal.Error() =>
-      Out.println(t"The terminal could not be initialised")
+    case error: Terminal.Error =>
+      report(FlameBolts(FlameBolts.client, 6).carrying(error.bolt))
+        ( t"The terminal could not be initialised" )
+
       Exit.Fail(4)
 
   . protect:
       val frontend: TerminalFrontend =
-        caps.unsafe.unsafeAssumePure(TerminalFrontend(ultimatum.Occupancy.Inline, FlameTheme))
+        caps.unsafe.unsafeAssumePure(TerminalFrontend(Tui.Occupancy.Inline, FlameTheme))
 
       val engine: SocketEngine = caps.unsafe.unsafeAssumePure(SocketEngine(duplex))
 

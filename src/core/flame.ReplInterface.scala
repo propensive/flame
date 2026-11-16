@@ -222,14 +222,10 @@ class ReplInterface(engine: Engine, options: ReplInterface.Options)(using Monito
           case Repl.Reply.Session(_, name, names, outcome) =>
             outcome match
               case Repl.SessionOutcome.Missing =>
-                failure = Repl.messages.noSession(name)
-                notice(Tone.Failure, Repl.messages.noSession(name))
-                options.leave()
+                refuse(FlameBolts(FlameBolts.core, 2, 1), Repl.messages.noSession(name))
 
               case Repl.SessionOutcome.Exists =>
-                failure = Repl.messages.sessionExists(name)
-                notice(Tone.Failure, Repl.messages.sessionExists(name))
-                options.leave()
+                refuse(FlameBolts(FlameBolts.core, 2, 2), Repl.messages.sessionExists(name))
 
               case Repl.SessionOutcome.Created =>
                 note(Repl.messages.started(name))
@@ -265,6 +261,14 @@ class ReplInterface(engine: Engine, options: ReplInterface.Options)(using Monito
 
   private def notice(tone: Tone, text: Text): Unit =
     append(Block.Notice(tone, Unset, List(Block.paragraph(text))))
+
+  // The session could not be opened as asked: the reason, after its bolt code's label, is shown
+  // and kept as the `failure` the driver exits on, and the front-end is left.
+  private def refuse(bolt: fulminate.Bolt, message: Text): Unit =
+    val labelled: Text = t"${bolt.label} $message"
+    failure = labelled
+    notice(Tone.Failure, labelled)
+    options.leave()
 
   // An entry keeps the frame its line was entered at: a rule above and below the code.
   private def framed(code: Block): List[Block] =

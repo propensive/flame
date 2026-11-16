@@ -64,7 +64,14 @@ case class ApiCompletion(name: Text, kind: Text, signature: Text)  // one comple
 case class ApiCompletions(completions: List[ApiCompletion])        // the completion response
 case class ApiSessionsList(sessions: List[Text])      // GET  /api/sessions
 case class ApiSessionCreated(session: Text)           // POST /api/sessions
-case class ApiError(error: Text)                      // a 400/404 error body
+case class ApiError(error: Text, code: Text)          // a 400/404 error body and its bolt code
+
+object ApiError:
+  def apply(bolt: fulminate.Bolt, error: Text): ApiError = ApiError(error, bolt.text)
+
+  // The body of a 404: the session named in the path does not exist.
+  def missing(name: Text): ApiError =
+    ApiError(FlameBolts(FlameBolts.web, 2), t"no session named '$name'")
 
 // An evaluation result: `status` is `"ran"` or `"error"`; the remaining fields mirror the
 // plain-text REPL result (`name = value : tpe`, plus captured stdout and any diagnostics), each
@@ -116,6 +123,13 @@ private val jsonHeaders: List[Http.Header] =
 private def jsonResponse(status: Http.Status, body: Text): Http.Response =
   status(jsonHeaders, Http.Body.Fixed(body.in[Data]))
 
+object LocalEngine:
+  // A request whose answer threw: reported as a `Failed` under its id, carrying the code of the
+  // error it was reported on account of.
+  def failed(id: Int, error: Throwable): Repl.Reply.Failed =
+    val bolt: fulminate.Bolt = FlameBolts(FlameBolts.web, 1).carrying(FlameBolts.of(error))
+    Repl.failed(id, bolt, error.toString.tt)
+
 // The web's engine: a connection to the in-process sessions, called directly. Replies to a
 // request go to its callback; what the connection pushes of its own accord (an asynchronous
 // submission's streamed output and eventual result) goes to the sink, as over the socket.
@@ -161,7 +175,7 @@ class LocalEngine(sessions: Sessions[3.9])(using Monitor, System, Probate) exten
 
     async:
       try connection.respond(message).let(deliver)
-      catch case error: Throwable => deliver(Repl.Reply.Failed(id, error.toString.tt))
+      catch case error: Throwable => deliver(LocalEngine.failed(id, error))
 
     ()
 
@@ -171,7 +185,7 @@ class LocalEngine(sessions: Sessions[3.9])(using Monitor, System, Probate) exten
 
     async:
       try connection.respond(message)
-      catch case error: Throwable => sink(Repl.Reply.Failed(id, error.toString.tt))
+      catch case error: Throwable => sink(LocalEngine.failed(id, error))
 
     ()
 
@@ -197,7 +211,7 @@ private def restApi(apiSessions: Sessions[3.9])(request: Http.Request)(using Mon
     case target if request.method == Http.Post &&
       target.starts(t"/api/sessions/") && target.ends(t"/eval") =>
       val name: Text = target.chomp(t"/api/sessions/").chomp(t"/eval", Rtl)
-      val missing: Text = ApiError(t"no session named '$name'").in[Json].show
+      val missing: Text = ApiError.missing(name).in[Json].show
 
       apiSessions.session(name).lay(jsonResponse(Http.NotFound, missing)): repl =>
         // Read and parse the body as `{"code": "…"}`; a stream/parse failure yields `Unset` → 400.
@@ -208,13 +222,16 @@ private def restApi(apiSessions: Sessions[3.9])(request: Http.Request)(using Mon
             jsonResponse(Http.Ok, apiResult(repl.react(0, eval.code)).in[Json].show)
 
           case _ =>
-            val error: ApiError = ApiError(t"the request body must be JSON: {\"code\": \"…\"}")
+            val error: ApiError =
+              ApiError
+                ( FlameBolts(FlameBolts.web, 3, 1),
+                  t"the request body must be JSON: {\"code\": \"…\"}" )
             jsonResponse(Http.BadRequest, error.in[Json].show)
 
     case target if request.method == Http.Post &&
       target.starts(t"/api/sessions/") && target.ends(t"/complete") =>
       val name: Text = target.chomp(t"/api/sessions/").chomp(t"/complete", Rtl)
-      val missing: Text = ApiError(t"no session named '$name'").in[Json].show
+      val missing: Text = ApiError.missing(name).in[Json].show
 
       apiSessions.session(name).lay(jsonResponse(Http.NotFound, missing)): repl =>
         // Body is `{"code": "…", "offset": N}`; a stream/parse failure yields `Unset` → 400. The
@@ -232,7 +249,9 @@ private def restApi(apiSessions: Sessions[3.9])(request: Http.Request)(using Mon
 
           case _ =>
             val error: ApiError =
-              ApiError(t"the request body must be JSON: {\"code\": \"…\", \"offset\": N}")
+              ApiError
+                ( FlameBolts(FlameBolts.web, 3, 2),
+                  t"the request body must be JSON: {\"code\": \"…\", \"offset\": N}" )
 
             jsonResponse(Http.BadRequest, error.in[Json].show)
 
@@ -255,7 +274,7 @@ def serveHttp
   ( using Monitor, System, Probate, Classloader )
 :   Unit =
 
-  given Scalac[3.9, Universe.Classfile] = Scalac(Nil)
+  given Scalac[3.9, Toolchain.Universe.Classfile] = Scalac(Nil)
 
   // Each page auto-starts a fresh randomly-named session and may `/session`-switch to any other.
   // Results are exhibited as blocks, without terminal colour.
