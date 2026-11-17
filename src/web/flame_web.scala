@@ -64,7 +64,7 @@ case class ApiCompletion(name: Text, kind: Text, signature: Text)  // one comple
 case class ApiCompletions(completions: List[ApiCompletion])        // the completion response
 case class ApiSessionsList(sessions: List[Text])      // GET  /api/sessions
 case class ApiSessionCreated(session: Text)           // POST /api/sessions
-case class ApiError(error: Text, code: Text)          // a 400/404 error body and its bolt code
+case class ApiError(error: Text, bolt: Text)          // a 400/404 error body and its bolt code
 
 object ApiError:
   def apply(bolt: fulminate.Bolt, error: Text): ApiError = ApiError(error, bolt.text)
