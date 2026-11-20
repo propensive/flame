@@ -43,7 +43,7 @@ import internetAccess.online
 import logging.silentLogging
 import pathInterfaces.pathOnLinux
 import probates.awaitProbate
-import pyrocosm.{Block, Control, Event, Inline, Token, Tone}
+import pyrocosm.{Block, Control, Event, Inline, Shares, Token, Tone}
 import socketBackends.javaBaseSockets
 import strategies.throwUnsafely
 import systems.javaBaseSystem
@@ -151,6 +151,11 @@ object ReplFixture:
     val before: Repl.Outcome = repl.interpret(t"size")
     greeting = "changed"
     (before, repl.interpret(t"size"))
+
+// Fuel's help index, as its publisher declares it (`fuel.Help`): the layout of the share
+// `FuelHelp` reads.
+case class FuelEntry(@key address: Text, info: Text)
+case class FuelIndex(entry: List[FuelEntry])
 
 object Tests extends Suite(m"Flame Tests"):
   def run(): Unit =
@@ -2060,8 +2065,8 @@ object Tests extends Suite(m"Flame Tests"):
 
       test(m"a candidate with a qualified name is shown with the info the lookup has for it"):
         isolated:
-          val help: Text -> Optional[Text] =
-            key => if key == t"scala.Int#toLong" then t"this number, widened" else Unset
+          val help: List[Text] -> Map[Text, Text] =
+            _ => Map(t"scala.Int#toLong" -> t"this number, widened")
 
           val (engine, interface) = fresh(ReplInterface.Options(help = help))
           interface.field.value() = t"1.to"
@@ -2097,6 +2102,74 @@ object Tests extends Suite(m"Flame Tests"):
           interface.field.decoration().completions.map(_.info)
 
       . assert(_ == List(Unset, Unset))
+
+      // Fuel's index, as Fuel publishes it: a share whose entries are keyed by their address.
+      // `FuelHelp` knows only the keywords, so this is the test's own declaration of them.
+      test(m"a candidate is shown with the info Fuel has published for its qualified name"):
+        isolated:
+          pyrocosm.Filing.temporary: directory =>
+            val file: Path on Linux = directory / "share" / "help.ratel"
+
+            val index: FuelIndex =
+              FuelIndex(List(FuelEntry(t"scala.Int#toLong", t"this number, widened")))
+
+            Shares.publish(file, index)
+            val reader: Shares.Reader = Shares.Reader(file, 0L)
+
+            try
+              val help: List[Text] -> Map[Text, Text] = FuelHelp.infos(reader, _)
+              val (engine, interface) = fresh(ReplInterface.Options(help = help))
+              interface.field.value() = t"1.to"
+              interface.handle(Event.Edited(interface.field.input, t"1.to", 4, 4))
+              interface.handle(Event.Key(Keypress.Tab))
+              val id = engine.requests.size
+
+              val items =
+                List
+                  ( Repl.CompletionItem(t"toLong", t"method", t"Long", t"scala.Int#toLong"),
+                    Repl.CompletionItem(t"toLower", t"method", t"String", t"scala.Int#toLower") )
+
+              engine.answer(id, Repl.Reply.Completed(id, items))
+              interface.field.decoration().completions.map(_.info)
+            finally reader.close()
+
+      . assert(_ == List(t"this number, widened", Unset))
+
+      test(m"what Fuel publishes next is what the next lookup finds"):
+        pyrocosm.Filing.temporary: directory =>
+          val file: Path on Linux = directory / "share" / "help.ratel"
+          val reader: Shares.Reader = Shares.Reader(file, 0L)
+
+          try
+            val unpublished: Optional[Text] = FuelHelp.info(reader, t"scala.Int#toLong")
+            Shares.publish(file, FuelIndex(List(FuelEntry(t"scala.Int#toLong", t"widened"))))
+            val first: Optional[Text] = FuelHelp.info(reader, t"scala.Int#toLong")
+
+            Shares.publish
+              ( file,
+                FuelIndex
+                  ( List
+                      ( FuelEntry(t"scala.Int#toLong", t"this number, as a Long"),
+                        FuelEntry(t"scala.Int#toByte", t"this number, as a Byte") ) ) )
+
+            ( unpublished, first, FuelHelp.info(reader, t"scala.Int#toLong"),
+              FuelHelp.info(reader, t"scala.Int#toByte"), FuelHelp.info(reader, t"scala.Int#abs") )
+          finally reader.close()
+
+      . assert:
+          _ == (Unset, t"widened", t"this number, as a Long", t"this number, as a Byte", Unset)
+
+      test(m"a directory's index is that of Fuel's project above it, and nothing without one"):
+        pyrocosm.Filing.temporary: directory =>
+          val root: Text = directory.encode
+          pyrocosm.Filing.replace(directory / ".pyrocosm" / "fuel" / "config.tel", t"")
+          pyrocosm.Filing.replace(directory / "src" / "x.scala", t"")
+
+          ( FuelHelp.file(t"$root/src").let(_.encode) == FuelHelp.file(root).let(_.encode),
+            FuelHelp.file(root).let(_.encode.ends(t"/share/help.ratel")),
+            FuelHelp.of(t"$root/src")(List(t"scala.Int#toLong")).nil )
+
+      . assert(_ == (true, true, true))
 
       test(m"a completion for an older version of the text is dropped"):
         isolated:

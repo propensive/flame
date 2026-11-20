@@ -60,7 +60,8 @@ import webserverErrorPages.minimalErrorPage
 // automatically.
 case class ApiEval(code: Text)                        // POST body for `/api/sessions/{name}/eval`
 case class ApiComplete(code: Text, offset: Int)  // POST body for `/api/sessions/{name}/complete`
-case class ApiCompletion(name: Text, kind: Text, signature: Text)  // one completion candidate
+// One completion candidate; `info` is Fuel's line about it, empty when it has none.
+case class ApiCompletion(name: Text, kind: Text, signature: Text, info: Text = t"")
 case class ApiCompletions(completions: List[ApiCompletion])        // the completion response
 case class ApiSessionsList(sessions: List[Text])      // GET  /api/sessions
 case class ApiSessionCreated(session: Text)           // POST /api/sessions
@@ -198,7 +199,10 @@ class LocalEngine(sessions: Sessions[3.9])(using Monitor, System, Probate) exten
 // session; `POST /api/sessions/{name}/complete` returns the tab-completion candidates at a cursor
 // `offset` in `code`. Routing is exact-string, so the `{name}` path segment is peeled off by
 // stripping the fixed prefix and suffix. Anything else is not the API's (`Unset`).
-private def restApi(apiSessions: Sessions[3.9])(request: Http.Request)(using Monitor)
+private def restApi
+  ( apiSessions: Sessions[3.9], help: List[Text] -> Map[Text, Text] )
+  ( request: Http.Request )
+  ( using Monitor )
 :   Optional[Http.Response] =
 
   request.target match
@@ -241,9 +245,13 @@ private def restApi(apiSessions: Sessions[3.9])(request: Http.Request)(using Mon
           case req: ApiComplete =>
             val offset: Int = req.offset.max(0).min(req.code.length)
 
+            val found: List[Repl.CompletionItem] = repl.completionsAt(req.code, offset)
+            val infos: Map[Text, Text] = help(found.bind(_.qualified.lay(Nil)(List(_))))
+
             val items: List[ApiCompletion] =
-              repl.completionsAt(req.code, offset).map: item =>
-                ApiCompletion(item.name, item.kind, item.signature)
+              found.map: item =>
+                ApiCompletion
+                  ( item.name, item.kind, item.signature, item.qualified.let(infos.at(_)).or(t"") )
 
             jsonResponse(Http.Ok, ApiCompletions(items).in[Json].show)
 
@@ -270,7 +278,7 @@ def serveHttp
   ( port:    Int,
     quit:    Promise[Unit],
     address: Optional[Text]       = Unset,
-    help:    Text -> Optional[Text] = _ => Unset )
+    help:    List[Text] -> Map[Text, Text] = _ => Map() )
   ( using Monitor, System, Probate, Classloader )
 :   Unit =
 
@@ -286,7 +294,8 @@ def serveHttp
   val apiSessions = Sessions(Repl.Rendering.Inspect)
 
   val frontend: pyrocosm.WebFrontend =
-    caps.unsafe.unsafeAssumePure(pyrocosm.WebFrontend(port, fallback = restApi(apiSessions)(_)))
+    caps.unsafe.unsafeAssumePure:
+      pyrocosm.WebFrontend(port, fallback = restApi(apiSessions, help)(_))
 
   async:
     frontend.serve: () =>
@@ -307,4 +316,4 @@ def serveHttp
 @main
 def web(port: Int = 8080): Unit =
   given Classloader = threadContextClassloader
-  supervise(serveHttp(port, Promise[Unit]()))
+  supervise(serveHttp(port, Promise[Unit](), help = FuelHelp.here))
