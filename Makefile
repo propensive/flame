@@ -91,6 +91,12 @@ bench:
 	./mill flame.test.assembly
 	java -cp out/flame/test/assembly.dest/out.jar flame.firstLine $(ARGS)
 
+# Measure a lookup of Fuel's help in the share Fuel publishes, against a map held in memory
+# (`flame.helpLookup`, src/test/flame_bench.scala). ARGS: the number of entries (10000).
+bench-help:
+	./mill flame.test.assembly
+	java -cp out/flame/test/assembly.dest/out.jar flame.helpLookup $(ARGS)
+
 # Check every source against Consequent Style and the project's own rules with flare (the
 # release pinned in etc/tools; `make tools` installs it), as configured in
 # .pyrocosm/flare/config.tel. Findings are warnings, and CI does not run this; PATHS restricts the
@@ -116,4 +122,4 @@ snapshot-prune:
 dev:
 	./mill -w flame.client.compile
 
-.PHONY: bench check xek-fetch tools snapshot snapshot-prune assembly release publishLocal run web test test-plain dev install
+.PHONY: bench bench-help check xek-fetch tools snapshot snapshot-prune assembly release publishLocal run web test test-plain dev install

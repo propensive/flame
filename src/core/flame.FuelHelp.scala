@@ -32,110 +32,63 @@
                                                                                                   */
 package flame
 
-import scala.caps
+import scala.collection.concurrent.TrieMap
 
 import soundness.*
 
 import environments.javaBaseEnvironment
-import probates.cancelProbate
-import pyrocosm.{Advert, Bus, Channel, Machine, Peer, Swarm}
+import pyrocosm.Shares
 
-// Fuel's documentation of the project, held here for completions: a copy of the index Fuel
-// serves — each documented entity's key (`gossamer.Text#length`) and its one-line `info` — so
-// that attaching a line to a candidate is a map lookup, and never waits on another process.
+// Fuel's documentation of a project, read here for completions: each documented entity's
+// address (`gossamer.Text#length`) and its one-line `info`, which Fuel publishes as a share
+// (`pyrocosm.Shares`) — a RaTEL image in the project's cache — whenever it compiles. The file
+// is mapped into memory, and attaching a line to a candidate descends the image's index to
+// that one entry: the rest is not read, nothing waits on another process, and Fuel need not be
+// running.
 //
-// The hub tells Flame where Fuel is: a `fuel` node on this machine advertising a `help`
-// service. The index itself comes over a direct peer connection to that service, as fume
-// reaches its workers, not through the hub's bus (which floods every node and caps an event
-// at 16 KiB). Fuel announces a new model on the bus as an `api` event, which is the cue to
-// fetch again. Every fetch runs on its own task; a failure leaves the last index in place.
+// It is always the project's current index. The reader asks the filesystem whether Fuel has
+// published a newer file — one `stat`, at most every `Shares.interval` — and maps it if so; a
+// project Fuel has not compiled yet has no file, which is looked for again at the next lookup.
 //
-// `Message` mirrors Fuel's `Help.Message` field for field, under the same schema name, so
-// the two derive the same fingerprint, which is the protocol the handshake names.
+// The image carries its schema, so nothing of Fuel's types is repeated here: only the keywords
+// `entry`, `address` (its key) and `info`.
 object FuelHelp:
-  enum Message:
-    case Index(edition: Long, entries: List[Entry])
-
-  case class Entry(key: Text, info: Text)
-
   private val tool: Text = t"fuel"
-  private val service: Text = t"help"
-  private val protocol: Text = t"fuel-help"
-  private val event: Text = t"api"
-  private val port: Int = 8094
+  private val share: Text = t"help"
 
-  private lazy val codec: Channel.Codec[Message] =
-    import Channel.derivation.throwing
-    val schema: Tels = Tels.tels[Message](protocol)
+  // One reader for each project's file, kept for the life of the process.
+  private val readers: TrieMap[Text, Shares.Reader] = TrieMap()
 
-    Channel.Codec
-      ( protocol, schema, message => Channel.encode(message, schema),
-        data => Channel.decode[Message](data) )
+  // The info line of the entry at `address` in the image `reader` holds, if there is one.
+  def info(reader: Shares.Reader, address: Text): Optional[Text] =
+    reader.read((ratel.root / t"entry").find(address).let(_.text(t"info")))
 
-  @caps.unsafe.untrackedCaptures
-  @volatile
-  private var index: Map[Text, Text] = Map()
+  // The info lines of those of `addresses` which have one, found in one reading of the image:
+  // what a list of completions asks, all its candidates at once, since opening the image costs
+  // more than finding an entry in it.
+  def infos(reader: Shares.Reader, addresses: List[Text]): Map[Text, Text] =
+    val found: Optional[List[(Text, Text)]] =
+      reader.read:
+        val entries = ratel.root / t"entry"
 
-  @caps.unsafe.untrackedCaptures
-  @volatile
-  private var edition: Optional[Long] = Unset
+        addresses.bind: (address: Text) =>
+          entries.find(address).let(_.text(t"info")).lay(Nil): info => List(address -> info)
 
-  @caps.unsafe.untrackedCaptures
-  private val started: Atomic[Boolean] = Atomic(false)
+    found.lay(Map())(Map(_*))
 
-  // The info line for a qualified name, if Fuel has one; `Unset` is the usual answer.
-  def lookup(key: Text): Optional[Text] = index.at(key)
+  // Where Fuel publishes the index of the project `directory` is in: Fuel's project, the one
+  // whose `.pyrocosm/fuel/config.tel` is nearest above, which need not be Flame's.
+  def file(directory: Text): Optional[Path on Linux] =
+    Shares.path(tool, Shares.root(tool, directory), share)
 
-  // Holds the index: a copy is fetched now, and again whenever Fuel announces a new model.
-  // Called where a REPL interface is made; later calls do nothing.
-  def start()(using Monitor): Unit =
-    if !started.swap(true) then
-      Swarm.of(Flame.name).let: swarm =>
-        swarm.subscribe(Swarm.Filter(tools = Set(tool), kinds = Set(event), remote = false)):
-          (_, envelope) => envelope.event match
-            case Bus.Event.Tool(_, _, payload) =>
-              val announced: Optional[Long] = safely(payload.utf8.as[Long])
-              if announced != edition then async(fetch())
-            case _ => ()
+  // The lookup for the project `directory` is in: the info lines Fuel has for some qualified
+  // names; none is the usual answer.
+  def of(directory: Text): List[Text] -> Map[Text, Text] =
+    val reader: Optional[Shares.Reader] =
+      file(directory).let: file => readers.getOrElseUpdate(file.encode, Shares.Reader(file))
 
-        async(fetch())
+    (addresses: List[Text]) => reader.lay(Map[Text, Text]())(infos(_, addresses))
 
-  // Fuel's `help` service on this machine, as its node advertises it: the same identity as
-  // this node's (one machine, one certificate), and the machine's own token, which both
-  // tools read from the same file.
-  private def peer(): Optional[Machine] =
-    Swarm.of(Flame.name).let: swarm =>
-      val self: Text = swarm.node.identity
-
-      val advert: Optional[Advert] =
-        swarm.nodes().seek: advert =>
-          advert.node.tool == tool && advert.node.identity == self &&
-            advert.services.exists(_.name == service)
-
-      advert.let: advert =>
-        Machine
-          ( advert.node.machine,
-            List(t"127.0.0.1"),
-            advert.services.seek(_.name == service).let(_.port),
-            Peer.parseFingerprint(advert.node.identity),
-            Peer.token,
-            Nil )
-
-  // Fetches the index once, if Fuel is there: the whole index comes as one message.
-  def fetch(): Unit =
-    peer().let: machine =>
-      val fetched: Optional[Message.Index] =
-        Peer.exchange[Message, Optional[Message.Index]](machine, tool, Flame.version, codec, port):
-          session =>
-            try
-              session.receive() match
-                case Channel.Frame.Message(index: Message.Index) => index
-                case _                                           => Unset
-            finally session.close()
-        . match
-            case scala.Right(index) => index
-            case scala.Left(_)      => Unset
-
-      fetched.let: fetched =>
-        index = Map(fetched.entries.map { entry => entry.key -> entry.info }*)
-        edition = fetched.edition
+  // The lookup for the directory this process runs in, for a front-end which serves no one
+  // invocation.
+  def here: List[Text] -> Map[Text, Text] = of(java.lang.System.getProperty("user.dir").nn.tt)

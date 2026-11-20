@@ -33,6 +33,7 @@
 package flame
 
 import anticipation.*
+import contingency.*
 import denominative.*
 import escapade.*, termcapDefinitions.xtermTrueColorTermcap
 import gossamer.*
@@ -68,30 +69,33 @@ object BytecodeRender:
   private val synthetic: Set[Text] = Set(t"<init>", t"<clinit>", t"writeReplace")
 
   // Renders every non-synthetic method of `resource` (a `<class>.class` resource name loadable by
-  // `classloader`) under a bold header. `Unset` if the class can't be read; an empty `Text` if it
-  // has no disassemblable user methods (the caller reports either).
+  // `classloader`) under a bold header. `Unset` if the class can't be read — absent, or not a
+  // class file the parser accepts; an empty `Text` if it has no disassemblable user methods
+  // (the caller reports either).
   def render(resource: Text)(using Classloader): Optional[Text] =
-    Classfile(resource).let: classfile =>
-      classfile.methods
-        .filter: method => !synthetic.has(method.name)
-        .map: method => (method.name, method.bytecode)
-        .sweep:
-          case (name, code: Bytecode) => e"$Bold(${Names.rewrite(name, true)})\n${code.teletype}"
-        .join(e"\n\n")
-        .render(xtermTrueColorTermcap)
-        .pipe(Names.wrapper(_))
+    safely:
+      Classfile(resource).let: classfile =>
+        classfile.methods
+          .filter: method => !synthetic.has(method.name)
+          .map: method => (method.name, method.bytecode)
+          .sweep:
+            case (name, code: Bytecode) => e"$Bold(${Names.rewrite(name, true)})\n${code.teletype}"
+          .join(e"\n\n")
+          .render(xtermTrueColorTermcap)
+          .pipe(Names.wrapper(_))
 
   // The same methods as blocks: each a group of its demangled name, as a bound term, and its
   // bytecode's table. `Unset` if the class can't be read or has no disassemblable user method.
   def blocks(resource: Text)(using Classloader): Optional[Block] =
-    Classfile(resource).let: classfile =>
-      val groups: List[Block] =
-        classfile.methods
-          .filter: method => !synthetic.has(method.name)
-          .map: method => (method.name, method.bytecode)
-          .sweep { case (name, code: Bytecode) => group(name, code) }
+    safely:
+      Classfile(resource).let: classfile =>
+        val groups: List[Block] =
+          classfile.methods
+            .filter: method => !synthetic.has(method.name)
+            .map: method => (method.name, method.bytecode)
+            .sweep { case (name, code: Bytecode) => group(name, code) }
 
-      if groups.nil then Unset else Names.block(Block.Group(groups))
+        if groups.nil then Unset else Names.block(Block.Group(groups))
 
   private def group(name: Text, code: Bytecode): Block =
     val header: Token = Token(Names.rewrite(name, true), Token.Accent.Term, Token.Role.Binding)

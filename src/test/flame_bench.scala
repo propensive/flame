@@ -35,9 +35,12 @@ package flame
 import soundness.*
 
 import classloaders.threadContextClassloader
+import filesystemBackends.javaBaseFilesystem
 import logging.silentLogging
+import pathInterfaces.pathOnLinux
 import probates.awaitProbate
 import strategies.throwUnsafely
+import pyrocosm.Shares
 import systems.javaBaseSystem
 import temporaryDirectories.systemTemporaryDirectory
 import threads.platformThreads
@@ -179,3 +182,79 @@ def firstLine(args0: String*): Unit =
       row(probe, first, Unset, kind(reply))
 
   java.lang.System.exit(0)
+
+// A measurement, not a test: what it costs to find Fuel's line about a name in the share Fuel
+// publishes (`FuelHelp`), against the same lookup in a `Map` held in memory, which is what a
+// copy of the index fetched whole used to be. `make bench-help` runs it; ARGS is the number of
+// entries (10000 by default).
+//
+// Printed: publishing the index; the first lookup, which maps the file; a lookup of a name
+// which is there and of one which is not; a completion's worth (40 names, one in four
+// documented), one at a time and as the REPL asks, in one reading; the same against the `Map`;
+// and a lookup just after a newer index is published.
+@main
+def helpLookup(args0: String*): Unit =
+  val out = java.lang.System.out.nn
+  val count: Int = args0.stdlib.headOption.flatMap(_.toIntOption).getOrElse(10000)
+
+  def address(number: Int): Text = t"example.module$number.Type$number#member$number"
+
+  def entries(suffix: Text): List[FuelEntry] =
+    List.range(0, count).map: number =>
+      FuelEntry(address(number), t"the member numbered $number of its type$suffix")
+
+  // The median of `runs` timings of `action`, in nanoseconds, after as many again to warm up.
+  def median(runs: Int)(action: => Unit): Long =
+    def time(): Long =
+      val start: Long = java.lang.System.nanoTime
+      action
+      java.lang.System.nanoTime - start
+
+    List.range(0, runs).each { _ => time() }
+    List.range(0, runs).map { _ => time() }.stdlib.sorted.apply(runs/2)
+
+  def micros(nanos: Long): String = "%.1f µs".format(nanos/1000.0)
+
+  pyrocosm.Filing.temporary: directory =>
+    val file: Path on Linux = directory / "share" / "help.ratel"
+    val index: FuelIndex = FuelIndex(entries(t""))
+    val started: Long = java.lang.System.nanoTime
+    Shares.publish(file, index)
+    val published: Long = java.lang.System.nanoTime - started
+    val size: Long = java.nio.file.Files.size(java.nio.file.Path.of(file.encode.s))
+    out.println(s"$count entries, ${size/1024} KiB; published in ${published/1000000L} ms")
+
+    val reader: Shares.Reader = Shares.Reader(file)
+    val names: List[Text] = List.range(0, 40).map { number => address(number*(count/10)) }
+    val present: Text = address(count/2)
+    val absent: Text = address(count + 7)
+
+    val began: Long = java.lang.System.nanoTime
+    val first: Optional[Text] = FuelHelp.info(reader, present)
+    out.println(s"first lookup (maps the file): ${micros(java.lang.System.nanoTime - began)}")
+    out.println(s"  found: ${first.or(t"nothing")}")
+
+    out.println(s"share, a name it has:    ${micros(median(2000)(FuelHelp.info(reader, present)))}")
+    out.println(s"share, a name it lacks:  ${micros(median(2000)(FuelHelp.info(reader, absent)))}")
+
+    out.println:
+      s"share, 40 candidates:    ${micros(median(500)(names.each(FuelHelp.info(reader, _))))}"
+
+    out.println(s"share, 40 in one read:   ${micros(median(500)(FuelHelp.infos(reader, names)))}")
+
+    val map: Map[Text, Text] = Map(index.entry.map { entry => entry.address -> entry.info }*)
+    out.println(s"Map, a name it has:      ${micros(median(2000)(map.at(present)))}")
+    out.println(s"Map, 40 candidates:      ${micros(median(500)(names.each(map.at(_))))}")
+
+    val rebuilt: Long = median(5):
+      Map(index.entry.map { entry => entry.address -> entry.info }*)
+
+    out.println(s"Map, built from the list: ${micros(rebuilt)} (the cost of each fetch before)")
+
+    Shares.publish(file, FuelIndex(entries(t", revised")))
+    Thread.sleep(Shares.interval + 5L)
+    val again: Long = java.lang.System.nanoTime
+    val revised: Optional[Text] = FuelHelp.info(reader, present)
+    out.println(s"lookup after a new index: ${micros(java.lang.System.nanoTime - again)}")
+    out.println(s"  found: ${revised.or(t"nothing")}")
+    reader.close()
