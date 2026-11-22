@@ -2108,6 +2108,42 @@ object Tests extends Suite(m"Flame Tests"):
             streaming.head.lay(false)(pendingEntry) && texts(streaming).contains(t"hi") &&
               !settled.head.lay(false)(pendingEntry) && texts(settled).cut(t"hi").size == 2
 
+      // What a line printed directly follows its code, inside the entry's frame: that adjacency
+      // is what has the web draw the output as the lower part of the code's block. The result
+      // is not the code's output, and follows the frame.
+      def shape(entries: List[Block]): Text =
+        val kinds: List[Text] = entries.head.lay(Nil: List[Text]):
+          case Block.Group(content) =>
+            content.map:
+              case Block.Rule(_)         => t"rule"
+              case _: Block.Code         => t"code"
+              case Block.Output(_, _, _) => t"output"
+              case Block.Gauge(_, _)     => t"gauge"
+              case _                     => t"other"
+
+          case _ =>
+            Nil
+
+        kinds.join(t" ")
+
+      test(m"a line's output directly follows its code, while it runs and once it has settled"):
+        isolated:
+          val (engine, interface) = fresh()
+          interface.handle(Event.Submitted(interface.field.input, t"slow()"))
+          val id = engine.submissions.head.let(_.id).or(0)
+          engine.answer(id, Repl.Reply.Pending(id))
+          engine.push(Repl.Reply.Output(id, t"hi\n", Repl.stdoutStream))
+          engine.push(Repl.Reply.Output(id, t"oops\n", Repl.stderrStream))
+          val streaming = shape(interface.transcript())
+          val output = List(Block.Output(t"hi\n"), Block.Output(t"oops\n", error = true))
+          val blocks = Blocks.encode(output + List(Block.paragraph(t"res0: Int = 2")))
+          engine.push(Repl.Reply.Ran(id, Unset, t"", Unset, Unset, t"", Nil, Nil, blocks))
+          (streaming, shape(interface.transcript()))
+
+      . assert: (streaming, settled) =>
+          streaming == t"rule code output output rule gauge" &&
+            settled == t"rule code output output rule other"
+
       test(m"editing decorates the prompt at once and asks the engine for the scope"):
         isolated:
           val (engine, interface) = fresh()
