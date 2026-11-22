@@ -91,6 +91,14 @@ bench:
 	./mill flame.test.assembly
 	java -cp out/flame/test/assembly.dest/out.jar flame.firstLine $(ARGS)
 
+# Measure whether a line costs more the more lines its session already holds, and what an
+# abandoned session leaves behind (`flame.longSession`, src/test/flame_bench.scala). ARGS:
+# `--lines <n>` and `--every <k>` size the session and space the measurements; `--abandon <m>`
+# opens and abandons `m` sessions instead, as `m` launches of a client do.
+bench-long:
+	./mill flame.test.assembly
+	java -cp out/flame/test/assembly.dest/out.jar flame.longSession $(ARGS)
+
 # Measure a lookup of Fuel's help in the share Fuel publishes, against a map held in memory
 # (`flame.helpLookup`, src/test/flame_bench.scala). ARGS: the number of entries (10000).
 bench-help:
@@ -122,4 +130,4 @@ snapshot-prune:
 dev:
 	./mill -w flame.client.compile
 
-.PHONY: bench bench-help check xek-fetch tools snapshot snapshot-prune assembly release publishLocal run web test test-plain dev install
+.PHONY: bench bench-long bench-help check xek-fetch tools snapshot snapshot-prune assembly release publishLocal run web test test-plain dev install

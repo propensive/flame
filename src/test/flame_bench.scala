@@ -183,6 +183,237 @@ def firstLine(args0: String*): Unit =
 
   java.lang.System.exit(0)
 
+// A measurement, not a test: whether a line costs more the more lines its session already holds,
+// and what a session that is opened and then abandoned leaves behind. `make bench-long` runs it,
+// in one fresh JVM.
+//
+//   --lines <n>    grow the session to `n` lines (300)
+//   --every <k>    take the measurements every `k` lines (25)
+//   --warm <w>     first submit `w` lines to a scratch session, which is then closed, so that the
+//                  JVM's own warming-up is not mistaken for a young session's cost (60)
+//   --cpu          time by the processor time of the submitting and compiler threads rather than
+//                  by the wall clock, which is what to compare two builds by on a busy machine
+//   --abandon <m>  instead: open `m` sessions as a front-end does, one after another, submit a
+//                  line to each and leave it unclosed, as a client that exits does
+//
+// A session is grown with filler lines — a `val`, a `def`, a `case class` and a `given` in turn —
+// and at each checkpoint the same few lines are timed, as the median of five submissions: an
+// expression (`expr`), a use of two early definitions (`early`), a Soundness line that needs a
+// given (`given`), and a line that is rejected (`reject`); then a completion at a bare position
+// (`compl`) and a scope probe of a multi-line definition (`scope`, once: the first after a line,
+// which is the one that opens an inspector). `fill` is the mean cost of the filler lines since
+// the last checkpoint. The lines timed are themselves lines of the session, and `lines` counts
+// them. The heap is what remains in use after a collection.
+@main
+def longSession(args0: String*): Unit =
+  given Scalac[3.9, Toolchain.Universe.Classfile] = Scalac(Nil)
+
+  val args: scala.collection.immutable.Seq[String] = args0.stdlib
+  val out = java.lang.System.out.nn
+
+  def number(name: String, default: Int): Int =
+    val index: Int = args.indexOf(name)
+
+    if index < 0 || index + 1 >= args.length then default
+    else args(index + 1).toIntOption.getOrElse(default)
+
+  val lines: Int = number("--lines", 300)
+  val every: Int = number("--every", 25).max(1)
+  val warm: Int = number("--warm", 60)
+  val abandon: Int = number("--abandon", 0)
+  val runs: Int = 5
+
+  // The clock: the wall's, or with `--cpu` the processor time used by the thread that asks and by
+  // the sessions' compiler threads, which is where a line's cost is spent. A busy machine does not
+  // stretch that as it does the wall's, and neither the JVM's own compiler nor its collector is
+  // counted in it, so it is what to compare two builds by.
+  val clock: () => Long =
+    if !args.contains("--cpu") then () => java.lang.System.nanoTime else
+      val bean = java.lang.management.ManagementFactory.getThreadMXBean.nn
+
+      () =>
+        val ids: scala.Array[Long] = bean.getAllThreadIds.nn
+        var total: Long = bean.getCurrentThreadCpuTime
+        var index: Int = 0
+
+        while index < ids.length do
+          val info: java.lang.management.ThreadInfo | Null = bean.getThreadInfo(ids(index))
+
+          if info != null && info.getThreadName.nn.startsWith("flame-compiler")
+          then total = total + bean.getThreadCpuTime(ids(index)).max(0L)
+
+          index += 1
+
+        total
+
+  def millis(block: => Unit): Long =
+    val start = clock()
+    block
+    (clock() - start)/1000000L
+
+  def median(block: => Unit): Long =
+    List.range(0, runs).map { _ => millis(block) }.stdlib.sorted.apply(runs/2)
+
+  def heap(): Long =
+    java.lang.System.gc()
+    val runtime = Runtime.getRuntime.nn
+    (runtime.totalMemory - runtime.freeMemory)/(1024L*1024L)
+
+  def collecting(): Long =
+    val beans = java.lang.management.ManagementFactory.getGarbageCollectorMXBeans.nn
+    var total: Long = 0L
+    var index: Int = 0
+
+    while index < beans.size do
+      total = total + beans.get(index).nn.getCollectionTime
+      index += 1
+
+    total
+
+  def classes(): Int =
+    java.lang.management.ManagementFactory.getClassLoadingMXBean.nn.getLoadedClassCount
+
+  def threads(): Int = java.lang.management.ManagementFactory.getThreadMXBean.nn.getThreadCount
+
+  def filler(index: Int): Text = index%4 match
+    case 0 => t"val v$index = $index"
+    case 1 => t"def f$index(n: Int): Int = n + $index"
+    case 2 => t"case class C$index(x: Int)"
+    case _ => t"given g$index: scala.math.Ordering[C${index - 1}] = scala.math.Ordering.by(_.x)"
+
+  val samples: List[Text] =
+    List(t"1 + 1", t"f1(v0)", t"t\"hello\".length", t"val bad: Int = undefinedName")
+
+  supervise:
+    // A session, and how many lines it holds: every line it did not refuse.
+    class Aged():
+      val repl = Repl.make[3.9](Repl.Prelude.empty, Repl.Rendering.Inspect)
+      var size: Int = 0
+      var next: Int = 0
+
+      def submit(line: Text): Boolean = repl.react(1, line) match
+        case Repl.Reply.Rejected(_, diagnostics, _, _) => false
+        case _: Repl.Reply.Crashed                     => false
+        case _: Repl.Reply.Failed                      => false
+        case _                                         => (size += 1) yet true
+
+      // Filler lines until the session holds `target`; the mean cost of one, in milliseconds.
+      def fill(target: Int): Long =
+        var count: Int = 0
+        var refused: Int = 0
+        val start: Long = clock()
+
+        while size < target && refused < 20 do
+          if !submit(filler(next)) then
+            refused += 1
+            out.println(s"  refused: ${filler(next).s}")
+
+          next += 1
+          count += 1
+
+        if refused >= 20 then
+          out.println("the filler lines are being refused; giving up")
+          java.lang.System.exit(1)
+
+        if count == 0 then 0L else (clock() - start)/1000000L/count
+
+      def measure(filled: Long): Unit =
+        val at: Int = size
+        val scope: Long = millis(repl.scopeAt(t"def probe$at(a: Int) =\n  a"))
+        val timed = samples.map { line => median(submit(line)) }.stdlib
+        val completion: Long = median(repl.completionsAt(t"v", 1))
+
+        out.println:
+          String.format
+            ( "%6s %6s %6s %6s %6s %6s %6s %6s %8s %8s %8s %8s",
+              at.toString,
+              filled.toString,
+              timed(0).toString,
+              timed(1).toString,
+              timed(2).toString,
+              timed(3).toString,
+              completion.toString,
+              scope.toString,
+              heap().toString,
+              collecting().toString,
+              classes().toString,
+              threads().toString )
+
+    def aged(): Unit =
+      if warm > 0 then
+        val scratch = Aged()
+        scratch.submit(t"/set experimental")
+        scratch.submit(t"import soundness.*")
+        scratch.fill(warm)
+        samples.each { line => scratch.submit(line) }
+        scratch.repl.completionsAt(t"v", 1)
+        scratch.repl.close()
+        out.println(s"warmed up with $warm lines in a scratch session")
+
+      out.println:
+        String.format
+          ( "%6s %6s %6s %6s %6s %6s %6s %6s %8s %8s %8s %8s",
+            "lines",
+            "fill",
+            "expr",
+            "early",
+            "given",
+            "reject",
+            "compl",
+            "scope",
+            "heap MB",
+            "gc ms",
+            "classes",
+            "threads" )
+
+      val session = Aged()
+      session.submit(t"/set experimental")
+      session.submit(t"import soundness.*")
+      session.measure(session.fill(4))
+
+      while session.size < lines do
+        session.measure(session.fill((session.size/every + 1)*every))
+
+    // What a launch costs the process it is served by: each is a connection that opens a session
+    // of its own, is warmed up as a front-end's is, has a line or two submitted to it, and is
+    // then let go without the session being closed.
+    def abandoned(): Unit =
+      val sessions = Sessions(Repl.Rendering.Inspect, frontend = true)
+
+      out.println:
+        String.format
+          ( "%8s %6s %6s %8s %8s %8s %8s",
+            "sessions",
+            "first",
+            "expr",
+            "heap MB",
+            "gc ms",
+            "classes",
+            "threads" )
+
+      List.range(0, abandon).each: count =>
+        val connection = sessions.connection(_ => ())
+        connection.respond(Repl.Request.Session(0, t""))
+        Thread.sleep(50)
+        while connection.name.let(sessions.session(_)).lay(false)(_.priming) do Thread.sleep(10)
+        val first: Long = millis(connection.respond(Repl.Request.Submit(1, t"1 + 1")))
+        val again: Long = median(connection.respond(Repl.Request.Submit(1, t"1 + 1")))
+
+        out.println:
+          String.format
+            ( "%8s %6s %6s %8s %8s %8s %8s",
+              (count + 1).toString,
+              first.toString,
+              again.toString,
+              heap().toString,
+              collecting().toString,
+              classes().toString,
+              threads().toString )
+
+    if abandon > 0 then abandoned() else aged()
+
+  java.lang.System.exit(0)
+
 // A measurement, not a test: what it costs to find Fuel's line about a name in the share Fuel
 // publishes (`FuelHelp`), against the same lookup in a `Map` held in memory, which is what a
 // copy of the index fetched whole used to be. `make bench-help` runs it; ARGS is the number of
