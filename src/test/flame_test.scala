@@ -453,6 +453,27 @@ object Tests extends Suite(m"Flame Tests"):
 
       . assert(_ == t"quantity: Quantity[Feet[2]]")
 
+      // `soundness.*` brings `infix type of` into scope, so the refinement it expands to is
+      // written with it, as the user would write it.
+      test(m"a refined type is written with an infix alias which a wildcard import brings in"):
+        isolated:
+          val repl = Opened(Repl())
+          repl.react(0, t"/set experimental")
+          repl.react(0, t"import soundness.*")
+          binding(repl.interpret(t"x\"<foo/>\""))
+
+      . assert(_.ends(t": Xml of \"foo\""))
+
+      // … and only then: with `of` not in scope, the same type stays a refinement.
+      test(m"a refined type stays a refinement where no infix alias for it is in scope"):
+        isolated:
+          val repl = Opened(Repl())
+          repl.react(0, t"/set experimental")
+          repl.react(0, t"import xylophone.*")
+          binding(repl.interpret(t"x\"<foo/>\""))
+
+      . assert(_.ends(t": Xml { type Topic = \"foo\" }"))
+
       def diagnostics(reply: Repl.Reply): Text = reply match
         case r: Repl.Reply.Rejected => SemanticRender.stripAnsi(r.diagnostics)
         case _                      => t""
