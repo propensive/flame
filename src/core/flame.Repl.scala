@@ -2050,8 +2050,10 @@ class Repl[version <: Scalac.Versions]
         directType(body)
 
     // Resolve the exports of the user's wildcard scopes (extending `direct` with each export's
-    // target), keeping the full `designators` set for prefix matching. No wildcard imports, no
-    // reifier at all.
+    // target), keeping the full `designators` set for prefix matching. Everything else the
+    // resolution found is kept as it is — above all its `aliases`, the infix type aliases those
+    // scopes bring in, without which `Xml of "foo"` is written out as the refinement it expands
+    // to. No wildcard imports, no reifier at all.
     if exportable.isEmpty then stenography.Imports(designators, direct)
     else
       val statements: List[Text] = prelude.imports.map(_.tt) + imports
@@ -2062,7 +2064,7 @@ class Repl[version <: Scalac.Versions]
           exportsCache = (statements, fresh)
           fresh
 
-      stenography.Imports(designators, resolved.direct)
+      resolved.copy(designators = designators)
 
   // Renders a resolved type for DISPLAY (a result line's `: type`, a `def`'s return type),
   // abbreviated against the session's imports so it reads as the user wrote it — the same
