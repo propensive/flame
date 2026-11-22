@@ -157,10 +157,10 @@ object ReplFixture:
 case class FuelEntry(@key address: Text, info: Text)
 case class FuelIndex(entry: List[FuelEntry])
 
-// The same index with the pages Fuel also lists in it, and the share in which Fuel says where
-// its site is served, for as long as it is (`FuelHelp.pages`).
+// The pages Fuel publishes beside the index, and the share in which Fuel says where its site
+// is served, for as long as it is (`FuelHelp.pages`).
 case class FuelPage(@key address: Text, url: Text)
-case class FuelPages(entry: List[FuelEntry], page: List[FuelPage])
+case class FuelPages(page: List[FuelPage])
 case class FuelSite(address: Text, pid: Text)
 
 object Tests extends Suite(m"Flame Tests"):
@@ -2348,9 +2348,9 @@ object Tests extends Suite(m"Flame Tests"):
 
       test(m"Fuel's pages are found only while a living process says where they are served"):
         pyrocosm.Filing.temporary: directory =>
-          val index: Path on Linux = directory / "share" / "help.ratel"
+          val index: Path on Linux = directory / "share" / "pages.ratel"
           val site: Path on Linux = directory / "share" / "site.ratel"
-          val pages = FuelPages(Nil, List(FuelPage(t"xylophone.Xml", t"/api/xylophone.Xml")))
+          val pages = FuelPages(List(FuelPage(t"xylophone.Xml", t"/api/xylophone.Xml")))
           Shares.publish(index, pages)
           val reader: Shares.Reader = Shares.Reader(index, 0L)
           val announced: Shares.Reader = Shares.Reader(site, 0L)

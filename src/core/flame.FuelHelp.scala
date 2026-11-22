@@ -94,11 +94,14 @@ object FuelHelp:
   def here: List[Text] -> Map[Text, Text] = of(java.lang.System.getProperty("user.dir").nn.tt)
 
   // ── Pages ───────────────────────────────────────────────────────────────────────────────
-  // Fuel's index also has a `page` for every entity it documents, whether or not it has an
-  // info line: its `address` (the key) and its `url`, the page's path beneath the root of
-  // Fuel's site. Where that root is, Fuel says in a second share, `site`, for as long as it is
-  // serving the pages and no longer: its `address`, and the `pid` of the process serving. So
-  // a name is linked to its page only while there is a page to open.
+  // Fuel publishes a second share beside the index, `pages`, with a `page` for every entity it
+  // documents, whether or not it has an info line: its `address` (the key) and its `url`, the
+  // page's path beneath the root of Fuel's site. (It is a file of its own because an entry and
+  // its page have one address, and a key is unique among all of an image's members.) Where
+  // that root is, Fuel says in a third share, `site`, for as long as it is serving the pages
+  // and no longer: its `address`, and the `pid` of the process serving. So a name is linked to
+  // its page only while there is a page to open.
+  private val paged: Text = t"pages"
   private val site: Text = t"site"
 
   // The page paths of those of `addresses` which have a page, found in one reading.
@@ -137,7 +140,7 @@ object FuelHelp:
     val project: Text = Shares.root(tool, directory)
 
     val index: Optional[Shares.Reader] =
-      Shares.path(tool, project, share).let: file =>
+      Shares.path(tool, project, paged).let: file =>
         readers.getOrElseUpdate(file.encode, Shares.Reader(file))
 
     val announced: Optional[(Path on Linux, Shares.Reader)] =
