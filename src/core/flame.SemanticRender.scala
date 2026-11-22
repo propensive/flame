@@ -136,6 +136,11 @@ object SemanticRender:
       case Markup.Named(_, _, children)       => pieces(children)
       case Markup.Spanned(_, _, children)     => pieces(children)
 
+      // A tree (of a missing given's search) holds, between its nodes, the text which draws
+      // it: in a terminal's text that drawing is the tree.
+      case Markup.Tree(_, children)           => pieces(children)
+      case Markup.Node(_, _, _, _, children)  => pieces(children)
+
     flow(pieces(message.markup))
 
   // Flows `pieces` into a Teletype wrapped at `wrapWidth` (see `ansiMessage`): the pieces are
