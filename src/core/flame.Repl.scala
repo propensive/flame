@@ -1507,6 +1507,17 @@ object Repl:
     else if selective then t"import soundness.{$unadvisedSelector$selectors"
     else statement
 
+  // Whether a wrapper compiled from `code` may have members that reflection on its class would
+  // not find, or that a later line would use without naming: a given or an implicit, a type alias
+  // or an opaque type, an inline method, or an export (which may be of types). Judged by the
+  // words in it, so a string or a comment that has one counts too, and costs only an import.
+  private val unreflectedWords: java.util.regex.Pattern =
+    java.util.regex.Pattern.compile:
+      "\\b(given|implicit|type|opaque|inline|transparent|export)\\b"
+    . nn
+
+  def unreflected(code: Text): Boolean = unreflectedWords.matcher(code.s).nn.find()
+
   def advised(statement: Text): Text = statement.sub(unadvisedSelector, t"")
 
   // The compiler flag for semantic diagnostics (see `effectiveScalac`), which completion drops.
@@ -1617,6 +1628,13 @@ class Repl[version <: Scalac.Versions]
   @scala.caps.unsafe.untrackedCaptures
   private var importsCache: Optional[(List[Text], stenography.Imports)] = Unset
 
+  // What the reifier resolved the wildcard imports' exports to, under the import statements they
+  // were resolved for: the key of `importsCache` changes with every line, since each adds a
+  // wrapper, but the exports change only when an import is added or removed (or the classpath
+  // grows), and resolving them is the costly part of rebuilding the `Imports`.
+  @scala.caps.unsafe.untrackedCaptures
+  private var exportsCache: Optional[(List[Text], stenography.Imports)] = Unset
+
   // Serialises EVERY use of the reifier: its construction, the export resolution that builds
   // `semanticImports`, and the unpickling of a diagnostic's types (`SemanticRender.render`). The
   // reifier holds ONE dotc context, and dotc's symbol table is single-threaded — yet the socket
@@ -1647,6 +1665,24 @@ class Repl[version <: Scalac.Versions]
   // must exclude the names that a later wrapper re-defines (see `historyImports`).
   @scala.caps.unsafe.untrackedCaptures
   private var historyMembers: Map[Text, Set[Text]] = Map()
+
+  // The wrappers whose members reflection cannot be trusted to have named in full, and which every
+  // line therefore imports whether or not it mentions one of them (see `historyImports`): one
+  // whose line may define a given, which is used without being named, or a type alias or an inline
+  // method, which leave no trace in bytecode (`Repl.unreflected`); one compiled from something
+  // other than a line; and one whose reflection failed.
+  @scala.caps.unsafe.untrackedCaptures
+  private var historyOpaque: Map[Text, Boolean] = Map()
+
+  // The history imports of the line being evaluated, which every compile of it uses, and whether
+  // a compile of it that fails for want of a given should have advice sought on it; both set by
+  // `evaluate`, and so only ever touched under `mutex`. `Unset` outside a line's evaluation, when
+  // a compile imports the whole history.
+  @scala.caps.unsafe.untrackedCaptures
+  private var lineImports: Optional[List[Text]] = Unset
+
+  @scala.caps.unsafe.untrackedCaptures
+  private var advisable: Boolean = true
 
   // The user's persistent imports. An `import` statement creates no member, so — unlike
   // the `val`/`def`/`class` definitions that later lines see through the history imports
@@ -1733,7 +1769,7 @@ class Repl[version <: Scalac.Versions]
   // inner classes of both are read and a module class's name is taken without its `$`. A
   // bare `type` alias leaves no trace in bytecode, so a re-defined alias cannot be shadowed
   // this way — an accepted limitation.
-  private def wrapperMembers(name: Text): Set[Text] =
+  private def wrapperMembers(name: Text): Optional[Set[Text]] =
     try
       // Java reflection hands back a nullable JVM array, so each element is read by index
       // rather than traversed.
@@ -1760,7 +1796,20 @@ class Repl[version <: Scalac.Versions]
         .filter: each => !each.contains(t"$$") && each != t"writeReplace"
         .to[Set]
 
-    catch case _: Throwable => Set()
+    catch case _: Throwable => Unset
+
+  // Adds the wrapper `name`, just compiled from `code` (or from something that is not a line), to
+  // the history. Its members are filed before its name is: `scopeAt` reads both without `mutex`,
+  // and a wrapper in the history without its members would be one a line that needs it could
+  // leave out.
+  private def record(name: Text, code: Optional[Text]): Unit =
+    val members: Optional[Set[Text]] = wrapperMembers(name)
+    historyMembers = historyMembers.define(name, members.or(Set()))
+
+    if members.absent || code.lay(true)(Repl.unreflected)
+    then historyOpaque = historyOpaque.define(name, true)
+
+    history = history :+ name
 
   // A binding name for a new result: `base` if free, else `base2`, `base3`, … A candidate is taken
   // if it is a keyword or a name a prior wrapper (or the prelude seed) already binds — reusing one
@@ -1783,19 +1832,46 @@ class Repl[version <: Scalac.Versions]
   // earlier one of the same name (standard REPL behaviour), each earlier wrapper's
   // import excludes every member that a later wrapper re-defines, leaving exactly one
   // binding per name.
-  private def historyImports: List[Text] =
-    val exports: List[Set[Text]] =
-      history.map: (name: Text) => historyMembers.at(name).or(Set())
+  //
+  // Built from the latest wrapper back, carrying the names bound so far: every line asks for these
+  // several times, and each multi-line keystroke once, so the cost must stay linear in the
+  // session's length rather than gathering, for each wrapper, the members of all those after it.
+  //
+  // Given the text of a line, only the wrappers that line could need are imported: those with a
+  // member, not re-defined since, whose name appears somewhere in the text, and those whose
+  // members are not all known (`historyOpaque`). Every import is typed afresh in each compile, its
+  // wrapper's name looked up through all the imports before it, and every name in the line is
+  // then looked up through all of them — so a line that imported the whole history cost more
+  // with every line before it, which is most of what made a long session slow. That a name
+  // appears in the text is a generous test (it may be part of a longer name, or in a string), and
+  // errs only by importing a wrapper that was not needed; `evaluate` guards the other way, by
+  // trying a line it would reject again with the whole history.
+  private def historyImports(text: Optional[Text] = Unset): List[Text] =
+    val members: Map[Text, Set[Text]] = historyMembers
+    val opaque: Map[Text, Boolean] = historyOpaque
+    var later: Set[Text] = Set()
+    var statements: List[Text] = Nil
 
-    history.zip(exports).indexed.map: (entry, ordinal) =>
-      val (name, members) = entry
-      val later: Set[Text] = exports.skip(ordinal.n0 + 1).fold(Set())(_ + _)
-      val hidden: List[Text] = members.intersect(later).to[List].order(_.s)
+    history.reverse.each: (name: Text) =>
+      val exported: Set[Text] = members.at(name).or(Set())
+      val hidden: List[Text] = exported.intersect(later).to[List].order(_.s)
 
-      if hidden.nil then t"import $name.{given, *}"
-      else
-        val exclusions = hidden.map { (member: Text) => t"`$member` as _" }.join(t", ")
-        t"import $name.{$exclusions, given, *}"
+      val needed: Boolean = text.lay(true): text =>
+        opaque.at(name).or(false) || exported.to[List].exists: (member: Text) =>
+          !later.has(member) && text.contains(member)
+
+      if needed then
+        val statement: Text =
+          if hidden.nil then t"import $name.{given, *}"
+          else
+            val exclusions = hidden.map { (member: Text) => t"`$member` as _" }.join(t", ")
+            t"import $name.{$exclusions, given, *}"
+
+        statements = statement :: statements
+
+      later = later + exported
+
+    statements
 
   // The compile classpath must come from the *same* loader the wrapper objects
   // are run against (`classloader`, below), not from `classloaders.threadContext`:
@@ -1959,7 +2035,16 @@ class Repl[version <: Scalac.Versions]
     // target), keeping the full `designators` set for prefix matching. No wildcard imports, no
     // reifier at all.
     if exportable.isEmpty then stenography.Imports(designators, direct)
-    else stenography.Imports(designators, semanticReifier.imports(exportable, direct).direct)
+    else
+      val statements: List[Text] = prelude.imports.map(_.tt) + imports
+
+      val resolved: stenography.Imports =
+        exportsCache.let { (key, cached) => if key == statements then cached else Unset }.or:
+          val fresh: stenography.Imports = semanticReifier.imports(exportable, direct)
+          exportsCache = (statements, fresh)
+          fresh
+
+      stenography.Imports(designators, resolved.direct)
 
   // Renders a resolved type for DISPLAY (a result line's `: type`, a `def`'s return type),
   // abbreviated against the session's imports so it reads as the user wrote it — the same
@@ -2261,7 +2346,7 @@ class Repl[version <: Scalac.Versions]
         val content: Text =
           if Repl.neverExpression(code) then body else t"final val __scope = $body"
 
-        val source: Text = layout.wrap(index, historyImports, contextImports(code), content)
+        val source: Text = layout.wrap(index, historyImports(), contextImports(code), content)
         val offset: Int = source.offsetOf(ScopeInspector.marker, Rtl).let(_.n0).or(-1)
         val scalac: Scalac[version, Toolchain.Universe.Classfile] = effectiveScalac
         val path: Text = classpath()
@@ -2382,6 +2467,8 @@ class Repl[version <: Scalac.Versions]
     primeable = false
     scopeCache = Unset
     reifierCache = Unset
+    importsCache = Unset
+    exportsCache = Unset
     ReplContext.clear(session)
     ReplBridge.clear(session)
 
@@ -2675,7 +2762,7 @@ class Repl[version <: Scalac.Versions]
   :   (Built^{onOutput, rendered}) logs Compiler.Event raises Compiler.Error raises Async.Error =
 
     val name:    Text = layout.objectName(index)
-    val imported: List[Text] = historyImports
+    val imported: List[Text] = lineImports.or(historyImports())
     val source:  Text = layout.wrap(index, imported, imports, code)
     val (outcome, raw) = warmCompile(Map(t"$name.scala" -> source))
 
@@ -2684,7 +2771,9 @@ class Repl[version <: Scalac.Versions]
     // and diagnosed; else when (and if) it is wanted. The first compile of the line to need it
     // starts the search, and a later one (the statement fallback of an expression) keeps it,
     // since its notices are positioned against the line as typed, either way.
-    if outcome == Compiler.Result.Failure && Repl.missingGiven(raw) && pendingAdvice.absent then
+    val wanting: Boolean = outcome == Compiler.Result.Failure && Repl.missingGiven(raw)
+
+    if wanting && advisable && pendingAdvice.absent then
       val advisedImports: List[Text] = imports.map(Repl.advised)
       val advisedSource: Text = layout.wrap(index, imported, advisedImports, code)
       val scalac: Scalac[version, Toolchain.Universe.Classfile] = effectiveScalac
@@ -2717,8 +2806,7 @@ class Repl[version <: Scalac.Versions]
 
       case Compiler.Result.Success =>
         index += 1
-        history = history :+ name
-        historyMembers = historyMembers.define(name, wrapperMembers(name))
+        record(name, origin.or(code))
 
         Built.Deferred: () =>
           // Capture whatever the user's code prints to stdout. Scala's `println` writes to
@@ -2997,7 +3085,7 @@ class Repl[version <: Scalac.Versions]
 
         // Compile `body` as the wrapper object's contents, returning the result and its notices.
         def attempt(body: Text): (Compiler.Result, List[Notice]) =
-          val source = layout.wrap(index, historyImports, contextImports(line), body)
+          val source = layout.wrap(index, historyImports(), contextImports(line), body)
           warmCompile(Map(t"$name.scala" -> source))
 
         // Try the code as an expression (wrapped in a method) first, then as a raw definition.
@@ -3082,17 +3170,38 @@ class Repl[version <: Scalac.Versions]
 
     val key: Text = t"result:${session.toString.tt}:${index.toString.tt}"
 
-    // The scope this line sees, for typing the result and for checking name collisions.
-    val context: List[Text] =
-      ambientImports + (prelude.imports.map(_.tt) + sessionImports).map(Repl.unadvised) +
-        historyImports
+    // One attempt at the line, every compile and probe of which sees the earlier lines through
+    // `imported`; advice on a missing given is sought only in the `last` attempt there will be.
+    def attempt(imported: List[Text], last: Boolean): Built^{onOutput} =
+      lineImports = imported
+      advisable = last
 
-    // A definition or declaration can never be an expression: go STRAIGHT to the
-    // definition/statement path, skipping the result-type probe and the try-as-expression compile —
-    // two whole compiler runs (each re-loading the session's import context) that could only fail
-    // at the parser.
-    if Repl.neverExpression(line) then definitionOrStatement(line, key, context, onOutput)
-    else expressionFirst(line, key, context, onOutput)
+      // The scope this line sees, for typing the result and for checking name collisions.
+      val context: List[Text] =
+        ambientImports + (prelude.imports.map(_.tt) + sessionImports).map(Repl.unadvised) +
+          imported
+
+      // A definition or declaration can never be an expression: go STRAIGHT to the
+      // definition/statement path, skipping the result-type probe and the try-as-expression
+      // compile — two whole compiler runs (each re-loading the session's import context) that
+      // could only fail at the parser.
+      if Repl.neverExpression(line) then definitionOrStatement(line, key, context, onOutput)
+      else expressionFirst(line, key, context, onOutput)
+
+    // The line is first given only the earlier lines it mentions (see `historyImports`). Should it
+    // be rejected so, it is tried again with them all, exactly as every line once was: so a line
+    // is never refused for the want of a wrapper it was not given, and the diagnostics of one
+    // that is refused are those of the whole session. Only a line that fails pays for both.
+    val narrow: List[Text] = historyImports(line)
+
+    try
+      if narrow.size == history.size then attempt(narrow, true)
+      else attempt(narrow, false) match
+        case Built.Complete(_: Outcome.Rejected) => attempt(historyImports(), true)
+        case built                               => built
+    finally
+      lineImports = Unset
+      advisable = true
 
   // The expression-first path of `evaluate` (see there): probe the result type, mint a binding
   // name, and try the line bound as `val <name> = <line>`, falling back to `definitionOrStatement`.
@@ -3215,8 +3324,7 @@ class Repl[version <: Scalac.Versions]
 
       if errors.nil then
         index += 1
-        history = history :+ name
-        historyMembers = historyMembers.define(name, wrapperMembers(name))
+        record(name, Unset)
         Outcome.Ran(Nil, Unset, t"")
       else
         Outcome.Rejected(errors.map(Notice(Importance.Error, t"<seed>", _, Unset)))
@@ -3382,6 +3490,7 @@ class Repl[version <: Scalac.Versions]
             completionCache = Map()           // the set of resolvable names has changed
             reifierCache = Unset              // rebuild the diagnostics reifier for the classpath
             importsCache = Unset              // its exports resolve against the classpath too
+            exportsCache = Unset
             reprime()
             Outcome.Ran(Nil, Unset, t"Added to the classpath: ${path.encode}\n")
 
@@ -3508,9 +3617,10 @@ class Repl[version <: Scalac.Versions]
 
     // The scope a compiled line would see: the prelude's and the user's persistent imports,
     // plus the prior wrapper objects' members and givens (as `import rs$line$N.{given, *}`).
-    val context: List[Text] =
-      ambientImports + (prelude.imports.map(_.tt) + sessionImports).map(Repl.unadvised) +
-        historyImports
+    val persistent: List[Text] =
+      ambientImports + (prelude.imports.map(_.tt) + sessionImports).map(Repl.unadvised)
+
+    def context: List[Text] = persistent + historyImports()
 
     // The full member list of `expr.`, compiled ONCE and cached under the base, so typing
     // further member characters (or backspacing) costs no recompilation. The base's type is
@@ -3519,7 +3629,19 @@ class Repl[version <: Scalac.Versions]
     def members(base: Text): List[Repl.CompletionItem] =
       completionCache.at(base).or:
         val shown: stenography.Imports = semanticImports
-        val items = safely(typed(Repl.complete(context, base, base.length, shown))).or(Nil)
+
+        def under(imported: List[Text]): List[Repl.CompletionItem] =
+          safely(typed(Repl.complete(persistent + imported, base, base.length, shown))).or(Nil)
+
+        // The receiver is typed with the earlier lines it mentions (see `historyImports`), and
+        // with them all only if that finds nothing; a bare position, below, must see them all,
+        // since any name of the session may be what is being typed.
+        val narrow: List[Text] = historyImports(base)
+        val found: List[Repl.CompletionItem] = under(narrow)
+
+        val items: List[Repl.CompletionItem] =
+          if found.nil && narrow.size < history.size then under(historyImports()) else found
+
         completionCache = completionCache.define(base, items)
         items
 
@@ -3548,8 +3670,11 @@ class Repl[version <: Scalac.Versions]
             if binding then keywords
             else
               val shown: stenography.Imports = semanticImports
-              val completions = safely(typed(Repl.complete(context, code, offset, shown))).or(Nil)
-              keywords + probe(ticket)(completions)
+
+              // Typed within the probe: under `mutex`, as `typed` must be called, and not at all
+              // when a later completion has already superseded this one.
+              keywords + probe(ticket):
+                safely(typed(Repl.complete(context, code, offset, shown))).or(Nil)
 
   // Typecheck-highlights, compiles, and runs `code`, returning a `Reply` with the highlighting, the
   // result value, its rendered type, and any diagnostics. Only COMPILATION and the session-state
