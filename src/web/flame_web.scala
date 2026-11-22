@@ -191,7 +191,9 @@ class LocalEngine(sessions: Sessions[3.9])(using Monitor, System, Probate) exten
     ()
 
   def pushed(sink: Repl.Reply => Unit): Unit = this.sink = caps.unsafe.unsafeAssumePure(sink)
-  def close(): Unit = ()
+  // The page has gone: its connection leaves its session, which is closed if it was the
+  // page's own.
+  def close(): Unit = connection.close()
 
 // The JSON REST API: a plain request/response HTTP API over an INDEPENDENT plain-text session
 // registry, served alongside the browser UI. `POST /api/sessions` creates a session; `GET

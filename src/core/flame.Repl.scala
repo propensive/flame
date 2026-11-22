@@ -1516,6 +1516,24 @@ object Repl:
       "\\b(given|implicit|type|opaque|inline|transparent|export)\\b"
     . nn
 
+  // Deletes the directory at `path` and everything in it, if it is there; what cannot be deleted
+  // is left.
+  def discard(path: Text): Unit =
+    def recur(file: java.io.File): Unit =
+      val children: scala.Array[java.io.File | Null] | Null = file.listFiles
+
+      if children != null then
+        var index: Int = 0
+
+        while index < children.length do
+          val child: java.io.File | Null = children(index)
+          if child != null then recur(child)
+          index += 1
+
+      file.delete()
+
+    try recur(java.io.File(path.s)) catch case _: Throwable => ()
+
   def unreflected(code: Text): Boolean = unreflectedWords.matcher(code.s).nn.find()
 
   def advised(statement: Text): Text = statement.sub(unadvisedSelector, t"")
@@ -2472,6 +2490,14 @@ class Repl[version <: Scalac.Versions]
     ReplContext.clear(session)
     ReplBridge.clear(session)
 
+  // Closes this `Repl` for good: `close`, and then the directory its lines were compiled into is
+  // deleted, after which no further line can be compiled. For a `Repl` that is being let go —
+  // a session whose last connection has gone, or a scratch one — which would otherwise leave
+  // every class it made in the temporary directory for as long as the machine is up.
+  def dispose(): Unit =
+    close()
+    Repl.discard(out.encode)
+
   // ── Priming ──────────────────────────────────────────────────────────────────────────────────
   // A session's first line is far slower than its later ones: nothing of the compiler is loaded
   // until it is submitted, and then the JVM loads and warms dotc and the rendering code, and the
@@ -2573,7 +2599,7 @@ class Repl[version <: Scalac.Versions]
             safely(scratch.react(0, line))
             done += share
             progress(done)
-        finally scratch.close()
+        finally scratch.dispose()
 
       var more: Boolean = true
 
@@ -2729,10 +2755,14 @@ class Repl[version <: Scalac.Versions]
       import strategies.throwUnsafely
       given monitor: Monitor = caps.unsafe.unsafeAssumePure(parasite.unsupervised.orphanMonitor)
       val scratch: Path on Linux = temporaryDirectory/Uuid()
-      scratch.create[Directory]()
-      val process = scalac(path)(Map(file -> source), scratch)
-      process.complete()
-      process.notices
+
+      try
+        scratch.create[Directory]()
+        val process = scalac(path)(Map(file -> source), scratch)
+        process.complete()
+        process.notices
+      finally
+        Repl.discard(scratch.encode)
 
   // Runs `advice` on a thread with the compile thread's stack, handing what it found to `sink`:
   // the advised notices if the compile reported an error, as it should, and `Unset` otherwise.

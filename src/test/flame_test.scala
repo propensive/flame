@@ -2326,6 +2326,68 @@ object Tests extends Suite(m"Flame Tests"):
     suite(m"REPL TCP server"):
       given Scalac[3.9, Toolchain.Universe.Classfile] = Scalac(Nil)
 
+      // A session keeps a warm compiler and every value its lines made, so one started for a
+      // connection that asked for none by name is closed when the connection ends (see
+      // `Sessions#release`); one that somebody named, or that another connection is on, is not.
+      test(m"a session started for a connection is closed when the connection ends"):
+        isolated:
+          val sessions = Opened(Sessions())
+          val connection = sessions.connection(_ => ())
+          connection.respond(Repl.Request.Submit(1, t"1 + 1"))
+          val before: Int = sessions.names.size
+          connection.close()
+          (before, sessions.names.size)
+
+      . assert(_ == (1, 0))
+
+      test(m"a session started under a chosen name outlives the connection that started it"):
+        isolated:
+          val sessions = Opened(Sessions())
+          val connection = sessions.connection(_ => ())
+          connection.respond(Repl.Request.Create(1, t"kept"))
+          connection.close()
+          sessions.names
+
+      . assert(_ == List(t"kept"))
+
+      test(m"a session another connection has joined outlives the connection it was started for"):
+        isolated:
+          val sessions = Opened(Sessions())
+          val first = sessions.connection(_ => ())
+          val second = sessions.connection(_ => ())
+          val name: Text = first.currentName
+          second.respond(Repl.Request.Join(1, name))
+          first.close()
+          val joined: List[Text] = sessions.names
+          second.close()
+          (joined == List(name), sessions.names.size)
+
+      . assert(_ == (true, 0))
+
+      test(m"a connection can return to the session started for it after switching away"):
+        isolated:
+          val sessions = Opened(Sessions())
+          val connection = sessions.connection(_ => ())
+          val name: Text = connection.currentName
+          connection.respond(Repl.Request.Submit(1, t"val kept = 41"))
+          connection.respond(Repl.Request.Create(2, t"elsewhere"))
+          connection.respond(Repl.Request.Join(3, name))
+          connection.respond(Repl.Request.Submit(4, t"kept + 1"))
+
+      . assert:
+          case Repl.Reply.Ran(_, value, _, _, _, _, _, _, _) => value.let(_ == t"42").or(false)
+          case _                                             => false
+
+      test(m"a request answered after its connection has ended starts no session"):
+        isolated:
+          val sessions = Opened(Sessions())
+          val connection = sessions.connection(_ => ())
+          connection.close()
+          connection.respond(Repl.Request.Tokenize(1, t"1 + 1"))
+          sessions.names.size
+
+      . assert(_ == 0)
+
       // The type is the SINGLETON `2`, not `Int`: an expression line is bound as a `final val`, so
       // a constant expression keeps the constant type the compiler folds it to (see
       // `Repl.resultType`).

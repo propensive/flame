@@ -102,6 +102,15 @@ class Sessions[version <: Scalac.Versions]
 
   private var registry: Map[Text, Repl[version]] = Map()
   private val lock:     Mutex                    = Mutex()
+
+  // How many connections are on each session, and which sessions were started for a connection
+  // that asked for none by name (`create`). Such a session is its connection's own, so it is
+  // closed when the last connection on it has gone (see `release`): a session keeps a warm
+  // compiler, a class loader and every value its lines made, and one left behind by each client
+  // that ever connected is what a long-lived server would otherwise fill up with. A session
+  // started under a name somebody chose stays until the server stops, to be joined again.
+  private var holders:   Map[Text, Int]     = Map()
+  private var anonymous: Map[Text, Boolean] = Map()
   private val quit:     Promise[Unit]            = Promise()
 
   // Fulfilled when a connected client sends a `Quit` request; the server host `attend`s it to block
@@ -128,7 +137,32 @@ class Sessions[version <: Scalac.Versions]
           t"$base$n"
 
       registry = registry.define(name, Repl.make[version](Repl.Prelude.empty, render))
+      anonymous = anonymous.define(name, true)
       name
+
+  // Notes that one more connection is on the session `name`.
+  private def hold(name: Text): Unit =
+    lock { holders = holders.define(name, holders.at(name).or(0) + 1) }
+
+  // Notes that one connection fewer is on the session `name`, and closes the session if that was
+  // the last and nobody named it. The session is forgotten under the lock and closed outside it:
+  // closing waits for a compile in flight.
+  private def release(name: Text): Unit =
+    val abandoned: Optional[Repl[version]] = lock:
+      val remaining: Int = (holders.at(name).or(1) - 1).max(0)
+      holders = holders.define(name, remaining)
+
+      if remaining > 0 || !anonymous.at(name).or(false) then Unset else
+        val closing: Optional[Repl[version]] = registry.at(name)
+        val kept: List[Text] = registry.keys.to[List].filter(_ != name)
+
+        val remainder: List[(Text, Repl[version])] = kept.flatMap: key =>
+          registry.at(key).lay(Nil) { repl => List(key -> repl) }
+
+        registry = Map(remainder*)
+        closing
+
+    abandoned.let(_.dispose())
 
   // Registers a fresh session under the given `name` — the one a client asked for with `--session`
   // or `/session` — unless one of that name already exists. `true` when it was created.
@@ -145,9 +179,11 @@ class Sessions[version <: Scalac.Versions]
     val closing: List[Repl[version]] = lock:
       val all = registry.values.to[List]
       registry = Map()
+      holders = Map()
+      anonymous = Map()
       all
 
-    closing.each(_.close())
+    closing.each(_.dispose())
 
   // Serializes a `Reply` to BinTEL body bytes; a valid reply always type-assigns, so this is total.
   private def encode(reply: Repl.Reply): Data = unsafely(reply.bintel)
@@ -217,11 +253,50 @@ class Sessions[version <: Scalac.Versions]
     // pushes a reply through it (see `connection`), which a task could not otherwise hold.
     private val push: Repl.Reply -> Unit = caps.unsafe.unsafeAssumePure(send)
 
-    def currentName: Text = current.or:
-      val name = create()
+    // Guards `current`, `held` and `closed`: requests are answered concurrently, each on a task
+    // of its own, and a connection must be counted once on each session it has been on.
+    private val switching: Mutex = Mutex()
+    @volatile private var closed: Boolean = false
+
+    // Every session this connection has been on. It stays on them all until it ends, so that a
+    // session started for it is still there to come back to after a `/session` elsewhere.
+    private var held: List[Text] = Nil
+
+    // Called under `switching`.
+    private def visit(name: Text): Unit =
+      if !held.has(name) then
+        hold(name)
+        held = name :: held
+
       current = name
-      prime(name)
-      name
+
+    // A connection that has closed starts no session: a request of its that is still being
+    // answered finds none, rather than leaving a new one behind.
+    def currentName: Text = current.or:
+      val started: Optional[Text] = switching:
+        if closed || current.present then Unset else
+          val name = create()
+          visit(name)
+          name
+
+      started.let(prime)
+      current.or(t"")
+
+    // Moves this connection to the session `name`.
+    private def switch(name: Text): Unit = switching { if !closed then visit(name) }
+
+    // Ends the connection: it leaves every session it has been on, and each of those that was
+    // started for a connection which asked for none by name is closed, unless another connection
+    // is still on it. The socket loop and the web front-end call this when the client has gone.
+    def close(): Unit =
+      val left: List[Text] = switching:
+        if closed then Nil else
+          closed = true
+          val all: List[Text] = held
+          held = Nil
+          all
+
+      left.each(release)
 
     private def prime(name: Text): Unit = if frontend then
       session(name).let(_.prime { (done, total) => push(Repl.Reply.Warming(0, done, total)) })
@@ -291,7 +366,7 @@ class Sessions[version <: Scalac.Versions]
       case Repl.Request.Session(id, name) =>
         val wasAbsent: Boolean = current.absent
         val created: Boolean = if name == t"" then wasAbsent else open(name)
-        if name != t"" then current = name
+        if name != t"" then switch(name)
         if created && name != t"" then prime(name)
         val outcome = if created then Repl.SessionOutcome.Created else Repl.SessionOutcome.Joined
         val reply = Repl.Reply.Session(id, currentName, names, outcome)
@@ -300,7 +375,7 @@ class Sessions[version <: Scalac.Versions]
 
       case Repl.Request.Join(id, name) =>
         if session(name).present then
-          current = name
+          switch(name)
           applyContext()
           Repl.Reply.Session(id, name, names, Repl.SessionOutcome.Joined)
         else
@@ -308,7 +383,7 @@ class Sessions[version <: Scalac.Versions]
 
       case Repl.Request.Create(id, name) =>
         if open(name) then
-          current = name
+          switch(name)
           prime(name)
           applyContext()
           Repl.Reply.Session(id, name, names, Repl.SessionOutcome.Created)
@@ -373,6 +448,7 @@ class Sessions[version <: Scalac.Versions]
 
           response.let: reply => send(encode(reply))
     catch case _: Throwable => ()
+    finally connection.close()
 
     // Decodes one request and dispatches on the CURRENT session: `tokenize` is stateless (the
     // lexer); `submit`/`complete` run on `current`'s `Repl`; `session` switches/reports sessions;
