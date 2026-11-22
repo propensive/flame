@@ -157,6 +157,12 @@ object ReplFixture:
 case class FuelEntry(@key address: Text, info: Text)
 case class FuelIndex(entry: List[FuelEntry])
 
+// The pages Fuel publishes beside the index, and the share in which Fuel says where its site
+// is served, for as long as it is (`FuelHelp.pages`).
+case class FuelPage(@key address: Text, url: Text)
+case class FuelPages(page: List[FuelPage])
+case class FuelSite(address: Text, pid: Text)
+
 object Tests extends Suite(m"Flame Tests"):
   def run(): Unit =
     suite(m"REPL tests"):
@@ -2392,6 +2398,135 @@ object Tests extends Suite(m"Flame Tests"):
             FuelHelp.of(t"$root/src")(List(t"scala.Int#toLong")).nil )
 
       . assert(_ == (true, true, true))
+
+      // ── Links to documentation ──────────────────────────────────────────────────────────
+      def hinted(tokens: List[Token]): List[(Text, Optional[Text])] =
+        tokens.map { (token: Token) => (token.text, token.hint) }
+
+      test(m"a rendered type's names are tokens of their own, but not within a string"):
+        val names = Map(t"Xml" -> t"xylophone.Xml", t"List" -> t"scala.collection.immutable.List")
+        hinted(Blocks.named(t"List[Xml of \"Xml\"]", names))
+
+      . assert:
+          _ == List
+            ( (t"List", t"scala.collection.immutable.List"), (t"[", Unset),
+              (t"Xml", t"xylophone.Xml"), (t" of \"Xml\"]", Unset) )
+
+      test(m"a token of code names what its type is, where its type is what it names"):
+        ( Blocks.address(t"List", t"scala.collection.immutable.List[scala.Int]"),
+          Blocks.address(t"Xml", t"xylophone.Xml.type"),
+          Blocks.address(t"Text", t"gossamer.Textual#Text"),
+          Blocks.address(t"x", t"scala.Int"),
+          Blocks.address(t"f", t"scala.Int => scala.Int") )
+
+      . assert:
+          _ == (t"scala.collection.immutable.List", t"xylophone.Xml", t"gossamer.Textual#Text",
+              Unset, Unset)
+
+      test(m"a result's type knows the address of each name in it"):
+        isolated:
+          given Scalac[3.9, Toolchain.Universe.Classfile] = Scalac(Nil)
+          val repl = Opened(Repl())
+
+          val shown: Optional[Repl.TypeText] = repl.interpret(t"scala.List(scala.Option(1))") match
+            case Repl.Outcome.Ran(_, _, _, _, tpe) => tpe
+            case _                                 => Unset
+
+          shown.or(Repl.TypeText(t"")) match
+            case named: Repl.NamedTypeText =>
+              (named.text, named.names.at(t"List"), named.names.at(t"Option"))
+
+            case other =>
+              (other.text, Unset, Unset)
+
+      . assert(_ == (t"List[Option[Int]]", t"scala.collection.immutable.List", t"scala.Option"))
+
+      def linkOf(blocks: List[Block]): List[(Text, Optional[Text])] = blocks.flatMap:
+        case Block.Group(content) => linkOf(content)
+
+        case Block.Paragraph(content) =>
+          content.flatMap:
+            case Inline.Snippet(_, tokens) =>
+              tokens.map: (token: Token) =>
+                val url: Optional[Text] = token.link.let:
+                  case Inline.Destination.External(url) => url
+                  case _                                => Unset
+
+                (token.text, url)
+
+            case _ =>
+              Nil
+
+        case _ =>
+          Nil
+
+      val typed: Block =
+        Block.Paragraph
+          ( List
+              ( Inline.Snippet
+                  ( pyrocosm.Language.Scala,
+                    List
+                      ( Token(t"Xml", Token.Accent.Typal, hint = t"xylophone.Xml"),
+                        Token(t"Foo", Token.Accent.Typal, hint = t"line.Foo"),
+                        Token(t"]", Token.Accent.Typal) ) ) ) )
+
+      test(m"a hinted name with a page links to it, and one without keeps its hint alone"):
+        val pages: List[Text] -> Map[Text, Text] = (addresses: List[Text]) =>
+          if addresses == List(t"xylophone.Xml", t"line.Foo")
+          then Map(t"xylophone.Xml" -> t"http://localhost:8090/fuel/api/xylophone.Xml")
+          else Map()
+
+        ( linkOf(Links.resolve(List(typed), pages)),
+          Links.resolve(List(typed), _ => Map()) == List(typed) )
+
+      . assert:
+          _ == (List
+              ( (t"Xml", t"http://localhost:8090/fuel/api/xylophone.Xml"), (t"Foo", Unset),
+                (t"]", Unset) ), true)
+
+      test(m"a settled entry's names link to the pages the front-end knows of"):
+        isolated:
+          val pages: List[Text] -> Map[Text, Text] =
+            _ => Map(t"xylophone.Xml" -> t"http://localhost:8090/fuel/api/xylophone.Xml")
+
+          val (engine, interface) = fresh(ReplInterface.Options(pages = pages))
+          interface.handle(Event.Submitted(interface.field.input, t"xml"))
+          val id = engine.submissions.head.let(_.id).or(0)
+          val blocks = Blocks.encode(List(typed))
+          engine.answer(id, Repl.Reply.Ran(id, Unset, t"", Unset, Unset, t"", Nil, Nil, blocks))
+          linkOf(interface.transcript()).filter(_(1).present)
+
+      . assert(_ == List((t"Xml", t"http://localhost:8090/fuel/api/xylophone.Xml")))
+
+      test(m"Fuel's pages are found only while a living process says where they are served"):
+        pyrocosm.Filing.temporary: directory =>
+          val index: Path on Linux = directory / "share" / "pages.ratel"
+          val site: Path on Linux = directory / "share" / "site.ratel"
+          val pages = FuelPages(List(FuelPage(t"xylophone.Xml", t"/api/xylophone.Xml")))
+          Shares.publish(index, pages)
+          val reader: Shares.Reader = Shares.Reader(index, 0L)
+          val announced: Shares.Reader = Shares.Reader(site, 0L)
+          val own: Text = ProcessHandle.current().nn.pid().toString.tt
+
+          try
+            val unannounced: Optional[Text] = FuelHelp.root(site, announced)
+            Shares.publish(site, FuelSite(t"http://localhost:8090/fuel", own))
+            val serving: Optional[Text] = FuelHelp.root(site, announced)
+            Shares.publish(site, FuelSite(t"http://localhost:8090/fuel", t"2147483646"))
+            val dead: Optional[Text] = FuelHelp.root(site, announced)
+            Shares.publish(site, FuelSite(t"http://localhost:8090/fuel", own))
+            val again: Optional[Text] = FuelHelp.root(site, announced)
+            java.nio.file.Files.delete(java.nio.file.Path.of(site.encode.s))
+
+            ( unannounced, serving, dead, again, FuelHelp.root(site, announced),
+              FuelHelp.urls(reader, List(t"xylophone.Xml", t"xylophone.Missing")) )
+          finally
+            reader.close()
+            announced.close()
+
+      . assert:
+          _ == (Unset, t"http://localhost:8090/fuel", Unset, t"http://localhost:8090/fuel", Unset,
+              Map(t"xylophone.Xml" -> t"/api/xylophone.Xml"))
 
       test(m"a completion for an older version of the text is dropped"):
         isolated:

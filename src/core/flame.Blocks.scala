@@ -59,7 +59,59 @@ object Blocks:
     val role: Optional[Token.Role] = token.role.let: (role: Text) =>
       if role == t"binding" then Token.Role.Binding else Token.Role.Usage
 
-    Token(token.text, accent, role)
+    Token(token.text, accent, role, hint = token.tpe.let(address(token.text, _)))
+
+  // What a token of code names, if its type says: a token is a name's own mention when its
+  // type is exactly what it names — a type's token, an object's, or the head of an applied
+  // type — as Fuel links the code of its samples. `tpe` is the type in full
+  // (`scala.collection.immutable.List[scala.Int]`, `xylophone.Xml.type`), and the address is
+  // its head, where that is a plain path whose last name is the token's text.
+  def address(text: Text, tpe: Text): Optional[Text] =
+    val head: Text = tpe.cut(t"[").head
+    val path: Text = if head.ends(t".type") then head.chomp(t".type", Rtl) else head
+    val plain: Boolean = path.s.forall: (char: Char) =>
+      identifier(char) || char == '.' || char == '#'
+
+
+    if plain && text != t"" && (path.ends(t".$text") || path.ends(t"#$text")) then path else Unset
+
+  private def identifier(char: Char): Boolean = char.isLetterOrDigit || char == '_' || char == '$'
+
+  // A rendered type as tokens: each name in it which `names` knows is a token of its own,
+  // hinting at its address, and whatever lies between is as it was. A string literal's
+  // content is not a name, whatever it spells.
+  def named(text: Text, names: Map[Text, Text]): List[Token] =
+    val source: String = text.s
+    var tokens: List[Token] = Nil
+    var start: Int = 0      // where the run of text not yet made a token begins
+    var index: Int = 0
+    var quoted: Boolean = false
+
+    def flush(end: Int): Unit =
+      if end > start then
+        tokens = Token(source.substring(start, end).nn.tt, Token.Accent.Typal) :: tokens
+
+    while index < source.length do
+      val char: Char = source.charAt(index)
+
+      if char == '"' then
+        quoted = !quoted
+        index += 1
+      else if quoted || !identifier(char) then index += 1
+      else
+        var end: Int = index
+        while end < source.length && identifier(source.charAt(end)) do end += 1
+        val word: Text = source.substring(index, end).nn.tt
+
+        names.at(word).let: (address: Text) =>
+          flush(index)
+          tokens = Token(word, Token.Accent.Typal, hint = address) :: tokens
+          start = end
+
+        index = end
+
+    flush(source.length)
+    tokens.reverse
 
   // A `/`-command line: the command word, then its parameters.
   def command(line: Text): List[Repl.Token] =
@@ -213,11 +265,16 @@ object Blocks:
         List(Inline.Snippet(Language.Scala, tokens))
 
       val typed: List[Inline] = tpe.lay(Nil: List[Inline]): (tpe: Repl.TypeText) =>
+        // The names in the type, where the engine rendered it and so knows them.
+        val names: Map[Text, Text] = tpe match
+          case named: Repl.NamedTypeText => named.names
+          case _                         => Map()
+
         val widened: List[Token] = tpe.base.lay(Nil: List[Token]): (base: Text) =>
-          List(Token(t" <: ", Token.Accent.Symbol), Token(base, Token.Accent.Typal))
+          Token(t" <: ", Token.Accent.Symbol) :: named(base, names)
 
         val tokens: List[Token] =
-          List(Token(t": ", Token.Accent.Symbol), Token(tpe.text, Token.Accent.Typal)) + widened
+          Token(t": ", Token.Accent.Symbol) :: named(tpe.text, names) + widened
 
         List(Inline.Snippet(Language.Scala, tokens))
 

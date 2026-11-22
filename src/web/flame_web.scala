@@ -280,7 +280,8 @@ def serveHttp
   ( port:    Int,
     quit:    Promise[Unit],
     address: Optional[Text]       = Unset,
-    help:    List[Text] -> Map[Text, Text] = _ => Map() )
+    help:    List[Text] -> Map[Text, Text] = _ => Map(),
+    pages:   List[Text] -> Map[Text, Text] = _ => Map() )
   ( using Monitor, System, Probate, Classloader )
 :   Unit =
 
@@ -302,7 +303,9 @@ def serveHttp
   async:
     frontend.serve: () =>
       val engine: LocalEngine = caps.unsafe.unsafeAssumePure(LocalEngine(sessions))
-      val options = ReplInterface.Options(navigation = true, quitAllowed = false, help = help)
+      val options =
+        ReplInterface.Options(navigation = true, quitAllowed = false, help = help, pages = pages)
+
       val interface: ReplInterface = caps.unsafe.unsafeAssumePure(ReplInterface(engine, options))
       interface.start()
       (interface.interface, interface.handle)
@@ -318,4 +321,4 @@ def serveHttp
 @main
 def web(port: Int = 8080): Unit =
   given Classloader = threadContextClassloader
-  supervise(serveHttp(port, Promise[Unit](), help = FuelHelp.here))
+  supervise(serveHttp(port, Promise[Unit](), help = FuelHelp.here, pages = FuelHelp.pagesHere))

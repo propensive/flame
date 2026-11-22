@@ -92,3 +92,72 @@ object FuelHelp:
   // The lookup for the directory this process runs in, for a front-end which serves no one
   // invocation.
   def here: List[Text] -> Map[Text, Text] = of(java.lang.System.getProperty("user.dir").nn.tt)
+
+  // ── Pages ───────────────────────────────────────────────────────────────────────────────
+  // Fuel publishes a second share beside the index, `pages`, with a `page` for every entity it
+  // documents, whether or not it has an info line: its `address` (the key) and its `url`, the
+  // page's path beneath the root of Fuel's site. (It is a file of its own because an entry and
+  // its page have one address, and a key is unique among all of an image's members.) Where
+  // that root is, Fuel says in a third share, `site`, for as long as it is serving the pages
+  // and no longer: its `address`, and the `pid` of the process serving. So a name is linked to
+  // its page only while there is a page to open.
+  private val paged: Text = t"pages"
+  private val site: Text = t"site"
+
+  // The page paths of those of `addresses` which have a page, found in one reading.
+  def urls(reader: Shares.Reader, addresses: List[Text]): Map[Text, Text] =
+    val found: Optional[List[(Text, Text)]] =
+      reader.read:
+        val pages = ratel.root / t"page"
+
+        addresses.bind: (address: Text) =>
+          pages.find(address).let(_.text(t"url")).lay(Nil): url => List(address -> url)
+
+    found.lay(Map())(Map(_*))
+
+  // Whether the process which announced the site is still running: one which was killed
+  // leaves its announcement behind.
+  private def running(pid: Text): Boolean =
+    safely(pid.s.toLong).lay(false): (pid: Long) =>
+      val handle: java.util.Optional[ProcessHandle] = ProcessHandle.of(pid).nn
+      handle.isPresent && handle.get.nn.isAlive
+
+  // The root of Fuel's site, if Fuel is serving it: the announcement is withdrawn by deleting
+  // its file, which a reader that has it mapped would not see, so the file is asked for first.
+  def root(file: Path on Linux, reader: Shares.Reader): Optional[Text] =
+    if !java.nio.file.Files.exists(java.nio.file.Path.of(file.encode.s)) then Unset else
+      val read: Optional[Optional[(Text, Text)]] =
+        reader.read:
+          ratel.root.text(t"address").let: (address: Text) =>
+            ratel.root.text(t"pid").let: (pid: Text) => (address, pid)
+
+      read.let(identity(_)).let: (address: Text, pid: Text) =>
+        if running(pid) then address else Unset
+
+  // The lookup of pages for the project `directory` is in: the URL of the page of each of
+  // some addresses which Fuel documents, and none at all unless Fuel is serving them.
+  def pages(directory: Text): List[Text] -> Map[Text, Text] =
+    val project: Text = Shares.root(tool, directory)
+
+    val index: Optional[Shares.Reader] =
+      Shares.path(tool, project, paged).let: file =>
+        readers.getOrElseUpdate(file.encode, Shares.Reader(file))
+
+    val announced: Optional[(Path on Linux, Shares.Reader)] =
+      Shares.path(tool, project, site).let: file =>
+        (file, readers.getOrElseUpdate(file.encode, Shares.Reader(file)))
+
+    (addresses: List[Text]) =>
+      if addresses.nil then Map[Text, Text]() else
+        val served: Optional[Text] = announced.let { (file, reader) => root(file, reader) }
+
+        served.lay(Map[Text, Text]()): (root: Text) =>
+          val found: Map[Text, Text] = index.lay(Map[Text, Text]())(urls(_, addresses))
+
+          val located: List[(Text, Text)] = addresses.bind: (address: Text) =>
+            found.at(address).lay(Nil: List[(Text, Text)]): url => List(address -> t"$root$url")
+
+          Map(located*)
+
+  def pagesHere: List[Text] -> Map[Text, Text] =
+    pages(java.lang.System.getProperty("user.dir").nn.tt)

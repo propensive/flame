@@ -54,7 +54,9 @@ object ReplInterface:
   // environment; `commands` are submitted first (`/set …`, `/language …`, `/classload …`);
   // `history` holds the earlier submissions, oldest first; `persist` is given a submission worth
   // remembering; and `leave` is called on `/quit` and `/disconnect`, when the frontend should
-  // stop.
+  // stop. `help` gives a line of documentation for each of some qualified names, and `pages`
+  // the URL of the page documenting each, for a front-end in which a name can be a link: a
+  // reply's names which have a page link to it.
   case class Options
     ( title:        Text                              = t"Flame",
       navigation:   Boolean                           = false,
@@ -66,7 +68,8 @@ object ReplInterface:
       historyLimit: Int                               = 100,
       persist:      Text => Unit                      = _ => (),
       leave:        () => Unit                        = () => (),
-      help:         List[Text] -> Map[Text, Text]     = _ => Map() )
+      help:         List[Text] -> Map[Text, Text]     = _ => Map(),
+      pages:        List[Text] -> Map[Text, Text]     = _ => Map() )
 
   // The delay before a completion is asked for after a keystroke, so typing is not a query
   // per character.
@@ -292,7 +295,10 @@ class ReplInterface(engine: Engine, options: ReplInterface.Options)(using Monito
     val gauge: Block = Block.Gauge(pyrocosm.Status.Indeterminate(), caption)
     Block.Group(framed(code, outputs().at(id).or(Nil) + List(gauge)))
 
-  private def replace(id: Int, settled: Block): Unit =
+  // An entry as it is shown: the names in it which have a page of documentation link to it.
+  private def replace(id: Int, block: Block): Unit =
+    val settled: Block = Links.resolve(List(block), options.pages).head.or(block)
+
     pending().at(id).let: current =>
       transcript.amend: entries =>
         entries.map: (block: Block) => if block eq current then settled else block

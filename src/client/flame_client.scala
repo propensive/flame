@@ -114,7 +114,7 @@ object FlameWeb extends Tool.Web:
     given Classloader = serverClassloader
     val quit: Promise[Unit] = Promise()
     quitting = quit
-    serveHttp(port, quit, address(port), FuelHelp.here)
+    serveHttp(port, quit, address(port), FuelHelp.here, FuelHelp.pagesHere)
 
   def stop(): Unit = quitting.let(_.offer(()))
 

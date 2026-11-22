@@ -1204,6 +1204,39 @@ object Repl:
     // The whole type as one unstyled string, for the contexts that have no way to dim the base.
     def plain: Text = base.lay(text): widened => t"$text <: $widened"
 
+  // A rendered type which also knows what its names are: `names` maps each name the text shows
+  // (`Xml`) to the address of what it names (`xylophone.Xml`), which is the key its
+  // documentation is found by. It is a `TypeText` and travels as one — the wire's codecs are
+  // derived from `TypeText` and see no more — so the names live only where the type was
+  // rendered, in the engine, which writes them into the reply's blocks as each token's hint.
+  final class NamedTypeText(text: Text, base: Optional[Text], val names: Map[Text, Text])
+  extends TypeText(text, base)
+
+  // The names a type's rendering may show, each with the address of what it names: every
+  // designator anywhere in the trees, by its last name. A name which two different designators
+  // share is left out, since the text alone does not say which of them a mention is. The walk
+  // is over the trees as products, so that it needs no case for each kind of node.
+  def typeNames(syntaxes: List[Syntax]): Map[Text, Text] =
+    import scala.compiletime.asMatchable
+
+    var found: List[stenography.Designator] = Nil
+
+    def collect(value: Any): Unit = value.asMatchable match
+      case designator: stenography.Designator => found = designator :: found
+      case items: Iterable[?]                 => items.iterator.foreach(collect)
+      case product: Product                   => product.productIterator.foreach(collect)
+      case _                                  => ()
+
+    syntaxes.each(collect)
+
+    val named: List[(Text, Text)] = found.map: (designator: stenography.Designator) =>
+      designator.name -> designator.qualified
+
+    val unique: List[(Text, Text)] = named.filter: (pair: (Text, Text)) =>
+      named.all { (other: (Text, Text)) => other(0) != pair(0) || other(1) == pair(1) }
+
+    Map(unique*)
+
   // The Scala type of an expression, read from a typechecked highlight of
   //
   //     <context>
@@ -2103,9 +2136,10 @@ class Repl[version <: Scalac.Versions]
   // so. Everything else (`List[Int]`, a refined `String { … }`) widens to itself and is shown
   // alone.
   private def typeText(result: Repl.ResultType)(using System): Repl.TypeText =
-    Repl.TypeText
+    Repl.NamedTypeText
       ( renderType(result.precise),
-        if result.widened == result.precise then Unset else renderType(result.widened) )
+        if result.widened == result.precise then Unset else renderType(result.widened),
+        Repl.typeNames(List(result.precise, result.widened)) )
 
   // Renders `notices` to the reply's diagnostics string, re-rendering the types embedded in error
   // messages through stenography when the compiler supplied semantic markup
