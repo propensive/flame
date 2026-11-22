@@ -801,6 +801,69 @@ object Tests extends Suite(m"Flame Tests"):
           case Repl.Outcome.Ran(_, value, _, _, _) => value.or(t"").contains(t"2")
           case _                                   => false
 
+      // A line imports only the earlier lines it could need (see `Repl#historyImports`): those
+      // that define a name it mentions, and those whose definitions it might use unnamed or that
+      // reflection does not see. Each of these is a line which needs an earlier one in a way that
+      // mentioning one of its reflected members does not account for.
+      test(m"a line uses a given of an earlier line that it does not name"):
+        isolated:
+          val repl = Opened(Repl())
+          repl.interpret(t"case class Box(n: Int)")
+          repl.interpret(t"given boxOrder: scala.math.Ordering[Box] = scala.math.Ordering.by(_.n)")
+          repl.interpret(t"val unrelated = 0")
+          repl.interpret(t"List(Box(2), Box(1)).sorted.head.n")
+
+      . assert:
+          case Repl.Outcome.Ran(_, value, _, _, _) => value.or(t"").contains(t"1")
+          case _                                   => false
+
+      test(m"a line uses a type alias of an earlier line"):
+        isolated:
+          val repl = Opened(Repl())
+          repl.interpret(t"type Count = Int")
+          repl.interpret(t"val unrelated = 0")
+          repl.interpret(t"val count: Count = 41")
+          repl.interpret(t"count + 1")
+
+      . assert:
+          case Repl.Outcome.Ran(_, value, _, _, _) => value.or(t"").contains(t"42")
+          case _                                   => false
+
+      test(m"a line uses an inline method of an earlier line"):
+        isolated:
+          val repl = Opened(Repl())
+          repl.interpret(t"inline def twice(n: Int): Int = n*2")
+          repl.interpret(t"val unrelated = 0")
+          repl.interpret(t"twice(21)")
+
+      . assert:
+          case Repl.Outcome.Ran(_, value, _, _, _) => value.or(t"").contains(t"42")
+          case _                                   => false
+
+      test(m"a line uses a name of an earlier line that reflection does not report"):
+        isolated:
+          val repl = Opened(Repl())
+          repl.interpret(t"val a$$b = 41")
+          repl.interpret(t"val unrelated = 0")
+          repl.interpret(t"a$$b + 1")
+
+      . assert:
+          case Repl.Outcome.Ran(_, value, _, _, _) => value.or(t"").contains(t"42")
+          case _                                   => false
+
+      test(m"a line sees the latest of a name's definitions among lines it does not mention"):
+        isolated:
+          val repl = Opened(Repl())
+          repl.interpret(t"val x = 1")
+          repl.interpret(t"val y = 40")
+          repl.interpret(t"val unrelated = 0")
+          repl.interpret(t"val x = 2")
+          repl.interpret(t"x + y")
+
+      . assert:
+          case Repl.Outcome.Ran(_, value, _, _, _) => value.or(t"").contains(t"42")
+          case _                                   => false
+
       test(m"a request's id is the one its reply must echo"):
         Repl.requestId(Repl.Request.Submit(7, t"1"))
 
