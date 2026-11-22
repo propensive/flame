@@ -1069,7 +1069,8 @@ object Repl:
         t"/bytecode" -> t"show the JVM bytecode of an expression or definition",
         t"/unimport" -> t"remove an earlier import from scope (by the tokens it was imported with)",
         t"/classpath" -> t"show the current classpath",
-        t"/classload" -> t"add a JAR file or directory to the classpath" )
+        t"/classload" -> t"add a JAR file or directory to the classpath",
+        t"/interrupt" -> t"stop the lines that are still running" )
 
   // The `/set` subcommands, each as a WHOLE-LINE `/set <name>` item (so a front-end inserts it as
   // it would a command) of kind `setting` — which the CLI renders with the same command/parameter
@@ -1153,6 +1154,22 @@ object Repl:
     def sessionExists(name: Text): Text = t"A session named '$name' already exists"
 
     def unknownCommand(line: Text): Text = t"Unknown command: $line"
+
+    // What `/interrupt` answers: how many lines it has asked to stop, and how many that were
+    // asked before are running still.
+    def interrupting(lines: Int, strays: Int): Text =
+      def count(n: Int): Text = if n == 1 then t"1 line" else t"${n.toString.tt} lines"
+
+      val asked: Text = if lines == 0 then t"Nothing is running" else t"Interrupting ${count(lines)}"
+
+      if strays == 0 then asked
+      else t"$asked; ${count(strays)} interrupted earlier ${if strays == 1 then t"has" else t"have"} not stopped"
+
+    val interrupted: Text = t"Interrupted"
+
+    val interruptedRunning: Text =
+      t"Interrupted, but the line has not stopped: it is still running in the background, and " +
+        t"what it defines cannot be used"
 
     // An import's confirmation, one per clause, as the engine's message after the run's output;
     // a front-end recognises it by `importedClause` to show it as a notice.
@@ -1543,6 +1560,15 @@ object Repl:
 
   // A value handed from one thread to another that then waits for it.
   private final class Cell[value](@volatile var value: value)
+
+  // How long, in nanoseconds, a line that has been interrupted is given to end before it is left
+  // behind.
+  val grace: Long = 2000000000L
+
+  // What a line that was interrupted (`Repl#interrupt`) "threw": `running` if its thread took no
+  // notice and was left behind, still running.
+  class Interrupted(val running: Boolean)
+  extends Exception(if running then messages.interruptedRunning.s else messages.interrupted.s)
 
   // Whether a failed compile failed for want of a given, which is what the advice is about.
   def missingGiven(notices: List[Notice]): Boolean = notices.exists: (notice: Notice) =>
@@ -2289,7 +2315,15 @@ class Repl[version <: Scalac.Versions]
     def retire(): Boolean =
       requests.offer(Warm.Request.Retire, Warm.pollInterval, juc.TimeUnit.MILLISECONDS)
 
-    def alive: Boolean = thread.isAlive
+    // Set once a compile has crashed, or a probe has died of an `Error`: the compiler's context
+    // may be left half-updated by either, so the session answers that request and then ends, and
+    // the next line opens a fresh one. Set before the answer is handed over, so whoever receives
+    // it already sees the session as gone.
+    @volatile
+    @scala.caps.unsafe.untrackedCaptures
+    private var spent: Boolean = false
+
+    def alive: Boolean = thread.isAlive && !spent
 
     private val thread: Thread =
       val runnable: Runnable = caps.unsafe.unsafeAssumePure: () => serve()
@@ -2320,7 +2354,13 @@ class Repl[version <: Scalac.Versions]
           case Warm.Request.Retire => running = false
 
           case Warm.Request.Probe(run, done) =>
-            try run(compilation.frontend) catch case _: Throwable => ()
+            try run(compilation.frontend) catch
+              case _: Exception => ()
+
+              case _: Throwable =>
+                spent = true
+                running = false
+
             done.offer(java.lang.Boolean.TRUE)
 
           case Warm.Request.Compile(sources, reply) =>
@@ -2333,6 +2373,14 @@ class Repl[version <: Scalac.Versions]
                 if outcome == Compiler.Result.Success then process.save(out)
                 (outcome, process.notices)
               catch case error: Throwable => (Compiler.Result.Crash(error.stackTrace), Nil)
+
+            result(0) match
+              case Compiler.Result.Crash(_) =>
+                spent = true
+                running = false
+
+              case _ =>
+                ()
 
             reply.offer(result)
 
@@ -2420,11 +2468,19 @@ class Repl[version <: Scalac.Versions]
       // fresh one. Phrased over the `Optional` rather than around it, so the session is a value we
       // hold rather than one we have to prove is there.
       warm.lay(open()): existing =>
-        if warmKey.lay(true)(_ != key) then
+        if !existing.alive then open()
+        else if warmKey.lay(true)(_ != key) then
           existing.retire()
           open()
         else
           existing
+
+  // For the tests: ends the warm session as an `Error` thrown in the midst of a probe does, and
+  // answers whether it took the session with it.
+  private[flame] def sabotage()(using System): Boolean = mutex:
+    warmSession().lay(false): session =>
+      session.inspect[Unit](throw jl.Error("sabotage"))
+      !session.alive
 
   // Runs `probe` — a result-type, signature or completion probe — with typechecked highlighting:
   // in the warm session (see `Warm#inspect`), or, when there is none or it failed there, with a
@@ -2468,6 +2524,8 @@ class Repl[version <: Scalac.Versions]
   // that has not taken the `Retire` within `Warm.retireAttempts` offers is stuck in work of its
   // own, and is abandoned — it is a daemon — rather than waited on forever.
   def close(): Unit =
+    interrupt()
+
     mutex:
       warm.let: session =>
         def retire(attempts: Int): Unit =
@@ -2659,6 +2717,92 @@ class Repl[version <: Scalac.Versions]
     case Complete(outcome: Outcome)
     case Deferred(run: () => Outcome)
 
+  // ── Interruption ─────────────────────────────────────────────────────────────────────────────
+  // A line submitted through `react` runs on a thread of its own, which `/interrupt` (or the
+  // session's closing) interrupts. That stops a line which is sleeping, waiting, or blocked on
+  // interruptible I/O, and one that checks for it; the JVM offers no way to stop a thread that
+  // does none of these (`Thread.stop` is gone), so a line that has not ended `Repl.grace` after it
+  // was asked to is left behind: its submission is answered as interrupted, and its thread, a
+  // daemon at the lowest priority, runs on until it ends of its own accord or the process does.
+  private final class Interruption:
+    @volatile private var asked: Long = 0L
+    @volatile private var thread: Optional[Thread] = Unset
+
+    def requested: Boolean = asked != 0L
+    def stray: Boolean = thread.lay(false)(_.isAlive)
+
+    def interrupt(): Unit = synchronized:
+      if asked == 0L then asked = jl.System.nanoTime.max(1L)
+      thread.let(_.interrupt())
+
+    // What `body` made, or `Unset` if it was interrupted before it began, or is running still
+    // (`stray`) after it was.
+    def run[result](body: () => result): Optional[result] =
+      val found: Repl.Cell[Optional[result]] = Repl.Cell(Unset)
+      val thrown: Repl.Cell[Optional[Throwable]] = Repl.Cell(Unset)
+
+      val runnable: Runnable = caps.unsafe.unsafeAssumePure: () =>
+        try found.value = body() catch case error: Throwable => thrown.value = error
+
+      val created = Thread(null, runnable, "flame-line", Warm.stackSize)
+      created.setDaemon(true)
+
+      val started: Boolean = synchronized:
+        if requested then false else
+          thread = created
+          created.start()
+          true
+
+      if !started then Unset else
+        def expired: Boolean = asked != 0L && jl.System.nanoTime - asked > Repl.grace
+
+        // Whoever is waiting may be interrupted in turn (its task cancelled): the line is then
+        // asked to stop, and waited on as before.
+        while created.isAlive && !expired do
+          try created.join(Warm.pollInterval) catch case _: InterruptedException => interrupt()
+
+        if created.isAlive then
+          created.setPriority(Thread.MIN_PRIORITY)
+          Unset
+        else
+          thrown.value.let(throw _)
+          found.value
+
+  // The lines now running, and those left behind (see `Interruption`). `interruptible` is set
+  // while `react` builds a line, so that only its lines are run apart: `interpret` runs a line on
+  // its caller's thread, as it always has.
+  private val running: juc.ConcurrentHashMap[Interruption, java.lang.Boolean] =
+    juc.ConcurrentHashMap()
+
+  private val strays: juc.ConcurrentHashMap[Interruption, java.lang.Boolean] =
+    juc.ConcurrentHashMap()
+
+  @volatile
+  @scala.caps.unsafe.untrackedCaptures
+  private var interruptible: Boolean = false
+
+  // Asks every line this session is running to stop, and those left behind once more; answers how
+  // many of each there were.
+  def interrupt(): (Int, Int) =
+    var lines: Int = 0
+    var left: Int = 0
+
+    strays.keySet.nn.forEach: stray =>
+      if stray.nn.stray then
+        stray.nn.interrupt()
+        left += 1
+      else strays.remove(stray)
+
+    running.keySet.nn.forEach: line =>
+      line.nn.interrupt()
+      lines += 1
+
+    (lines, left)
+
+  // An interrupted line is taken out of the history: its wrapper never finished initializing, so
+  // a later line that touched it would fail, or, behind one still running, wait forever.
+  private def forget(name: Text): Unit = mutex { history = history.filter(_ != name) }
+
   // Post-processes a built line's eventual `Outcome.Ran` (leaving failures untouched), preserving
   // the deferred-run structure so the transformation runs off the mutex with the load.
   private def mapRan(built: Built^)(map: Outcome.Ran -> Outcome): Built^{built} = built match
@@ -2840,6 +2984,14 @@ class Repl[version <: Scalac.Versions]
         index += 1
         record(name, origin.or(code))
 
+        // Registered here, under `mutex`, so that an `/interrupt` which arrives before the line
+        // has begun to run still finds it.
+        val interruption: Optional[Interruption] =
+          if !interruptible then Unset else
+            val fresh = Interruption()
+            running.put(fresh, java.lang.Boolean.TRUE)
+            fresh
+
         Built.Deferred: () =>
           // Capture whatever the user's code prints to stdout. Scala's `println` writes to
           // `scala.Console.out` (a thread-local, set by `withOut`), while Java code writes to the
@@ -2900,29 +3052,47 @@ class Repl[version <: Scalac.Versions]
               . map: (stream, bytes) => Repl.tagged(stream, bytes.toString("UTF-8").nn.tt)
               . join
 
-          try
-            // Seed accessors read their session from this thread-local.
-            ReplBridge.setCurrentSession(session)
+          def perform(): Outcome =
+            try
+              // Seed accessors read their session from this thread-local.
+              ReplBridge.setCurrentSession(session)
 
-            // The ambient `Stdio`'s termcap for this run: ANSI in the terminal, plain on the web.
-            val termcap: Termcap = render match
-              case Repl.Rendering.Exhibit(false) => termcapDefinitions.basicTermcap
-              case _                             => termcapDefinitions.xterm256Termcap
+              // The ambient `Stdio`'s termcap for this run: ANSI in the terminal, plain on the
+              // web.
+              val termcap: Termcap = render match
+                case Repl.Rendering.Exhibit(false) => termcapDefinitions.basicTermcap
+                case _                             => termcapDefinitions.xterm256Termcap
 
-            ReplStdio.withTermcap(termcap):
-              Diversions.threaded(out, err):
-                scala.Console.withOut(out)(scala.Console.withErr(err)(loader.on(t"$name$$")))
+              ReplStdio.withTermcap(termcap):
+                Diversions.threaded(out, err):
+                  scala.Console.withOut(out)(scala.Console.withErr(err)(loader.on(t"$name$$")))
 
-            Outcome.Ran(notices, rendered, output)
-          catch
-            case error: ExceptionInInitializerError =>
-              Outcome.Threw(notices, Optional(error.getCause).or(error), output)
+              Outcome.Ran(notices, rendered, output)
+            catch
+              case error: ExceptionInInitializerError =>
+                Outcome.Threw(notices, Optional(error.getCause).or(error), output)
 
-            // Running arbitrary user code can throw anything, including `Error`s
-            // (`LinkageError`, `StackOverflowError`, …), which must not escape and
-            // kill the session.
-            case error: Throwable =>
-              Outcome.Threw(notices, error, output)
+              // Running arbitrary user code can throw anything, including `Error`s
+              // (`LinkageError`, `StackOverflowError`, …), which must not escape and
+              // kill the session.
+              case error: Throwable =>
+                Outcome.Threw(notices, error, output)
+
+          interruption.lay(perform()): interruption =>
+            def interrupted: Outcome =
+              forget(name)
+              Outcome.Threw(notices, Repl.Interrupted(interruption.stray), output)
+
+            try
+              interruption.run(() => perform()) match
+                case _: Outcome.Threw if interruption.requested => interrupted
+                case outcome: Outcome                           => outcome
+
+                case _ =>
+                  if interruption.stray then strays.put(interruption, java.lang.Boolean.TRUE)
+                  interrupted
+
+            finally running.remove(interruption)
 
   // The import statements a submitted line introduces — each `;`-or-newline segment that
   // begins with `import`, so any definition or expression sharing the line is left out
@@ -3556,6 +3726,9 @@ class Repl[version <: Scalac.Versions]
       else if line.trim.starts(t"/classload") then Built.Complete(classload(line.trim))
       else if line.trim.starts(t"/tasty") then tasty(line.trim, onOutput)
       else if line.trim.starts(t"/bytecode") then bytecode(line.trim)
+      else if line.trim == t"/interrupt" then
+        val (lines, left) = interrupt()
+        Built.Complete(Outcome.Ran(Nil, Unset, t"${Repl.messages.interrupting(lines, left)}\n"))
       else evaluate(line, onOutput)
 
     ensureSeeded().lay(lineOutcome):
@@ -3786,6 +3959,7 @@ class Repl[version <: Scalac.Versions]
             try
               mutex:
                 seekAdvice = true
+                interruptible = true
 
                 try
                   val built = build(code, onOutput)
@@ -3793,6 +3967,7 @@ class Repl[version <: Scalac.Versions]
                   built
                 finally
                   seekAdvice = false
+                  interruptible = false
                   pendingAdvice = Unset
             finally pendingSubmissions.decrementAndGet()
 
@@ -3889,7 +4064,23 @@ class Repl[version <: Scalac.Versions]
         // block.
         val (plain, spans) = Repl.segments(output)
 
-        if exhibiting then
+        // A line that was interrupted threw nothing of its own: it is answered with a notice of
+        // that, and no stack trace.
+        val interruption: Optional[Text] = error match
+          case error: Repl.Interrupted => Optional(error.getMessage).let(_.tt)
+          case _                       => Unset
+
+        if interruption.present then
+          val message: Text = interruption.or(t"")
+
+          if exhibiting then
+            val notice: Block =
+              Block.Notice(pyrocosm.Tone.Warning, Unset, List(Block.paragraph(message)))
+            val blocks: List[Block] = Blocks.output(plain, spans, ansi) + List(notice)
+            Repl.Reply.Threw(id, plain, t"", tokens, spans, Blocks.encode(blocks))
+          else
+            Repl.Reply.Threw(id, plain, message, tokens, spans)
+        else if exhibiting then
           val trace: StackTrace = StackTraceRender.trimmed(error)(using loader)
           val blocks: List[Block] = Blocks.output(plain, spans, ansi) + List(Blocks.trace(trace))
           Repl.Reply.Threw(id, plain, t"", tokens, spans, Blocks.encode(blocks))

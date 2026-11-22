@@ -290,6 +290,101 @@ object Tests extends Suite(m"Flame Tests"):
 
       . assert(_ == Nil)
 
+      // A line submitted through `react` runs on a thread of its own, which `/interrupt` (here,
+      // `Repl#interrupt`, which it calls) asks to stop. `submitted` runs the line on a thread and
+      // interrupts it once it is running; its answer is the text of the reply.
+      def replyText(reply: Repl.Reply): Text = reply match
+        case Repl.Reply.Threw(_, _, diagnostics, _, _, blocks) => t"threw: $diagnostics$blocks"
+        case Repl.Reply.Ran(_, _, output, _, _, _, _, _, _)    => t"ran: $output"
+        case Repl.Reply.Rejected(_, diagnostics, _, _)         => t"rejected: $diagnostics"
+        case _                                                 => t"other"
+
+      def interrupted(react: () => Repl.Reply, interrupt: () => Int): Text =
+        val reply: java.util.concurrent.atomic.AtomicReference[Text] =
+          java.util.concurrent.atomic.AtomicReference(t"unanswered")
+
+        val submit: Runnable = caps.unsafe.unsafeAssumePure: () =>
+          reply.set(replyText(react()))
+
+        val submitting = new Thread(submit)
+        submitting.setDaemon(true)
+        submitting.start()
+        var tries: Int = 0
+
+        while interrupt() == 0 && tries < 1500 do
+          Thread.sleep(20)
+          tries += 1
+
+        submitting.join(30000L)
+        reply.get.nn
+
+      test(m"a sleeping line is stopped by an interruption"):
+        isolated:
+          val repl = Opened(Repl())
+          interrupted(() => repl.react(1, t"Thread.sleep(600000)"), () => repl.interrupt()(0))
+
+      . assert: reply =>
+          reply.starts(t"threw: ") && reply.contains(t"Interrupted") &&
+            !reply.contains(t"not stopped")
+
+      test(m"what an interrupted line defined is not in scope afterwards"):
+        isolated:
+          val repl = Opened(Repl())
+          val line: Text = t"val slow: Int = { Thread.sleep(600000); 1 }"
+          interrupted(() => repl.react(1, line), () => repl.interrupt()(0))
+          replyText(repl.react(2, t"slow"))
+
+      . assert(_.starts(t"rejected: "))
+
+      // A line that takes no notice of the interruption cannot be stopped; it is answered as
+      // interrupted all the same, and reported by the next `/interrupt`. The loop here ends when
+      // the test says so, so that it does not spin for the rest of the suite.
+      test(m"a line that ignores the interruption is left behind, and reported"):
+        isolated:
+          val repl = Opened(Repl())
+          val line: Text = t"while System.getProperty(\"flame.test.release\") == null do ()"
+
+          try
+            val reply: Text =
+              interrupted(() => repl.react(1, line), () => repl.interrupt()(0))
+
+            (reply.contains(t"has not stopped"), replyText(repl.react(2, t"/interrupt")))
+          finally java.lang.System.setProperty("flame.test.release", "yes")
+
+      . assert: (left, report) =>
+          left && report.contains(t"Nothing is running; 1 line interrupted earlier has not stopped")
+
+      test(m"/interrupt with nothing running says so"):
+        isolated:
+          replyText(Opened(Repl()).react(1, t"/interrupt"))
+
+      . assert(_.contains(t"Nothing is running\n"))
+
+      test(m"closing a session interrupts the line it is running"):
+        isolated:
+          val repl = Opened(Repl())
+
+          def close(): Int =
+            val lines: Int = repl.interrupt()(0)
+            if lines > 0 then repl.close()
+            lines
+
+          interrupted(() => repl.react(1, t"Thread.sleep(600000)"), () => close())
+
+      . assert(_.contains(t"Interrupted"))
+
+      // A compile that crashes, or a probe that dies of an `Error`, may leave the compiler's
+      // context half-updated: the warm session ends with it, and the next line opens another.
+      test(m"a compiler session that has died is replaced by the next line"):
+        isolated:
+          val repl = Opened(Repl())
+          repl.react(1, t"val kept = 20")
+          val first: Boolean = repl.sabotage()
+          val next: Text = replyText(repl.react(2, t"kept + 1"))
+          (first, next.starts(t"ran: "), repl.sabotage())
+
+      . assert(_ == (true, true, true))
+
       // `Out.println` needs a `Stdio`; the REPL supplies one ambiently (see `ReplStdio`), writing
       // to the run's captured stdout exactly as `println` does. Experimental mode, as any use of a
       // Soundness definition needs.
