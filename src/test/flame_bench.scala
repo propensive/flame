@@ -194,7 +194,9 @@ def firstLine(args0: String*): Unit =
 //   --cpu          time by the processor time of the submitting and compiler threads rather than
 //                  by the wall clock, which is what to compare two builds by on a busy machine
 //   --abandon <m>  instead: open `m` sessions as a front-end does, one after another, submit a
-//                  line to each and leave it unclosed, as a client that exits does
+//                  line to each and leave it unclosed, as a client that exited once did
+//   --close        with `--abandon`, end each connection as the server does when its client has
+//                  gone, which closes the session that was started for it
 //
 // A session is grown with filler lines — a `val`, a `def`, a `case class` and a `given` in turn —
 // and at each checkpoint the same few lines are timed, as the median of five submissions: an
@@ -376,7 +378,7 @@ def longSession(args0: String*): Unit =
 
     // What a launch costs the process it is served by: each is a connection that opens a session
     // of its own, is warmed up as a front-end's is, has a line or two submitted to it, and is
-    // then let go without the session being closed.
+    // then let go — without the session being closed, unless `--close` ends the connection.
     def abandoned(): Unit =
       val sessions = Sessions(Repl.Rendering.Inspect, frontend = true)
 
@@ -398,6 +400,7 @@ def longSession(args0: String*): Unit =
         while connection.name.let(sessions.session(_)).lay(false)(_.priming) do Thread.sleep(10)
         val first: Long = millis(connection.respond(Repl.Request.Submit(1, t"1 + 1")))
         val again: Long = median(connection.respond(Repl.Request.Submit(1, t"1 + 1")))
+        if args.contains("--close") then connection.close()
 
         out.println:
           String.format

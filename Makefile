@@ -94,7 +94,8 @@ bench:
 # Measure whether a line costs more the more lines its session already holds, and what an
 # abandoned session leaves behind (`flame.longSession`, src/test/flame_bench.scala). ARGS:
 # `--lines <n>` and `--every <k>` size the session and space the measurements; `--abandon <m>`
-# opens and abandons `m` sessions instead, as `m` launches of a client do.
+# opens and abandons `m` sessions instead, as `m` launches of a client do, and `--close` ends each
+# connection as the server does when its client has gone; `--cpu` times by processor time.
 bench-long:
 	./mill flame.test.assembly
 	java -cp out/flame/test/assembly.dest/out.jar flame.longSession $(ARGS)
