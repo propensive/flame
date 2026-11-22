@@ -1641,6 +1641,13 @@ object Tests extends Suite(m"Flame Tests"):
 
             stacks.map(describe).join(t"\n")
 
+          // A missing given's explanation is a tree: each node's label, parents first.
+          case Block.Tree(roots) =>
+            def labels(node: Block.TreeNode): List[Text] =
+              node.label.map(inline).join :: node.children.flatMap(labels)
+
+            roots.flatMap(labels).join(t"\n")
+
           case _ =>
             t""
 
