@@ -270,9 +270,18 @@ class ReplInterface(engine: Engine, options: ReplInterface.Options)(using Monito
     notice(Tone.Failure, labelled)
     options.leave()
 
-  // An entry keeps the frame its line was entered at: a rule above and below the code.
-  private def framed(code: Block): List[Block] =
-    List(Block.Rule(Block.Side.Above), code, Block.Rule(Block.Side.Below))
+  // An entry keeps the frame its line was entered at: a rule above and below the code. What
+  // the code printed is inside the frame, directly after the code, since that is how the model
+  // says whose output it is: the web draws it as the lower part of the code's own block, with
+  // no gutter. Only the output the content begins with is the code's in that sense; whatever
+  // comes after anything else (a message of the engine's, the result) follows the frame.
+  private def framed(code: Block, content: List[Block]): List[Block] =
+    def printed(todo: List[Block], done: List[Block]): (List[Block], List[Block]) = todo match
+      case (output: Block.Output) :: tail => printed(tail, output :: done)
+      case _                              => (done.reverse, todo)
+
+    val (output, rest) = printed(content, Nil)
+    List(Block.Rule(Block.Side.Above), code) + output + List(Block.Rule(Block.Side.Below)) + rest
 
   private def entry(id: Int): Block =
     val code: Block = codes().at(id).or(Block.Code(Language.Scala, Nil))
@@ -281,7 +290,7 @@ class ReplInterface(engine: Engine, options: ReplInterface.Options)(using Monito
       else Inline.text(t"evaluating")
 
     val gauge: Block = Block.Gauge(pyrocosm.Status.Indeterminate(), caption)
-    Block.Group(framed(code) + outputs().at(id).or(Nil) + List(gauge))
+    Block.Group(framed(code, outputs().at(id).or(Nil) + List(gauge)))
 
   private def replace(id: Int, settled: Block): Unit =
     pending().at(id).let: current =>
@@ -294,7 +303,7 @@ class ReplInterface(engine: Engine, options: ReplInterface.Options)(using Monito
   // ran are not kept alongside it.
   private def settle(id: Int, blocks: List[Block]): Unit =
     val code: Block = codes().at(id).or(Block.Code(Language.Scala, Nil))
-    replace(id, Block.Group(framed(code) + blocks))
+    replace(id, Block.Group(framed(code, blocks)))
     pending.revise(_.omit(id)); outputs.revise(_.omit(id)); codes.revise(_.omit(id))
     diagnosing.revise(_.filter(_ != id))
 
@@ -380,7 +389,7 @@ class ReplInterface(engine: Engine, options: ReplInterface.Options)(using Monito
                 Block.Gauge(pyrocosm.Status.Indeterminate(), Inline.text(t"seeking advice"))
 
               val shown: Block = codes().at(id).or(Block.Code(Language.Scala, Nil))
-              replace(id, Block.Group(framed(shown) + content(other) + List(seeking)))
+              replace(id, Block.Group(framed(shown, content(other) + List(seeking))))
             else
               settle(id, content(other))
 
