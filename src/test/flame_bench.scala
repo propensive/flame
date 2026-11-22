@@ -191,6 +191,8 @@ def firstLine(args0: String*): Unit =
 //   --every <k>    take the measurements every `k` lines (25)
 //   --warm <w>     first submit `w` lines to a scratch session, which is then closed, so that the
 //                  JVM's own warming-up is not mistaken for a young session's cost (60)
+//   --cpu          time by the processor time of the submitting and compiler threads rather than
+//                  by the wall clock, which is what to compare two builds by on a busy machine
 //   --abandon <m>  instead: open `m` sessions as a front-end does, one after another, submit a
 //                  line to each and leave it unclosed, as a client that exits does
 //
@@ -221,10 +223,33 @@ def longSession(args0: String*): Unit =
   val abandon: Int = number("--abandon", 0)
   val runs: Int = 5
 
+  // The clock: the wall's, or with `--cpu` the processor time used by the thread that asks and by
+  // the sessions' compiler threads, which is where a line's cost is spent. A busy machine does not
+  // stretch that as it does the wall's, and neither the JVM's own compiler nor its collector is
+  // counted in it, so it is what to compare two builds by.
+  val clock: () => Long =
+    if !args.contains("--cpu") then () => java.lang.System.nanoTime else
+      val bean = java.lang.management.ManagementFactory.getThreadMXBean.nn
+
+      () =>
+        val ids: scala.Array[Long] = bean.getAllThreadIds.nn
+        var total: Long = bean.getCurrentThreadCpuTime
+        var index: Int = 0
+
+        while index < ids.length do
+          val info: java.lang.management.ThreadInfo | Null = bean.getThreadInfo(ids(index))
+
+          if info != null && info.getThreadName.nn.startsWith("flame-compiler")
+          then total = total + bean.getThreadCpuTime(ids(index)).max(0L)
+
+          index += 1
+
+        total
+
   def millis(block: => Unit): Long =
-    val start = java.lang.System.nanoTime
+    val start = clock()
     block
-    (java.lang.System.nanoTime - start)/1000000L
+    (clock() - start)/1000000L
 
   def median(block: => Unit): Long =
     List.range(0, runs).map { _ => millis(block) }.stdlib.sorted.apply(runs/2)
@@ -276,7 +301,7 @@ def longSession(args0: String*): Unit =
       def fill(target: Int): Long =
         var count: Int = 0
         var refused: Int = 0
-        val start: Long = java.lang.System.nanoTime
+        val start: Long = clock()
 
         while size < target && refused < 20 do
           if !submit(filler(next)) then
@@ -290,7 +315,7 @@ def longSession(args0: String*): Unit =
           out.println("the filler lines are being refused; giving up")
           java.lang.System.exit(1)
 
-        if count == 0 then 0L else (java.lang.System.nanoTime - start)/1000000L/count
+        if count == 0 then 0L else (clock() - start)/1000000L/count
 
       def measure(filled: Long): Unit =
         val at: Int = size
@@ -317,6 +342,7 @@ def longSession(args0: String*): Unit =
     def aged(): Unit =
       if warm > 0 then
         val scratch = Aged()
+        scratch.submit(t"/set experimental")
         scratch.submit(t"import soundness.*")
         scratch.fill(warm)
         samples.each { line => scratch.submit(line) }
@@ -341,6 +367,7 @@ def longSession(args0: String*): Unit =
             "threads" )
 
       val session = Aged()
+      session.submit(t"/set experimental")
       session.submit(t"import soundness.*")
       session.measure(session.fill(4))
 
