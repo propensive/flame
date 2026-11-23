@@ -1646,6 +1646,7 @@ object Tests extends Suite(m"Flame Tests"):
           case Inline.Strong(content)    => content.map(inline).join
           case Inline.Toned(_, content)  => content.map(inline).join
           case Inline.Numeral(value, _)  => value.toString.tt
+          case Inline.Swatch(_)          => t"■"
           case _                         => t""
 
         def block(node: Block): Text = node match
@@ -1823,6 +1824,32 @@ object Tests extends Suite(m"Flame Tests"):
 
               case _ =>
                 false
+
+          case _ => false
+
+      test(m"a colour is exhibited as its swatch and its hexadecimal"):
+        isolated:
+          val repl = exhibiting
+          repl.react(0, t"/set experimental")
+          repl.react(0, t"import soundness.*")
+          repl.react(0, t"WebColors.Red")
+
+      . assert:
+          case Repl.Reply.Ran(_, _, _, _, _, _, _, _, blocks) =>
+            texts(Blocks.decode(blocks)).contains(t"■ #ff0000")
+
+          case _ => false
+
+      test(m"a daub mixed of two colours is exhibited as the swatch of what it has come to"):
+        isolated:
+          val repl = exhibiting
+          repl.react(0, t"/set experimental")
+          repl.react(0, t"import soundness.*, mixing.proportionalMixing")
+          repl.react(0, t"5*WebColors.Red + 3*WebColors.Yellow")
+
+      . assert:
+          case Repl.Reply.Ran(_, _, _, _, _, _, _, _, blocks) =>
+            texts(Blocks.decode(blocks)).contains(t"■ #ff5f00")
 
           case _ => false
 
