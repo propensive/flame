@@ -3229,7 +3229,7 @@ class Repl[version <: Scalac.Versions]
         t"flame.ReplBridge.put(${session.toString.tt}L, \"$key\", flame.InspectRender.render($ref))"
 
       case Repl.Rendering.Exhibit(_) =>
-        val media: Text = t"import pyrocosm.{rasterPresentable, svgPresentable}; "
+        val media: Text = t"import pyrocosm.{daubPresentable, rasterPresentable, svgPresentable}; "
         val id: Text = session.toString.tt
         t"${media}flame.ReplBridge.put(${id}L, \"$key\", flame.ExhibitRender.render($ref))"
 
