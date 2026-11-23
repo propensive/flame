@@ -34,8 +34,8 @@ package flame
 
 // The bolt codes of Flame, which begin `↯/f`, as those of Pyrocosm and its other tools do
 // (`pyrocosm.Bolts`). Each module of Flame is a subdivision, numbered after Pyrocosm's own and
-// those of the tools before it; the record of what every code means is `f.tel` in
-// propensive/bolt.
+// those of the tools before it; the record of what every code means is `bolt.tel` in
+// propensive/pyrocosm.
 object FlameBolts:
   final val core     = 17
   final val web      = 18
